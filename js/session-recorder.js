@@ -97,6 +97,10 @@
     async start(existingStream = null, partyGroupLabel = "B.U.G.S.") {
       if (this.isRecording) return;
 
+      try {
+        await global.navigator?.storage?.persist?.();
+      } catch (_) {}
+
       this.stream =
         existingStream ||
         (await navigator.mediaDevices.getUserMedia({

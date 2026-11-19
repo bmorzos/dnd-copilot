@@ -27,6 +27,7 @@
       this.analyser = null;
       this.mediaStreamDest = null;
       this.vuTimer = null;
+      this.wakeLock = null;
       this.silenceHintTimer = null;
       this.maxRmsSinceStart = 0;
 
@@ -217,11 +218,32 @@
       this.#startTranscriberOnly();
     }
 
+    async #acquireWakeLock() {
+      try {
+        if (global.navigator?.wakeLock?.request && !this.wakeLock) {
+          this.wakeLock = await global.navigator.wakeLock.request("screen");
+          this.wakeLock.addEventListener?.("release", () => {
+            this.wakeLock = null;
+          });
+        }
+      } catch (_) {}
+    }
+
+    #releaseWakeLock() {
+      if (this.wakeLock) {
+        try {
+          this.wakeLock.release();
+        } catch (_) {}
+        this.wakeLock = null;
+      }
+    }
+
     #activateCurrentEngine() {
       this.isListening = true;
       this.maxRmsSinceStart = 0;
       this.hasAnalyzedSinceStart = false;
       this.unprocessedCharsCount = 0;
+      this.#acquireWakeLock();
       this.#startVuMeter();
       this.#startTranscriberOnly();
     }
@@ -288,6 +310,7 @@
       }
 
       this.#stopTranscriberOnly();
+      this.#releaseWakeLock();
       this.onInterimText("");
 
       if (pauseBoundAudio && this.boundAudioEl && !this.boundAudioEl.paused) {
