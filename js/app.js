@@ -44,19 +44,78 @@
     onToast: (m) => showToast(m, false)
   });
 
-  const sessionRecorder = new global.DnDCopilot.SessionRecorder((recStatus) => {
-    const recBtn = el("btnToggleRecord");
-    const recLbl = el("recordBtnLabel");
-    if (recBtn && recLbl) {
-      recBtn.classList.toggle("recording", recStatus.isRecording);
-      recLbl.textContent = recStatus.isRecording
-        ? `⏹ ${recStatus.elapsedLabel}`
-        : "⏺ Record";
+  function playSoftAlertChime() {
+    try {
+      const AudioCtx = global.AudioContext || global.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const gain = ctx.createGain();
+      gain.gain.value = 0.08;
+      gain.connect(ctx.destination);
+
+      const osc1 = ctx.createOscillator();
+      osc1.frequency.value = 440;
+      osc1.connect(gain);
+      osc1.start();
+      osc1.stop(ctx.currentTime + 0.16);
+
+      const osc2 = ctx.createOscillator();
+      osc2.frequency.value = 330;
+      osc2.connect(gain);
+      osc2.start(ctx.currentTime + 0.18);
+      osc2.stop(ctx.currentTime + 0.38);
+      setTimeout(() => ctx.close().catch(() => {}), 600);
+    } catch (_) {}
+  }
+
+  let lastAlertSentAt = 0;
+
+  function triggerHealthWarning(msg) {
+    const bar = el("healthAlertBanner");
+    const txt = el("healthAlertText");
+    if (bar && txt) {
+      txt.textContent = msg;
+      bar.classList.remove("hidden");
     }
-    if (!el("savedModal")?.classList.contains("hidden")) {
-      renderSavedModal();
+
+    // Throttle audible chime & OS notifications so repeated retries don't spam every 8s
+    if (Date.now() - lastAlertSentAt < 25000) return;
+    lastAlertSentAt = Date.now();
+
+    playSoftAlertChime();
+
+    if (bridge.isExtensionContext()) {
+      chrome.runtime.sendMessage({ type: "HEALTH_ALERT", message: msg }).catch(() => {});
+    } else if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+      try {
+        new Notification("D&D Copilot — Recording/Transcript Alert", { body: msg });
+      } catch (_) {}
     }
-  });
+  }
+
+  function clearHealthWarning() {
+    el("healthAlertBanner")?.classList.add("hidden");
+    if (bridge.isExtensionContext()) {
+      chrome.runtime.sendMessage({ type: "HEALTH_CLEAR" }).catch(() => {});
+    }
+  }
+
+  const sessionRecorder = new global.DnDCopilot.SessionRecorder(
+    (recStatus) => {
+      const recBtn = el("btnToggleRecord");
+      const recLbl = el("recordBtnLabel");
+      if (recBtn && recLbl) {
+        recBtn.classList.toggle("recording", recStatus.isRecording);
+        recLbl.textContent = recStatus.isRecording
+          ? `⏹ ${recStatus.elapsedLabel}`
+          : "⏺ Record";
+      }
+      if (!el("savedModal")?.classList.contains("hidden")) {
+        renderSavedModal();
+      }
+    },
+    (alertMsg) => triggerHealthWarning(alertMsg)
+  );
 
   const audioListener = new global.DnDCopilot.TableAudioListener(store, {
     onInterimText: (text) => {
@@ -91,6 +150,8 @@
       if (bar) bar.style.width = `${pct}%`;
     },
     onError: (errMsg) => showToast(errMsg, true),
+    onHealthAlert: (alertMsg) => triggerHealthWarning(alertMsg),
+    onHealthRecovered: () => clearHealthWarning(),
     onSpeechBatchReady: async () => {
       try {
         await gemini.analyzeTableSituation(store);
@@ -674,13 +735,22 @@
       showToast("Switched speech to Groq Whisper!");
     });
 
-    // Session Recorder (Crash-safe IndexedDB — also starts Mic transcription if idle so BOTH audio + transcript save!)
+    el("btnDismissHealthAlert").addEventListener("click", clearHealthWarning);
+
+    // Session Recorder (Crash-safe IndexedDB — opens an independent mic stream when recording room audio so switching engines never interrupts backup audio!)
     el("btnToggleRecord").addEventListener("click", async () => {
       if (sessionRecorder.isRecording) {
         sessionRecorder.stop();
         showToast("Audio recording saved! Open '💾 Saved' anytime to download.");
       } else {
         try {
+          if (
+            !bridge.isExtensionContext() &&
+            typeof Notification !== "undefined" &&
+            Notification.permission === "default"
+          ) {
+            Notification.requestPermission().catch(() => {});
+          }
           if (!audioListener.isListening) {
             await audioListener.start();
           }
@@ -688,8 +758,13 @@
             store.getActivePartyGroupName() === "__demo__"
               ? "B.U.G.S."
               : store.getActivePartyGroupName();
-          await sessionRecorder.start(audioListener.getRecordableStream(), partyName);
-          showToast("Recording audio + live transcript (auto-saved every 5s)!");
+          // Use independent mic stream for live room recording so toggling speech engine never touches backup audio
+          const sharedStream =
+            audioListener.activeSourceType === "system" || audioListener.activeSourceType === "file"
+              ? audioListener.getRecordableStream()
+              : null;
+          await sessionRecorder.start(sharedStream, partyName);
+          showToast("Recording independent audio backup + live transcript!");
         } catch (_) {
           showToast("Allow microphone access to record.", true);
         }

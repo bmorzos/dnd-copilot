@@ -31,14 +31,16 @@
   }
 
   class SessionRecorder {
-    constructor(onUpdate = () => {}) {
+    constructor(onUpdate = () => {}, onAlert = () => {}) {
       this.onUpdate = onUpdate;
+      this.onAlert = onAlert;
       this.isRecording = false;
       this.activeSessionId = null;
       this.recorder = null;
       this.stream = null;
       this.ownsStream = false;
       this.startedAt = null;
+      this.lastChunkSavedAt = null;
       this.elapsedTimer = null;
       this.mimeType = "audio/webm";
       this.savedSessions = [];
@@ -150,10 +152,41 @@
       });
 
       const currentId = this.activeSessionId;
+      this.lastChunkSavedAt = Date.now();
+
+      audioTracks[0]?.addEventListener?.("ended", () => {
+        if (this.isRecording && this.activeSessionId === currentId) {
+          this.onAlert(
+            "⚠️ Backup audio recording stopped unexpectedly (microphone disconnected)! Check D&D Copilot."
+          );
+          this.stop();
+        }
+      });
+
+      this.recorder.onerror = (ev) => {
+        this.onAlert(
+          `⚠️ Backup audio recorder error: ${ev?.error?.message || "MediaRecorder error"}`
+        );
+      };
+
+      this.recorder.onstop = () => {
+        if (this.isRecording && this.activeSessionId === currentId) {
+          this.onAlert("⚠️ Backup audio recorder stopped unexpectedly! Check D&D Copilot.");
+          this.stop();
+        }
+      };
+
       this.recorder.ondataavailable = async (e) => {
         if (e.data && e.data.size > 0) {
-          await this.#appendChunk(currentId, e.data);
-          await this.refreshSavedList();
+          try {
+            await this.#appendChunk(currentId, e.data);
+            this.lastChunkSavedAt = Date.now();
+            await this.refreshSavedList();
+          } catch (dbErr) {
+            this.onAlert(
+              `⚠️ Could not save backup audio chunk to disk (${dbErr?.message || dbErr})!`
+            );
+          }
         }
       };
 
@@ -252,6 +285,7 @@
       return {
         isRecording: this.isRecording,
         elapsedLabel: `${mins}:${rem}`,
+        lastChunkSavedAt: this.lastChunkSavedAt,
         hasSavedChunks: this.savedSessions.length > 0,
         savedSessions: this.savedSessions
       };

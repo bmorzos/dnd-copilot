@@ -14,6 +14,8 @@
       this.onVolumeLevel = callbacks.onVolumeLevel || (() => {});
       this.onError = callbacks.onError || (() => {});
       this.onSpeechBatchReady = callbacks.onSpeechBatchReady || (() => {});
+      this.onHealthAlert = callbacks.onHealthAlert || (() => {});
+      this.onHealthRecovered = callbacks.onHealthRecovered || (() => {});
 
       this.isListening = false;
       this.activeSourceType = "idle"; // "mic" | "system" | "file" | "idle"
@@ -25,6 +27,7 @@
 
       this.audioCtx = null;
       this.analyser = null;
+      this.scriptProc = null;
       this.mediaStreamDest = null;
       this.vuTimer = null;
       this.wakeLock = null;
@@ -35,10 +38,30 @@
       this.mediaRecorder = null;
       this.chunkTimeout = null;
       this.peakRmsInWindow = 0;
+      this.rmsSamplesInWindow = 0;
+
+      this.pendingClips = [];
+      this.isDrainingClips = false;
+      this.hadHealthFailure = false;
 
       this.hasAnalyzedSinceStart = false;
       this.unprocessedCharsCount = 0;
       this.lastAutoAnalyzeAt = 0;
+
+      if (typeof global.addEventListener === "function") {
+        global.addEventListener("online", () => {
+          if (this.pendingClips.length > 0 && !this.isDrainingClips) {
+            this.#drainGroqQueue();
+          }
+        });
+      }
+      if (typeof global.document?.addEventListener === "function") {
+        global.document.addEventListener("visibilitychange", () => {
+          if (global.document.visibilityState === "visible" && this.isListening) {
+            this.#acquireWakeLock();
+          }
+        });
+      }
     }
 
     /**
@@ -63,6 +86,7 @@
 
       this.activeSourceType = "mic";
       this.customAudioTrack = this.mediaStream.getAudioTracks()[0] || null;
+      this.#attachTrackWatchdog(this.customAudioTrack, "Microphone");
       this.#activateCurrentEngine();
 
       // If mic hears dead silence for 6s, remind user about PC Audio / Audio File in case they're playing a recording in headphones
@@ -218,6 +242,30 @@
       this.#startTranscriberOnly();
     }
 
+    #attachTrackWatchdog(track, label) {
+      if (!track || typeof track.addEventListener !== "function") return;
+      track.addEventListener("ended", () => {
+        if (this.isListening && this.customAudioTrack === track) {
+          this.onHealthAlert(
+            `⚠️ ${label} audio stopped or disconnected! Check your input in D&D Copilot so the transcript keeps running.`
+          );
+          this.stop();
+        }
+      });
+      track.addEventListener("mute", () => {
+        if (this.isListening && this.customAudioTrack === track) {
+          this.onHealthAlert(
+            `⚠️ ${label} was muted by your system! Unmute it so D&D Copilot can hear the table.`
+          );
+        }
+      });
+      track.addEventListener("unmute", () => {
+        if (this.isListening && this.customAudioTrack === track) {
+          this.onHealthRecovered();
+        }
+      });
+    }
+
     async #acquireWakeLock() {
       try {
         if (global.navigator?.wakeLock?.request && !this.wakeLock) {
@@ -325,6 +373,13 @@
       }
 
       if (this.audioCtx) {
+        if (this.scriptProc) {
+          try {
+            this.scriptProc.onaudioprocess = null;
+            this.scriptProc.disconnect();
+          } catch (_) {}
+          this.scriptProc = null;
+        }
         this.audioCtx.close().catch(() => {});
         this.audioCtx = null;
         this.analyser = null;
@@ -357,6 +412,13 @@
         this.vuTimer = null;
       }
       if (this.audioCtx) {
+        if (this.scriptProc) {
+          try {
+            this.scriptProc.onaudioprocess = null;
+            this.scriptProc.disconnect();
+          } catch (_) {}
+          this.scriptProc = null;
+        }
         this.audioCtx.close().catch(() => {});
         this.audioCtx = null;
         this.analyser = null;
@@ -387,6 +449,25 @@
         this.analyser.connect(silentSink);
         silentSink.connect(this.audioCtx.destination);
 
+        // Un-throttled audio-thread RMS metering (runs even when tab is in the background for hours!)
+        if (typeof this.audioCtx.createScriptProcessor === "function") {
+          this.scriptProc = this.audioCtx.createScriptProcessor(4096, 1, 1);
+          this.scriptProc.onaudioprocess = (ev) => {
+            if (!this.isListening) return;
+            const ch = ev.inputBuffer.getChannelData(0);
+            let sum = 0;
+            for (let i = 0; i < ch.length; i += 4) {
+              sum += ch[i] * ch[i];
+            }
+            const rms = Math.sqrt(sum / Math.max(1, Math.ceil(ch.length / 4)));
+            if (rms > this.peakRmsInWindow) this.peakRmsInWindow = rms;
+            if (rms > this.maxRmsSinceStart) this.maxRmsSinceStart = rms;
+            this.rmsSamplesInWindow += 1;
+          };
+          source.connect(this.scriptProc);
+          this.scriptProc.connect(silentSink);
+        }
+
         // Create a standardized WebAudio MediaStreamDestination so MediaRecorder works
         // identically on .mp3/.m4a/.wav/.webm files, PC/Tab audio, and Microphones!
         if (typeof this.audioCtx.createMediaStreamDestination === "function") {
@@ -406,6 +487,7 @@
           const rms = Math.sqrt(sumSq / buf.length);
           if (rms > this.peakRmsInWindow) this.peakRmsInWindow = rms;
           if (rms > this.maxRmsSinceStart) this.maxRmsSinceStart = rms;
+          this.rmsSamplesInWindow += 1;
           this.onVolumeLevel(Math.min(100, Math.round(rms * 420)));
         }, 120);
       } catch (_) {}
@@ -513,7 +595,15 @@
             } else if (this.activeSourceType === "mic") {
               rec.start();
             }
-          } catch (_) {}
+          } catch (restartErr) {
+            if ((this.store.settings.groqApiKey || "").trim()) {
+              this.switchSpeechEngine("groq");
+            } else {
+              this.onHealthAlert(
+                "⚠️ Chrome built-in speech paused while in a background tab! Switch to Groq in the top bar for uninterrupted multi-hour transcripts."
+              );
+            }
+          }
         }, 220);
       };
 
@@ -546,6 +636,60 @@
         this.onError(`Could not start Chrome Speech: ${err.message || err}`);
         return false;
       }
+    }
+
+    async #drainGroqQueue() {
+      if (this.isDrainingClips) return;
+      this.isDrainingClips = true;
+
+      while (this.pendingClips.length > 0) {
+        const item = this.pendingClips[0];
+        try {
+          this.onInterimText(
+            this.pendingClips.length > 1
+              ? `⚡ Groq Whisper transcribing (${this.pendingClips.length} queued)...`
+              : "⚡ Groq Whisper transcribing..."
+          );
+          const text = await global.DnDCopilot.GeminiClient.transcribeWithGroq(
+            item.blob,
+            this.store
+          );
+          this.pendingClips.shift();
+
+          if (this.hadHealthFailure) {
+            this.hadHealthFailure = false;
+            this.onHealthRecovered();
+          }
+
+          if (text) {
+            this.store.addTranscriptLine(item.speakerLabel, text, false);
+            this.onInterimText(`💬 Heard: "${text}"`);
+            this.#checkAutoAnalyzeTrigger(text.length);
+          }
+        } catch (err) {
+          const msg = err?.message || String(err);
+          this.hadHealthFailure = true;
+          this.onInterimText(`⚠️ Transcript issue: ${msg}`);
+
+          if (msg.includes("Groq API Key rejected")) {
+            this.pendingClips.length = 0;
+            this.onHealthAlert(`⚠️ Transcript stopped: ${msg}`);
+            break;
+          }
+
+          // Keep up to 20 clips (~4 mins of speech) buffered while Wi-Fi reconnects!
+          if (this.pendingClips.length > 20) {
+            this.pendingClips.shift();
+          }
+          this.onHealthAlert(
+            `⚠️ Live Transcript delayed (${msg}) — buffering your audio clips automatically and retrying in 8s!`
+          );
+          await new Promise((r) => setTimeout(r, 8000));
+          if (!this.isListening && this.pendingClips.length === 0) break;
+        }
+      }
+
+      this.isDrainingClips = false;
     }
 
     #startGroqWhisperChunker() {
@@ -583,11 +727,14 @@
           return;
         }
 
-        const clipDurationMs = isFirstClip ? 5000 : 7500;
+        // 6s first clip for quick feedback, then 12s clips (5 req/min = well-formed full sentences + 6+ hr quota!)
+        const clipDurationMs = isFirstClip ? 6000 : 12000;
         isFirstClip = false;
 
         const chunks = [];
+        const clipStartedAt = Date.now();
         this.peakRmsInWindow = 0;
+        this.rmsSamplesInWindow = 0;
 
         let recorder;
         try {
@@ -598,35 +745,56 @@
               })
             : new MediaRecorder(audioOnlyStream);
         } catch (err) {
-          this.onError(`Recorder error: ${err.message || err}`);
+          this.onHealthAlert(`⚠️ Transcript recorder error: ${err.message || err}`);
           return;
         }
 
         this.mediaRecorder = recorder;
-        this.onInterimText(
-          `🎧 Groq Whisper listening (${this.#sourceLabel()}) — next caption in ${Math.round(
-            clipDurationMs / 1000
-          )}s...`
-        );
+        if (!this.isDrainingClips) {
+          this.onInterimText(
+            `🎧 Groq Whisper active (${this.#sourceLabel()}) — runs continuously even on other tabs`
+          );
+        }
 
-        recorder.ondataavailable = (e) => {
-          if (e.data && e.data.size > 0) chunks.push(e.data);
+        recorder.onerror = (ev) => {
+          this.onHealthAlert(
+            `⚠️ Transcript audio capture error: ${ev?.error?.message || "MediaRecorder error"}`
+          );
         };
 
-        recorder.onstop = async () => {
-          // Schedule next clip immediately so zero audio is missed while HTTP request runs!
+        // Driven by C++ MediaRecorder 1000ms timeslices — NEVER throttled in background tabs!
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            chunks.push(e.data);
+          }
+          if (
+            recorder.state === "recording" &&
+            Date.now() - clipStartedAt >= clipDurationMs
+          ) {
+            try {
+              recorder.stop();
+            } catch (_) {}
+          }
+        };
+
+        recorder.onstop = () => {
+          if (this.chunkTimeout) {
+            clearTimeout(this.chunkTimeout);
+            this.chunkTimeout = null;
+          }
+
+          // Start next clip immediately so zero syllables are missed between chunks!
           if (this.isListening && this.store.settings.speechMode === "groq") {
             recordNextClip();
           }
 
           if (chunks.length === 0) return;
 
-          // Only skip dead room silence in Microphone mode; always transcribe active Audio File / PC Audio!
+          // Only skip dead silence if audio-thread metering actually measured >= 5 buffers and all were silent
           if (this.activeSourceType === "mic") {
-            const analyserRunning = this.analyser && this.audioCtx?.state === "running";
-            if (analyserRunning && this.peakRmsInWindow < 0.0012) {
-              if (this.isListening) {
-                this.onInterimText("🔇 Waiting for speech on Microphone...");
+            if (this.rmsSamplesInWindow >= 5 && this.peakRmsInWindow < 0.001) {
+              if (this.isListening && !this.isDrainingClips) {
+                this.onInterimText("🔇 Listening (room is quiet)...");
               }
               return;
             }
@@ -635,29 +803,20 @@
           const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
           if (blob.size < 600) return;
 
-          try {
-            this.onInterimText("⚡ Groq Whisper transcribing...");
-            const text = await global.DnDCopilot.GeminiClient.transcribeWithGroq(blob, this.store);
-            if (text) {
-              this.store.addTranscriptLine(speakerLabel, text, false);
-              this.onInterimText(`💬 Heard: "${text}"`);
-              this.#checkAutoAnalyzeTrigger(text.length);
-            }
-          } catch (err) {
-            this.onInterimText(`⚠️ Groq error: ${err.message || err}`);
-            this.onError(err.message || String(err));
-          }
+          this.pendingClips.push({ blob, speakerLabel });
+          this.#drainGroqQueue();
         };
 
-        // 500ms timeslice guarantees Chrome flushes MediaRecorder buffers continuously on captureStream()
-        recorder.start(500);
+        recorder.start(1000);
+
+        // Safety fallback timer only if C++ timeslice hasn't rotated yet
         this.chunkTimeout = setTimeout(() => {
           if (recorder.state === "recording") {
             try {
               recorder.stop();
             } catch (_) {}
           }
-        }, clipDurationMs);
+        }, clipDurationMs + 3500);
       };
 
       recordNextClip();

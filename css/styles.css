@@ -227,6 +227,20 @@ body {
   border-color: var(--blue);
 }
 
+/* PERSISTENT HEALTH WARNING BAR */
+.health-alert-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 18px;
+  background: #7f1d1d;
+  border-bottom: 2px solid #f87171;
+  color: #ffffff;
+  font-size: 16px;
+  font-weight: 700;
+}
+
 /* RECORDING AUDIO FILE BAR */
 .recording-bar {
   display: flex;

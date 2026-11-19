@@ -56,6 +56,12 @@
     </div>
   </header>
 
+  <!-- PERSISTENT HEALTH WARNING BANNER (ONLY SHOWN IF TRANSCRIPT OR RECORDING HITS AN ISSUE) -->
+  <div id="healthAlertBanner" class="health-alert-bar hidden" role="alert">
+    <span id="healthAlertText"></span>
+    <button id="btnDismissHealthAlert" type="button" class="btn btn-quiet">Dismiss</button>
+  </div>
+
   <!-- AUDIO FILE BAR (ONLY VISIBLE WHEN PLAYING A PAST RECORDING) -->
   <div id="recordingPlayerBar" class="recording-bar hidden">
     <span id="recordingFileName" class="recording-name">Recording</span>

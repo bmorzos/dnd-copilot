@@ -613,3 +613,76 @@ test("B.U.G.S. party group saves character sheets permanently and transcripts ar
   assert.equal(sbMac.DnDCopilot.Store.settings.speechMode, "groq");
   assert.equal(sbMac.DnDCopilot.Store.state.party.length, 2);
 });
+
+test("Groq Whisper retries transient blips, carries rolling context prompt, and fires cross-tab health alerts on mic drop", async () => {
+  const sb = createBrowserSandbox();
+  const store = sb.DnDCopilot.Store;
+  const gemini = sb.DnDCopilot.GeminiClient;
+
+  store.resetSession();
+  store.updateSettings({ groqApiKey: "gsk_retry_key" });
+  store.addTranscriptLine("Table", "Lord Neverember hid the key beneath the obsidian altar.", false);
+
+  let attempts = 0;
+  let capturedPrompt = "";
+  sb.fetch = async (_url, opts) => {
+    attempts += 1;
+    capturedPrompt = String(opts.body.get("prompt") || "");
+    if (attempts === 1) {
+      return {
+        ok: false,
+        status: 503,
+        headers: { get: () => "0.01" },
+        json: async () => ({ error: { message: "Temporary blip" } })
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({ text: "We search around the base of the obsidian altar for traps." })
+    };
+  };
+
+  const out = await gemini.transcribeWithGroq(
+    new Blob(["audio-bytes"], { type: "audio/webm" }),
+    store
+  );
+  assert.equal(attempts, 2);
+  assert.match(capturedPrompt, /obsidian altar/);
+  assert.equal(out, "We search around the base of the obsidian altar for traps.");
+
+  // Verify mic disconnect watchdog triggers onHealthAlert
+  let alertReceived = "";
+  const endListeners = [];
+  sb.navigator = {
+    mediaDevices: {
+      getUserMedia: async () => ({
+        getAudioTracks: () => [
+          {
+            kind: "audio",
+            readyState: "live",
+            stop: () => {},
+            addEventListener: (ev, fn) => {
+              if (ev === "ended") endListeners.push(fn);
+            }
+          }
+        ],
+        getTracks: () => []
+      })
+    }
+  };
+  sb.webkitSpeechRecognition = class {
+    start() {}
+    stop() {}
+  };
+
+  const listener = new sb.DnDCopilot.TableAudioListener(store, {
+    onHealthAlert: (m) => {
+      alertReceived = m;
+    }
+  });
+  await listener.start();
+  assert.equal(endListeners.length, 1);
+  // Simulate unexpected microphone unplug mid-session
+  endListeners[0]();
+  assert.match(alertReceived, /stopped or disconnected/i);
+});

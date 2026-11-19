@@ -395,7 +395,79 @@
     return await publicResp.json();
   }
 
+  function showInPageHealthAlert(msgText) {
+    let banner = document.getElementById("dnd-copilot-cross-tab-alert");
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.id = "dnd-copilot-cross-tab-alert";
+      Object.assign(banner.style, {
+        position: "fixed",
+        top: "14px",
+        right: "14px",
+        zIndex: "2147483647",
+        maxWidth: "420px",
+        padding: "12px 16px",
+        borderRadius: "10px",
+        background: "#7f1d1d",
+        border: "2px solid #f87171",
+        color: "#ffffff",
+        fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
+        fontSize: "15px",
+        fontWeight: "600",
+        boxShadow: "0 12px 32px rgba(0,0,0,0.65)",
+        display: "flex",
+        alignItems: "center",
+        gap: "12px"
+      });
+      document.body.appendChild(banner);
+    }
+    banner.innerHTML = "";
+    const textSpan = document.createElement("span");
+    textSpan.style.flex = "1";
+    textSpan.textContent = msgText;
+
+    const openBtn = document.createElement("button");
+    openBtn.textContent = "Check Copilot";
+    Object.assign(openBtn.style, {
+      background: "#ffffff",
+      color: "#7f1d1d",
+      border: "none",
+      borderRadius: "6px",
+      padding: "6px 10px",
+      fontWeight: "700",
+      cursor: "pointer",
+      whiteSpace: "nowrap"
+    });
+    openBtn.addEventListener("click", () => {
+      chrome.runtime.sendMessage({ type: "OPEN_DASHBOARD_TAB" }).catch(() => {});
+      banner.remove();
+    });
+
+    const closeBtn = document.createElement("button");
+    closeBtn.textContent = "✕";
+    Object.assign(closeBtn.style, {
+      background: "transparent",
+      color: "#fecaca",
+      border: "none",
+      fontSize: "16px",
+      cursor: "pointer"
+    });
+    closeBtn.addEventListener("click", () => banner.remove());
+
+    banner.append(textSpan, openBtn, closeBtn);
+  }
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === "SHOW_COPILOT_ALERT") {
+      showInPageHealthAlert(message.message || "D&D Copilot needs attention!");
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (message?.type === "CLEAR_COPILOT_ALERT") {
+      document.getElementById("dnd-copilot-cross-tab-alert")?.remove();
+      sendResponse({ ok: true });
+      return false;
+    }
     if (message?.type === "COLLECT_SNAPSHOT_NOW") {
       sendResponse({ ok: true, snapshot: buildSnapshot() });
       return false;

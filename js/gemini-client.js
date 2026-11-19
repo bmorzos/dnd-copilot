@@ -22,9 +22,14 @@
     "thank you",
     "thanks for watching.",
     "thanks for watching!",
+    "thanks for watching",
+    "please subscribe.",
     "you",
     ".",
+    "..",
+    "...",
     "bye.",
+    "bye",
     "subtitles by the amara.org community"
   ]);
 
@@ -226,42 +231,80 @@
     });
 
     const partyNames = store.state.party.map((p) => p.name).join(", ");
-    const vocabPrompt = `D&D 5e tabletop session. AboveVTT, saving throw, initiative, spell slot.${
-      partyNames ? ` Party: ${partyNames}.` : ""
-    }`;
+    const prevLine =
+      store.state.transcript.length > 0
+        ? store.state.transcript[store.state.transcript.length - 1].text.slice(-160)
+        : "";
+    const vocabPrompt = [
+      `D&D 5e tabletop session.${partyNames ? ` Party: ${partyNames}.` : ""}`,
+      prevLine
+    ]
+      .filter(Boolean)
+      .join(" ");
 
-    const form = new FormData();
-    form.append("file", file);
-    form.append("model", "whisper-large-v3-turbo");
-    form.append("language", "en");
-    form.append("response_format", "json");
-    form.append("prompt", vocabPrompt);
+    let lastErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("model", "whisper-large-v3-turbo");
+      form.append("language", "en");
+      form.append("response_format", "json");
+      form.append("temperature", "0");
+      form.append("prompt", vocabPrompt);
 
-    const resp = await fetch(GROQ_WHISPER_ENDPOINT, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${groqKey}`
-      },
-      body: form
-    });
-
-    if (!resp.ok) {
-      let detail = "";
       try {
-        const j = await resp.json();
-        detail = j?.error?.message || JSON.stringify(j);
-      } catch (_) {
-        detail = await resp.text();
+        const resp = await fetch(GROQ_WHISPER_ENDPOINT, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${groqKey}`
+          },
+          body: form
+        });
+
+        if (resp.ok) {
+          const data = await resp.json();
+          const text = String(data?.text || "").replace(/\s+/g, " ").trim();
+          if (!text || WHISPER_HALLUCINATIONS.has(text.toLowerCase())) {
+            return "";
+          }
+          return text;
+        }
+
+        // Do not retry invalid API key (401/403)
+        if (resp.status === 401 || resp.status === 403) {
+          throw new Error("Groq API Key rejected (check key in ⚙️ Settings).");
+        }
+
+        let detail = "";
+        try {
+          const j = await resp.json();
+          detail = j?.error?.message || JSON.stringify(j);
+        } catch (_) {
+          detail = await resp.text();
+        }
+        lastErr = new Error(`Groq Whisper HTTP ${resp.status}: ${detail.slice(0, 180)}`);
+
+        // Respect Retry-After on 429 or backoff on 5xx
+        if (attempt < 2 && (resp.status === 429 || resp.status >= 500)) {
+          const retryHeader = Number(resp.headers?.get?.("retry-after") || 0);
+          const waitMs = retryHeader > 0 ? retryHeader * 1000 : (attempt + 1) * 2000;
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+        break;
+      } catch (netErr) {
+        lastErr = netErr;
+        if (String(netErr?.message || "").includes("Groq API Key rejected")) {
+          throw netErr;
+        }
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, (attempt + 1) * 2000));
+          continue;
+        }
       }
-      throw new Error(`Groq Whisper HTTP ${resp.status}: ${detail.slice(0, 200)}`);
     }
 
-    const data = await resp.json();
-    const text = String(data?.text || "").trim();
-    if (!text || WHISPER_HALLUCINATIONS.has(text.toLowerCase())) {
-      return "";
-    }
-    return text;
+    throw lastErr || new Error("Groq transcription failed after 3 attempts.");
   }
 
   function buildCompactSessionContext(store) {

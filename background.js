@@ -55,6 +55,53 @@ async function fetchCharacterDirectly(characterId) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== "object") return false;
 
+  if (message.type === "OPEN_DASHBOARD_TAB") {
+    openOrFocusDashboard();
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message.type === "HEALTH_ALERT") {
+    const alertText = String(message.message || "Transcript or audio recording needs attention!");
+    try {
+      chrome.action.setBadgeText({ text: "!" });
+      chrome.action.setBadgeBackgroundColor({ color: "#ef4444" });
+    } catch (_) {}
+    try {
+      chrome.notifications?.create("dnd-copilot-health-alert", {
+        type: "basic",
+        iconUrl: "icons/icon128.png",
+        title: "D&D Copilot — Recording/Transcript Alert",
+        message: alertText,
+        priority: 2
+      });
+    } catch (_) {}
+    // Also show an in-page alert banner on any open D&D Beyond / AboveVTT tab!
+    findDndBeyondTabs().then((tabs) => {
+      for (const tab of tabs) {
+        chrome.tabs
+          .sendMessage(tab.id, { type: "SHOW_COPILOT_ALERT", message: alertText })
+          .catch(() => {});
+      }
+    });
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message.type === "HEALTH_CLEAR") {
+    try {
+      chrome.action.setBadgeText({ text: "" });
+      chrome.notifications?.clear("dnd-copilot-health-alert");
+    } catch (_) {}
+    findDndBeyondTabs().then((tabs) => {
+      for (const tab of tabs) {
+        chrome.tabs.sendMessage(tab.id, { type: "CLEAR_COPILOT_ALERT" }).catch(() => {});
+      }
+    });
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (message.type === "ABOVEVTT_SNAPSHOT") {
     latestAboveVttSnapshot = message.payload;
     if (sender?.tab?.id) {
