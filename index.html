@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>D&amp;D Copilot</title>
+  <link rel="icon" type="image/png" href="icons/icon48.png" />
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <!-- CLEAN, SIMPLE TOP BAR -->
+  <header class="topbar">
+    <div class="topbar-group">
+      <img src="icons/icon48.png" alt="d20" class="brand-icon" />
+      <span class="brand-title">D&amp;D Copilot</span>
+      <button id="btnOpenBridgeModal" class="status-pill">
+        <span class="status-dot"></span>
+        <span id="bridgeStatusText">AboveVTT</span>
+      </button>
+    </div>
+
+    <div class="topbar-group topbar-center">
+      <button id="btnToggleMic" class="btn btn-listen" title="Listen via your microphone (live table)">
+        <span id="micBtnLabel">🎙️ Mic</span>
+      </button>
+
+      <button id="btnSystemAudio" class="btn btn-quiet" title="Capture audio playing in another Chrome tab, VLC, YouTube, or Windows Media Player (works with headphones!)">
+        <span id="sysAudioBtnLabel">🔊 PC Audio</span>
+      </button>
+
+      <button id="btnLoadAudioFile" class="btn btn-quiet" title="Open and play a recorded session audio/video file">
+        📂 Audio File
+      </button>
+      <input id="audioFileInput" type="file" accept="audio/*,video/*" class="hidden" />
+
+      <!-- 1-CLICK CHROME <-> GROQ SWITCH -->
+      <div class="engine-switch" role="group" aria-label="Speech Engine">
+        <button id="btnEngineChrome" class="engine-opt active" type="button">Chrome</button>
+        <button id="btnEngineGroq" class="engine-opt" type="button">Groq</button>
+      </div>
+
+      <div class="vu-wrap" title="Live audio level">
+        <div id="vuBarFill" class="vu-fill"></div>
+      </div>
+
+      <button id="btnToggleRecord" class="btn btn-quiet" title="Record session audio (auto-saved every 5s)">
+        <span id="recordBtnLabel">⏺ Record</span>
+      </button>
+    </div>
+
+    <div class="topbar-group">
+      <button id="btnOpenSavedModal" class="btn btn-action" title="Download or view saved session transcripts &amp; audio recordings">
+        💾 Saved
+      </button>
+      <button id="btnOpenSettings" class="btn btn-quiet">⚙️ Settings</button>
+    </div>
+  </header>
+
+  <!-- AUDIO FILE BAR (ONLY VISIBLE WHEN PLAYING A PAST RECORDING) -->
+  <div id="recordingPlayerBar" class="recording-bar hidden">
+    <span id="recordingFileName" class="recording-name">Recording</span>
+    <audio id="sessionAudioPlayer" controls class="recording-audio"></audio>
+    <button id="btnFastTranscribeFile" class="btn btn-primary" title="Send the whole audio file (<25MB) to Groq Whisper for instant transcription">
+      ⚡ Fast Transcribe (Groq)
+    </button>
+    <button id="btnCloseRecording" class="btn btn-quiet">✕</button>
+  </div>
+
+  <!-- TOAST -->
+  <div id="toastBanner" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <!-- SIMPLE, SPACIOUS 3-COLUMN LAYOUT -->
+  <main class="main-grid">
+    <!-- COLUMN 1: WHAT'S GOING ON (LARGE & EASY TO READ) + MINIMIZED TRANSCRIPT -->
+    <section class="panel col-whats-going-on">
+      <div class="panel-header">
+        <h2>What's Going On</h2>
+        <div class="header-actions">
+          <span id="sceneModeBadge" class="scene-tag">Exploration</span>
+          <button id="btnAnalyzeNow" class="btn btn-action">↻ Update</button>
+        </div>
+      </div>
+
+      <div class="whats-going-on-body">
+        <p id="situationHeadline" class="big-headline">
+          Ready to listen to your game.
+        </p>
+        <ul id="situationBullets" class="big-bullets"></ul>
+        <div id="situationObjectives" class="objectives-box hidden"></div>
+      </div>
+
+      <div id="interimSpeechBanner" class="live-hearing hidden"></div>
+
+      <!-- MINIMIZED TRANSCRIPT DRAWER AT BOTTOM -->
+      <details id="transcriptDrawer" class="transcript-drawer">
+        <summary>
+          <span>Live Transcript (<span id="transcriptCount">0</span>)</span>
+        </summary>
+        <div class="transcript-drawer-body">
+          <div class="simple-row">
+            <form id="manualTranscriptForm" class="simple-row" style="flex:1;">
+              <input
+                id="manualTranscriptInput"
+                type="text"
+                class="input"
+                placeholder="Add a quick note or clue..."
+              />
+              <button type="submit" class="btn btn-quiet">Add</button>
+            </form>
+            <button id="btnDownloadTranscriptQuick" type="button" class="btn btn-action" title="Download full session transcript (.txt)">
+              ⬇ Save .txt
+            </button>
+          </div>
+          <div id="transcriptList" class="transcript-list"></div>
+        </div>
+      </details>
+    </section>
+
+    <!-- COLUMN 2: ONE FOCUS AT A TIME (BEST MOVE | PUZZLE | COMBAT) -->
+    <section class="panel col-focus">
+      <div class="focus-tabs" role="tablist">
+        <button class="focus-tab active" data-tab="advisor" type="button">🪄 Best Move</button>
+        <button class="focus-tab" data-tab="puzzle" type="button">🧩 Puzzle</button>
+        <button class="focus-tab" data-tab="combat" type="button">⚔️ Combat</button>
+      </div>
+
+      <!-- TAB 1: BEST MOVE / SPELL SUGGESTIONS -->
+      <div id="viewAdvisor" class="focus-body">
+        <div class="sub-bar">
+          <span id="playingAsLabel" class="muted-label">Select ★ Me on your sheet →</span>
+          <button id="btnRunAdvisor" class="btn btn-primary">⚡ Suggest Best Move</button>
+        </div>
+
+        <div id="concentrationAlert" class="alert-box hidden"></div>
+        <p id="advisorOverview" class="lead-text">
+          Mark your character with <strong>★ Me</strong> on the right, then click <strong>Suggest Best Move</strong>.
+        </p>
+        <div id="advisorCustomAnswer" class="answer-box hidden"></div>
+
+        <div id="advisorRecommendations" class="stack-list"></div>
+
+        <form id="advisorQuestionForm" class="simple-row bottom-ask">
+          <input
+            id="advisorQuestionInput"
+            type="text"
+            class="input"
+            placeholder="Ask a tactical question (e.g. Best AoE right now?)..."
+          />
+          <button type="submit" class="btn btn-action">Ask</button>
+        </form>
+      </div>
+
+      <!-- TAB 2: PUZZLE SOLVER -->
+      <div id="viewPuzzle" class="focus-body hidden">
+        <div class="sub-bar">
+          <span class="muted-label">Riddles, Clues &amp; Theories</span>
+          <button id="btnSolvePuzzle" class="btn btn-primary">🧠 Solve Puzzle</button>
+        </div>
+
+        <input
+          id="puzzleInscriptionInput"
+          type="text"
+          class="input riddle-input"
+          placeholder="Riddle or inscription text..."
+        />
+
+        <form id="addClueForm" class="simple-row">
+          <input id="newClueInput" type="text" class="input" placeholder="Add a clue..." />
+          <button type="submit" class="btn btn-quiet">+ Clue</button>
+        </form>
+
+        <div id="puzzleCluesList" class="clues-box"></div>
+        <div id="puzzleHypothesesList" class="stack-list"></div>
+        <div id="puzzleNextChecks" class="checks-box"></div>
+      </div>
+
+      <!-- TAB 3: PLAYER-FAIR COMBAT & ROLLS -->
+      <div id="viewCombat" class="focus-body hidden">
+        <div class="sub-bar">
+          <span id="combatRoundLabel" class="muted-label">Out of Combat</span>
+          <button id="btnSyncAboveVttNow" class="btn btn-quiet">↻ Sync VTT</button>
+        </div>
+
+        <div id="initiativeStrip" class="init-strip hidden"></div>
+
+        <form id="addEnemyForm" class="simple-row">
+          <input id="newEnemyNameInput" type="text" class="input" placeholder="Add enemy name..." />
+          <button type="submit" class="btn btn-quiet">+ Add</button>
+        </form>
+
+        <div id="enemyList" class="stack-list"></div>
+
+        <h3 class="section-heading">Recent Rolls</h3>
+        <div id="gameLogList" class="rolls-list"></div>
+      </div>
+    </section>
+
+    <!-- COLUMN 3: PARTY HEALTH & SPELL SLOTS (SAVED IN EXTENSION AS B.U.G.S.) -->
+    <section class="panel col-party">
+      <div class="panel-header">
+        <div class="party-group-bar">
+          <select id="partyGroupSelect" class="party-group-select" title="Saved Party Group (persisted in Chrome extension)">
+            <option value="B.U.G.S.">B.U.G.S.</option>
+          </select>
+        </div>
+        <div class="header-actions">
+          <button id="btnRefreshParty" class="btn btn-quiet" title="Sync sheets from D&amp;D Beyond">↻</button>
+          <button id="btnOpenSheetsModal" class="btn btn-action">+ Hero</button>
+        </div>
+      </div>
+
+      <div id="partyList" class="party-list"></div>
+    </section>
+  </main>
+
+  <!-- MODAL 1: ABOVEVTT & PARTY CHARACTER SHEETS -->
+  <div id="bridgeModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>Party Group &amp; AboveVTT</h2>
+        <button class="btn-close" data-close-modal="bridgeModal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="info-block">
+          <strong>Saved Party Group in Extension</strong>
+          <p class="muted-p">Your character sheets are automatically saved in the extension under this group name:</p>
+          <div class="simple-row" style="margin-top:8px;">
+            <input
+              id="partyGroupNameInput"
+              type="text"
+              class="input"
+              value="B.U.G.S."
+              placeholder="Group name (e.g. B.U.G.S.)"
+            />
+            <button id="btnSavePartyGroup" type="button" class="btn btn-action">💾 Save Group</button>
+          </div>
+        </div>
+
+        <div class="info-block">
+          <strong>Add Party Character Sheets (D&amp;D Beyond)</strong>
+          <p class="muted-p">Paste D&amp;D Beyond character links or IDs (one per line):</p>
+          <textarea
+            id="characterUrlsInput"
+            class="textarea"
+            rows="3"
+            placeholder="https://www.dndbeyond.com/characters/12345678"
+          ></textarea>
+          <button id="btnSyncCharacterUrls" class="btn btn-primary" style="margin-top:8px;">
+            Sync Character Sheets
+          </button>
+        </div>
+
+        <div class="info-block">
+          <strong>AboveVTT Connection (<span id="extDetectedText">Checking...</span>)</strong>
+          <p class="muted-p">
+            If running as an unpacked Chrome extension, any open D&amp;D Beyond / AboveVTT tab connects automatically!
+            On a locked-down work Mac without extensions, drag this bookmark to your Bookmarks Bar and click it on your AboveVTT tab:
+          </p>
+          <div class="simple-row" style="margin-top:8px;">
+            <a id="bookmarkletDragLink" class="bookmarklet-pill" href="#bookmarklet">⚔️ Sync AboveVTT</a>
+            <button id="btnCopyBookmarklet" class="btn btn-quiet" type="button">Copy Bookmark Link</button>
+          </div>
+        </div>
+
+        <details class="raw-details">
+          <summary>Paste Raw Character JSON (Offline Fallback)</summary>
+          <textarea id="rawCharacterJsonInput" class="textarea" rows="3" placeholder='{"data": {...}}'></textarea>
+          <button id="btnImportRawJson" class="btn btn-quiet" style="margin-top:6px;">Import JSON</button>
+        </details>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 2: SAVED TRANSCRIPTS & AUDIO RECORDINGS -->
+  <div id="savedModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>Saved Transcripts &amp; Audio Recordings</h2>
+        <button class="btn-close" data-close-modal="savedModal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="info-block">
+          <strong>Current Live Session Transcript (<span id="savedCurrentLineCount">0</span> lines)</strong>
+          <p class="muted-p">Auto-saved continuously inside the extension.</p>
+          <div class="simple-row" style="margin-top:10px;">
+            <button id="btnDownloadCurrentTranscript" type="button" class="btn btn-primary">
+              ⬇ Download Transcript (.txt)
+            </button>
+            <button id="btnArchiveCurrentTranscript" type="button" class="btn btn-action">
+              📌 Save Snapshot to Archive
+            </button>
+          </div>
+        </div>
+
+        <div class="info-block">
+          <strong>Saved Session Audio Recordings</strong>
+          <p class="muted-p">Recorded sessions are flushed to browser storage every 5 seconds so nothing is lost.</p>
+          <div id="savedAudioList" class="stack-list" style="margin-top:10px;"></div>
+        </div>
+
+        <div class="info-block">
+          <strong>Archived Session Transcripts</strong>
+          <div id="savedTranscriptArchiveList" class="stack-list" style="margin-top:10px;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 3: SIMPLE SETTINGS (GROQ & GEMINI KEYS) -->
+  <div id="settingsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>Settings</h2>
+        <button class="btn-close" data-close-modal="settingsModal">✕</button>
+      </div>
+      <div class="modal-body">
+        <label class="field">
+          <span class="field-label">Groq API Key (Recommended — Free Tier at console.groq.com/keys)</span>
+          <input
+            id="settingGroqKey"
+            type="password"
+            class="input"
+            placeholder="gsk_... (powers Groq Whisper speech + fast AI advice)"
+            autocomplete="off"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field-label">Optional Gemini API Key (Leave blank if using Groq or Free Local Mode)</span>
+          <input
+            id="settingApiKey"
+            type="password"
+            class="input"
+            placeholder="AIza... (optional)"
+            autocomplete="off"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field-label">AI Brain Preference</span>
+          <select id="settingAiProvider" class="select">
+            <option value="auto">Automatic (Uses Groq or Gemini key if entered, otherwise $0 Local)</option>
+            <option value="groq">Groq (Llama 3.3 70B)</option>
+            <option value="gemini">Google Gemini</option>
+            <option value="local-free">Free Offline Rules Engine ($0, no key)</option>
+          </select>
+        </label>
+
+        <div class="modal-footer">
+          <div class="simple-row">
+            <button id="btnLoadDemo" class="btn btn-quiet" type="button">Load Demo</button>
+            <button id="btnExportSession" class="btn btn-quiet" type="button" title="Export B.U.G.S. party &amp; session to transfer to another computer">Export Backup</button>
+            <button id="btnImportSession" class="btn btn-quiet" type="button" title="Import a backup JSON from another computer">Import Backup</button>
+            <input id="importBackupFileInput" type="file" accept=".json,application/json" class="hidden" />
+            <button id="btnResetSession" class="btn btn-danger" type="button">New Session</button>
+          </div>
+          <button id="btnSaveSettings" class="btn btn-primary" type="button">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script defer src="js/ddb-parser.js"></script>
+  <script defer src="js/state.js"></script>
+  <script defer src="js/local-brain.js"></script>
+  <script defer src="js/gemini-client.js"></script>
+  <script defer src="js/session-recorder.js"></script>
+  <script defer src="js/audio-listener.js"></script>
+  <script defer src="js/bridge-host.js"></script>
+  <script defer src="js/app.js"></script>
+</body>
+</html>
