@@ -6,6 +6,30 @@
 let latestAboveVttSnapshot = null;
 let latestSourceTabId = null;
 
+async function fetchLocalServerRollContext() {
+  try {
+    const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), 1800) : null;
+    const resp = await fetch(`http://127.0.0.1:8765/api/local-profile?_t=${Date.now()}`, {
+      cache: "no-store",
+      ...(ctrl ? { signal: ctrl.signal } : {})
+    });
+    if (timer) clearTimeout(timer);
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const prof = data?.exists ? data.profile : null;
+    const party = Array.isArray(prof?.state?.party)
+      ? prof.state.party.filter((p) => p?.id && !String(p.id).startsWith("demo-"))
+      : [];
+    if (party.length === 0) return null;
+    const myId = prof?.state?.myCharacterId;
+    const myChar = party.find((p) => String(p.id) === String(myId)) || party[0];
+    return { myChar, party, updatedAt: Date.now() };
+  } catch (_) {
+    return null;
+  }
+}
+
 async function openOrFocusDashboard() {
   const dashboardUrl = chrome.runtime.getURL("index.html");
   const existingTabs = await chrome.tabs.query({ url: dashboardUrl });
@@ -160,6 +184,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       type: "BRIDGE_GAMELOG_ROLLS",
       rolls: message.rolls || []
     }).catch(() => {});
+    fetch("http://127.0.0.1:8765/api/abovevtt-rolls", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        rolls: Array.isArray(message.rolls) ? message.rolls : [],
+        sourcePage: sender?.tab?.url || ""
+      })
+    }).catch(() => {});
     sendResponse({ ok: true });
     return false;
   }
@@ -199,6 +231,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "GET_ROLL_CONTEXT") {
     (async () => {
       try {
+        const localCtx = await fetchLocalServerRollContext();
+        if (localCtx?.myChar) {
+          chrome.storage?.local?.set({ dnd_copilot_roll_context: localCtx }).catch(() => {});
+          sendResponse({ ok: true, ...localCtx });
+          return;
+        }
         const stored = await chrome.storage?.local?.get("dnd_copilot_roll_context");
         sendResponse({ ok: true, ...(stored?.dnd_copilot_roll_context || {}) });
       } catch (_) {

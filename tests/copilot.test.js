@@ -2128,6 +2128,8 @@ test("DDBParser extracts item spell bonuses/saves/traits and RollMaximizer maxim
   const rm = sb.DnDCopilot.RollMaximizer;
 
   const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8"));
+  assert.ok(manifest.content_scripts[0].all_frames === true, "content_scripts must inject into AboveVTT character sheet iframes");
+  assert.ok(manifest.content_scripts[0].js.includes("js/ddb-parser.js"));
   assert.ok(manifest.content_scripts[0].js.includes("js/roll-maximizer.js"));
 
   const rainePayload = {
@@ -2279,4 +2281,14 @@ test("DDBParser extracts item spell bonuses/saves/traits and RollMaximizer maxim
   );
   assert.ok(avttCoach.reminders.some((r) => /14 → 17/.test(r.extraNote)));
   assert.ok(avttCoach.reminders.some((r) => /Gnome Cunning/i.test(r.title)));
+
+  // Simulate an AboveVTT-embedded character sheet click / .noty_body toast where actor name isn't printed in the toast
+  const rayToastCoach = rm.analyzeAboveVttRoll(
+    { actor: "Raine", action: "Ray of Frost", kind: "attack", total: 17, rawText: "Ray of Frost To Hit 1d20+9 = 17" },
+    raine,
+    party
+  );
+  assert.equal(rayToastCoach.matchedSpec.name, "Ray of Frost");
+  assert.ok(rayToastCoach.reminders.some((r) => /Wand of the War Mage/i.test(r.title)));
+  assert.ok(rayToastCoach.reminders.some((r) => /Elemental Adept \(Cold\)/i.test(r.title)));
 });

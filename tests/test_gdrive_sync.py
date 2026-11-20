@@ -171,6 +171,22 @@ class GdriveSyncTests(unittest.TestCase):
             self.assertTrue(local_server_mod.has_real_party(loaded))
             self.assertEqual(loaded["state"]["party"][0]["name"], "Raine")
 
+    def test_abovevtt_roll_relay_dedupes_and_filters_since(self):
+        with local_server_mod.ABOVEVTT_ROLLS_LOCK:
+            local_server_mod.ABOVEVTT_ROLLS.clear()
+        r1 = local_server_mod.append_abovevtt_rolls(
+            [{"fingerprint": "fp-raine-wis-14", "actor": "Raine", "action": "WIS Save", "kind": "save", "total": 14}],
+            source_page="https://www.dndbeyond.com/characters/141442264?abovevtt=true",
+        )
+        self.assertEqual(r1["added"], 1)
+        ts1 = r1["lastReceivedAt"]
+        dup = local_server_mod.append_abovevtt_rolls([{"fingerprint": "fp-raine-wis-14", "actor": "Raine", "total": 14}])
+        self.assertEqual(dup["added"], 0)
+        since_zero = local_server_mod.get_abovevtt_rolls_since(0)
+        self.assertEqual(len(since_zero["rolls"]), 1)
+        since_after = local_server_mod.get_abovevtt_rolls_since(ts1)
+        self.assertEqual(len(since_after["rolls"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

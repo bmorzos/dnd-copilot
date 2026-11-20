@@ -19,6 +19,8 @@ import gdrive_sync
 ROOT_DIR = Path(__file__).resolve().parent
 PROFILE_FILE = ROOT_DIR / ".copilot-profile.json"
 PROFILE_LOCK = threading.Lock()
+ABOVEVTT_ROLLS = []
+ABOVEVTT_ROLLS_LOCK = threading.Lock()
 ALLOWED_CORS_ORIGIN_RE = re.compile(
     r"^(?:https?://(?:127\.0\.0\.1|localhost)(?::\d+)?|chrome-extension://[a-z0-9]+)$"
 )
@@ -70,6 +72,13 @@ class CopilotRequestHandler(SimpleHTTPRequestHandler):
             if data:
                 return self._send_json_obj(200, {"exists": True, "profile": data})
             return self._send_json_obj(200, {"exists": False})
+
+        if path == "/api/abovevtt-rolls":
+            try:
+                since_ms = int((qs.get("since") or ["0"])[0])
+            except ValueError:
+                since_ms = 0
+            return self._send_json_obj(200, get_abovevtt_rolls_since(since_ms))
 
         match = DDB_PROXY_RE.match(self.path)
         if match:
@@ -200,6 +209,12 @@ class CopilotRequestHandler(SimpleHTTPRequestHandler):
                 force = bool(body.get("force"))
                 payload = body.get("profile") if isinstance(body.get("profile"), dict) else body
                 res = save_local_profile(payload, force=force)
+                return self._send_json_obj(200, res)
+
+            if path == "/api/abovevtt-rolls":
+                rolls = body.get("rolls") if isinstance(body.get("rolls"), list) else []
+                source_page = str(body.get("sourcePage") or "")
+                res = append_abovevtt_rolls(rolls, source_page=source_page)
                 return self._send_json_obj(200, res)
 
             return self._send_json_obj(404, {"error": f"Unknown API endpoint: {path}"})
@@ -374,6 +389,44 @@ def save_local_profile(payload: dict, profile_path: Path = PROFILE_FILE, force: 
         tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         os.replace(tmp_path, profile_path)
         return {"ok": True, "savedAt": int(time.time() * 1000), "hasRealParty": has_real_party(payload)}
+
+
+def append_abovevtt_rolls(rolls: list, source_page: str = "", max_items: int = 60) -> dict:
+    """Appends deduped AboveVTT/D&D Beyond rolls into memory so localhost dashboard stays live."""
+    if not isinstance(rolls, list) or not rolls:
+        return {"ok": True, "added": 0, "lastReceivedAt": 0}
+    with ABOVEVTT_ROLLS_LOCK:
+        seen = {r.get("fingerprint") for r in ABOVEVTT_ROLLS if r.get("fingerprint")}
+        added = 0
+        last_ts = int(ABOVEVTT_ROLLS[-1].get("receivedAt") or 0) if ABOVEVTT_ROLLS else 0
+        now_ms = int(time.time() * 1000)
+        for item in rolls:
+            if not isinstance(item, dict):
+                continue
+            fp = str(item.get("fingerprint") or "").strip()
+            if not fp or fp in seen:
+                continue
+            seen.add(fp)
+            now_ms = max(now_ms, last_ts + 1)
+            last_ts = now_ms
+            entry = dict(item)
+            entry["receivedAt"] = now_ms
+            if source_page and not entry.get("sourcePage"):
+                entry["sourcePage"] = source_page
+            ABOVEVTT_ROLLS.append(entry)
+            added += 1
+        if len(ABOVEVTT_ROLLS) > max_items:
+            del ABOVEVTT_ROLLS[:-max_items]
+        final_ts = int(ABOVEVTT_ROLLS[-1].get("receivedAt") or 0) if ABOVEVTT_ROLLS else 0
+        return {"ok": True, "added": added, "lastReceivedAt": final_ts}
+
+
+def get_abovevtt_rolls_since(since_ms: int = 0) -> dict:
+    """Returns relayed AboveVTT rolls newer than since_ms."""
+    with ABOVEVTT_ROLLS_LOCK:
+        rows = [dict(r) for r in ABOVEVTT_ROLLS if int(r.get("receivedAt") or 0) > since_ms]
+        last_ts = int(ABOVEVTT_ROLLS[-1].get("receivedAt") or 0) if ABOVEVTT_ROLLS else 0
+        return {"rolls": rows, "lastReceivedAt": last_ts}
 
 
 def _start_drive_auto_sync_thread():

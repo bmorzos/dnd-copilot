@@ -37,7 +37,9 @@
       "matches": [
         "https://www.dndbeyond.com/*"
       ],
+      "all_frames": true,
       "js": [
+        "js/ddb-parser.js",
         "js/roll-maximizer.js",
         "content-script.js"
       ],

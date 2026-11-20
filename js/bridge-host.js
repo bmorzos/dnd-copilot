@@ -19,9 +19,11 @@
       this.tabShareTimer = null;
       this.syncedCharacterIds = new Set();
       this.lastRollSyncHash = "";
+      this.lastPolledRollTs = Date.now() - 10000;
 
       this.#initExtensionListeners();
       this.#initPostMessageListeners();
+      this.#initLocalRollRelayPoller();
 
       // Periodic character sheet refresh every 30s in Extension, Bookmarklet, and Local Server modes
       setInterval(() => {
@@ -109,6 +111,43 @@
           window.opener.postMessage({ source: "dnd-copilot-dashboard", type: "DASHBOARD_READY" }, "*");
         } catch (_) {}
       }
+    }
+
+    #initLocalRollRelayPoller() {
+      if (!this.isLocalServerContext()) return;
+      const pollOnce = async () => {
+        try {
+          const resp = await fetch(`/api/abovevtt-rolls?since=${this.lastPolledRollTs}&_t=${Date.now()}`, {
+            cache: "no-store"
+          });
+          if (!resp.ok) return;
+          const data = await resp.json();
+          const rolls = Array.isArray(data?.rolls) ? data.rolls : [];
+          if (rolls.length > 0) {
+            const maxTs = Math.max(
+              this.lastPolledRollTs,
+              ...rolls.map((r) => Number(r.receivedAt || 0))
+            );
+            this.lastPolledRollTs = maxTs;
+            this.store.state.bridgeStatus = {
+              mode: "extension",
+              connectedPage: "AboveVTT Live (Extension)",
+              isAboveVttActive: true,
+              lastHeartbeat: Date.now()
+            };
+            const added = this.store.ingestGameLogRolls(rolls, true);
+            if (Array.isArray(added) && added.length > 0) {
+              this.onNewAboveVttRolls(added);
+            } else {
+              this.store.save();
+            }
+          }
+        } catch (_) {
+          // Ignore transient poll errors
+        }
+      };
+      setInterval(pollOnce, 2000);
+      setTimeout(pollOnce, 1200);
     }
 
     async #handleIncomingSnapshot(snapshot, modeLabel) {

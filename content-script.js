@@ -209,30 +209,54 @@
   }
 
   function parseGameLogEntry(li) {
-    // Strictly skip DM-only hidden game log entries
+    // Strictly skip DM-only hidden game log entries and our own coach UI
     if (!isElementVisible(li)) return null;
+    if (li.closest("#dnd-copilot-roll-toast, #dnd-copilot-roll-drawer, #dnd-copilot-roll-pill, #dnd-copilot-cross-tab-alert")) {
+      return null;
+    }
 
     const rawText = (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim();
     if (!rawText || rawText.length < 2) return null;
 
-    // Extract structured segments from DDB / AboveVTT game log markup
-    const sender =
-      li.querySelector(
-        "[class*='sender'], [class*='characterName'], [class*='playerName'], .gamelog-character-name, strong, b"
-      )?.textContent?.trim() || "";
-
+    // Extract structured segments from DDB / AboveVTT / Noty game log markup
     const actionLabel =
       li.querySelector(
-        "[class*='action'], [class*='rollName'], [class*='title'], .dice_result__info__title"
+        "[class*='action'], [class*='rollName'], [class*='title'], .dice_result__info__title, [class*='RollName'], [class*='Source']"
       )?.textContent?.trim() || "";
+
+    let sender =
+      li.querySelector(
+        "[class*='sender'], [class*='characterName'], [class*='playerName'], .gamelog-character-name, .dice_result__info__rolldetail-character"
+      )?.textContent?.trim() || "";
+
+    if (!sender) {
+      const strongText = li.querySelector("strong, b")?.textContent?.trim() || "";
+      if (
+        strongText &&
+        strongText !== actionLabel &&
+        !/^\d+$/.test(strongText) &&
+        !/\b(to hit|damage|saving throw|ability check|critical)\b/i.test(strongText) &&
+        strongText.length <= 36
+      ) {
+        sender = strongText;
+      }
+    }
+
+    const myId = rollContext?.myChar?.id ? String(rollContext.myChar.id) : "";
+    const isMyCharSheet = Boolean(myId && window.location.pathname.includes(`/characters/${myId}`));
+    if ((!sender || /^(table|roll|message)$/i.test(sender) || (isMyCharSheet && !li.querySelector("[class*='sender'], [class*='characterName'], [class*='playerName'], .gamelog-character-name"))) && isMyCharSheet) {
+      sender = rollContext.myChar.name || sender;
+    } else if (!sender && rollContext?.myChar?.name && (li.matches(".noty_body, .dice_result") || li.closest(".noty_body, [class*='DiceNotification']"))) {
+      sender = rollContext.myChar.name;
+    }
 
     const rollTypeLabel =
       li.querySelector(
-        "[class*='rollType'], .dice_result__rolltype, [class*='subTitle']"
+        "[class*='rollType'], .dice_result__rolltype, [class*='subTitle'], .dice_result__info__breakdown"
       )?.textContent?.trim() || "";
 
     const totalEl = li.querySelector(
-      "[class*='total'], .dice_result__total-result, [class*='resultTotal'], [class*='finalResult']"
+      ".dice_result__total-result, [class*='resultTotal'], [class*='finalResult'], [class*='totalResult'], [class*='Total'], [class*='total']"
     );
 
     let total = null;
@@ -244,9 +268,11 @@
     const formulaMatch = rawText.match(/\b(\d+d\d+(?:\s*[+-]\s*\d+)?)\b/i);
     const formula = formulaMatch ? formulaMatch[1].replace(/\s+/g, "") : "";
 
-    // Fallback numeric extraction for AboveVTT custom injected dice cards
-    if (total === null && formula) {
-      const numbers = rawText.match(/(?:=|:|\bresult\b)\s*(-?\d{1,4})\b/i) || rawText.match(/\b(-?\d{1,3})\s*$/);
+    // Fallback numeric extraction for AboveVTT / DDB dice toast cards
+    if (total === null && (formula || li.matches(".noty_body, .dice_result, [class*='DiceResult'], [class*='DiceNotification']"))) {
+      const numbers =
+        rawText.match(/(?:=|:|\bresult\b|\btotal\b)\s*(-?\d{1,4})\b/i) ||
+        rawText.match(/\b(-?\d{1,3})\s*$/);
       if (numbers) {
         const parsed = parseInt(numbers[1], 10);
         if (Number.isFinite(parsed)) total = parsed;
@@ -280,26 +306,47 @@
   }
 
   function collectVisibleGameLog(onlyNew = false) {
+    const candidates = [];
     const containers = document.querySelectorAll(
-      ".ct-game-log-pane, [class*='styles_gameLogPane'], [class*='GameLog'], #gamelog_panel"
+      ".ct-game-log-pane, [class*='styles_gameLog'], [class*='GameLog'], #gamelog_panel, #gamelog"
     );
+    containers.forEach((container) => {
+      container.querySelectorAll("li, [class*='GameLogEntry'], [class*='gameLogEntry'], [class*='entry']").forEach((el) => {
+        candidates.push(el);
+      });
+    });
+    document
+      .querySelectorAll(".noty_body, .dice_result, [class*='DiceNotification'], [class*='DiceResult'], [class*='RollResult']")
+      .forEach((el) => {
+        candidates.push(el);
+      });
+
+    // Dedupe nested elements so outer card & inner dice_result aren't parsed twice
+    const candidateSet = new Set(candidates);
+    const topNodes = candidates.filter((node) => {
+      let p = node.parentElement;
+      while (p) {
+        if (candidateSet.has(p)) return false;
+        p = p.parentElement;
+      }
+      return true;
+    });
+
     const entries = [];
     const seenInPass = new Set();
 
-    containers.forEach((container) => {
-      container.querySelectorAll("li").forEach((li) => {
-        const parsed = parseGameLogEntry(li);
-        if (!parsed || seenInPass.has(parsed.fingerprint)) return;
-        seenInPass.add(parsed.fingerprint);
+    topNodes.forEach((node) => {
+      const parsed = parseGameLogEntry(node);
+      if (!parsed || seenInPass.has(parsed.fingerprint)) return;
+      seenInPass.add(parsed.fingerprint);
 
-        const isNew = !seenRollFingerprints.has(parsed.fingerprint);
-        if (isNew) {
-          seenRollFingerprints.add(parsed.fingerprint);
-        }
-        if (!onlyNew || isNew) {
-          entries.push(parsed);
-        }
-      });
+      const isNew = !seenRollFingerprints.has(parsed.fingerprint);
+      if (isNew) {
+        seenRollFingerprints.add(parsed.fingerprint);
+      }
+      if (!onlyNew || isNew) {
+        entries.push(parsed);
+      }
     });
 
     return entries.slice(-40);
@@ -359,12 +406,59 @@
       display: "flex",
       alignItems: "center",
       justifyContent: "space-between",
-      gap: "8px",
+      gap: "6px",
       marginBottom: "6px"
     });
     const titleEl = document.createElement("strong");
     titleEl.style.color = "#f0c46c";
+    titleEl.style.flex = "1";
     titleEl.textContent = `🎲 ${title || "Full Potential Coach"}`;
+
+    const actionBtns = document.createElement("div");
+    Object.assign(actionBtns.style, { display: "flex", alignItems: "center", gap: "4px" });
+
+    if (sayScript) {
+      const copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.textContent = "📋";
+      copyBtn.title = "Copy Say-Aloud script";
+      Object.assign(copyBtn.style, {
+        background: "#1f273a",
+        border: "1px solid #2c3752",
+        borderRadius: "5px",
+        color: "#f3f6fc",
+        cursor: "pointer",
+        fontSize: "12px",
+        padding: "2px 6px"
+      });
+      copyBtn.addEventListener("click", () => {
+        navigator.clipboard?.writeText(sayScript).catch(() => {});
+        copyBtn.textContent = "✓";
+        setTimeout(() => {
+          copyBtn.textContent = "📋";
+        }, 1200);
+      });
+      actionBtns.appendChild(copyBtn);
+    }
+
+    const openDrawerBtn = document.createElement("button");
+    openDrawerBtn.type = "button";
+    openDrawerBtn.textContent = "🎲";
+    openDrawerBtn.title = "Open Roll Coach drawer";
+    Object.assign(openDrawerBtn.style, {
+      background: "#1f273a",
+      border: "1px solid #2c3752",
+      borderRadius: "5px",
+      color: "#f0c46c",
+      cursor: "pointer",
+      fontSize: "12px",
+      padding: "2px 6px"
+    });
+    openDrawerBtn.addEventListener("click", () => {
+      coachDrawerOpen = true;
+      renderFloatingRollDrawer();
+    });
+
     const closeBtn = document.createElement("button");
     closeBtn.type = "button";
     closeBtn.textContent = "✕";
@@ -376,7 +470,8 @@
       fontSize: "15px"
     });
     closeBtn.addEventListener("click", () => card.remove());
-    header.append(titleEl, closeBtn);
+    actionBtns.append(openDrawerBtn, closeBtn);
+    header.append(titleEl, actionBtns);
     card.appendChild(header);
 
     if (sayScript) {
@@ -435,7 +530,29 @@
     }
   }
 
+  function shouldShowFloatingRollUi() {
+    if (!document.body) return false;
+    if (window.innerWidth < 280 || window.innerHeight < 200) return false;
+    if (window.top === window) {
+      return (
+        /\/(?:characters|campaigns|games)\//i.test(window.location.pathname) ||
+        Boolean(
+          document.getElementById("combat_tracker") ||
+            document.getElementById("tokens") ||
+            document.querySelector(".player-card[data-player-id], .ct-character-sheet")
+        )
+      );
+    }
+    // Inside AboveVTT character-sheet iframe
+    return (
+      /\/characters\/\d+/i.test(window.location.pathname) ||
+      /abovevtt=true/i.test(window.location.search) ||
+      Boolean(document.querySelector(".ct-character-sheet"))
+    );
+  }
+
   function renderFloatingRollDrawer() {
+    if (!shouldShowFloatingRollUi()) return;
     let pill = document.getElementById("dnd-copilot-roll-pill");
     if (!pill && document.body) {
       pill = document.createElement("button");
@@ -910,17 +1027,96 @@
     return false;
   });
 
-  chrome.runtime
-    .sendMessage({ type: "GET_ROLL_CONTEXT" })
-    .then((resp) => {
+  function initSheetRollClickListener() {
+    if (window.__dndCopilotClickListenerBound) return;
+    window.__dndCopilotClickListenerBound = true;
+    document.addEventListener(
+      "click",
+      (ev) => {
+        try {
+          const target = ev.target;
+          if (!target || typeof target.closest !== "function") return;
+          if (target.closest("#dnd-copilot-roll-pill, #dnd-copilot-roll-drawer, #dnd-copilot-roll-toast")) return;
+          const rm = window.DnDCopilot?.RollMaximizer;
+          const myChar = rollContext?.myChar;
+          if (!rm || !myChar) return;
+
+          const clickable = target.closest(
+            ".integrated-dice__container, [class*='integrated-dice'], [class*='rollable'], [class*='dice-button'], [data-dice-notation], button, [role='button']"
+          );
+          if (!clickable) return;
+
+          const btnText = (clickable.innerText || clickable.textContent || "").replace(/\s+/g, " ").trim();
+          const clsAttr = String(clickable.getAttribute("class") || "");
+          const hasDiceCls = /dice|rollable/i.test(clsAttr) || clickable.hasAttribute("data-dice-notation");
+          const looksLikeRollText = /^[+-]\s*\d+$|^\d+d\d+|^DC\s*\d+|\broll\b/i.test(btnText);
+          if (!hasDiceCls && !looksLikeRollText) return;
+
+          const contextEl =
+            clickable.closest(
+              ".ct-spells-spell, [class*='spell'], [class*='attack'], [class*='skill'], [class*='saving-throw'], [class*='initiative'], tr, [role='row'], li"
+            ) || clickable.parentElement;
+          const ctxText = ((contextEl?.innerText || contextEl?.textContent || btnText) || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 200);
+          if (!ctxText) return;
+
+          const clickKind = classifyRollKind(ctxText, btnText);
+          const analyzed = rm.analyzeAboveVttRoll(
+            {
+              actor: myChar.name,
+              action: ctxText.slice(0, 48),
+              kind: clickKind === "chat" ? "roll" : clickKind,
+              total: null,
+              rawText: `${ctxText} ${btnText}`
+            },
+            myChar,
+            rollContext.party || []
+          );
+          if (!analyzed || analyzed.reminders.length === 0) return;
+          const sayLines = analyzed.reminders.map((r) => r.sayThis).filter(Boolean).slice(0, 3);
+          const bullets = analyzed.reminders.slice(0, 4).map((r) => `${r.title}${r.extraNote ? ` (${r.extraNote})` : ""}`);
+          if (sayLines.length > 0 || bullets.length > 0) {
+            showRollCoachToast(
+              `${myChar.name} · ${analyzed.matchedSpec?.name || "Roll"}`,
+              bullets,
+              sayLines.join(" ")
+            );
+          }
+        } catch (_) {
+          // Never interfere with host DDB click handlers
+        }
+      },
+      true
+    );
+  }
+
+  async function ensureRollContextLoaded() {
+    try {
+      const resp = await chrome.runtime.sendMessage({ type: "GET_ROLL_CONTEXT" });
       if (resp?.myChar) {
         rollContext = { myChar: resp.myChar, party: resp.party || [] };
       }
-      renderFloatingRollDrawer();
-    })
-    .catch(() => {
-      renderFloatingRollDrawer();
-    });
+    } catch (_) {}
+
+    if (!rollContext?.myChar && window.DnDCopilot?.DDBParser) {
+      const cid = extractCharacterIdFromString(window.location.href);
+      if (cid) {
+        try {
+          const json = await fetchCharacterJsonInPageContext(cid);
+          const parsed = window.DnDCopilot.DDBParser.parseCharacterJson(json);
+          rollContext = { myChar: parsed, party: [parsed] };
+        } catch (_) {}
+      }
+    }
+    renderFloatingRollDrawer();
+  }
+
+  ensureRollContextLoaded();
+  initSheetRollClickListener();
+  setInterval(ensureRollContextLoaded, 60000);
+  window.addEventListener("resize", () => renderFloatingRollDrawer());
 
   // Observe DOM updates cleanly with debounce
   let mutationTimer = null;
