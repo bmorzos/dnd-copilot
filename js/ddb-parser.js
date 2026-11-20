@@ -674,6 +674,7 @@
       spellSaveDc: 8 + profBonus + spellCastingMod,
       spellAttackBonus: profBonus + spellCastingMod,
       abilities,
+      inspiration: Boolean(data.inspiration),
       conditions: activeConditions,
       concentratingOn: "",
       spellSlots,

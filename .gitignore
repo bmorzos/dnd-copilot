@@ -6,3 +6,7 @@ __pycache__/
 node_modules/
 *backup*.json
 *.zip
+.gdrive-cache/
+.gdrive-token.json
+.gdrive-oauth.json
+.gdrive-config.json

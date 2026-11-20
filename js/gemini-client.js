@@ -544,7 +544,43 @@
     return allLines;
   }
 
-  function buildCompactSessionContext(store) {
+  function isLocalServerContext() {
+    const loc = global.location;
+    if (!loc || typeof global.fetch !== "function") return false;
+    const host = String(loc.hostname || "");
+    return (host === "localhost" || host === "127.0.0.1") && loc.protocol === "http:";
+  }
+
+  async function fetchLocalDriveMemoryContext(store, extraQuery = "") {
+    if (!isLocalServerContext()) return "";
+    let timer = null;
+    try {
+      const hasAbort = typeof AbortController === "function";
+      const ctrl = hasAbort ? new AbortController() : null;
+      if (ctrl) {
+        timer = setTimeout(() => ctrl.abort(), 2500);
+      }
+      const recentLines = (store.state.transcript || []).slice(-10).map((t) => t.text);
+      const resp = await global.fetch("/api/campaign-memory/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: String(extraQuery || ""),
+          recentLines
+        }),
+        ...(ctrl ? { signal: ctrl.signal } : {})
+      });
+      if (!resp || !resp.ok) return "";
+      const data = await resp.json();
+      return String(data?.contextText || "").trim();
+    } catch (_) {
+      return "";
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  function buildCompactSessionContext(store, extraPastContext = "") {
     const st = store.state;
     const myChar =
       st.party.find((p) => String(p.id) === String(st.myCharacterId)) || st.party[0] || null;
@@ -573,13 +609,15 @@
 
     const partyText = st.party
       .map((p) => {
-        const slots = p.spellSlots
+        const slots = (p.spellSlots || [])
           .map((s) => `${s.isPact ? "Pact " : ""}L${s.level}:${s.remaining}/${s.max}`)
           .join(", ");
         const isMe = myChar && String(p.id) === String(myChar.id) ? " [ME]" : "";
+        const insp = p.inspiration ? ", ✨ Inspired" : "";
+        const conds = p.conditions?.length ? `, Conditions: [${p.conditions.join(", ")}]` : "";
         return `- ${p.name} (${p.classSummary})${isMe}: HP ${p.hp.current}/${p.hp.max}${
           p.hp.temp ? ` +${p.hp.temp}thp` : ""
-        }, AC ${p.ac}${p.concentratingOn ? `, Concentrating on ${p.concentratingOn}` : ""}${
+        }, AC ${p.ac}${insp}${conds}${p.concentratingOn ? `, Concentrating on ${p.concentratingOn}` : ""}${
           slots ? `, Slots: [${slots}]` : ""
         }`;
       })
@@ -610,9 +648,13 @@
       : "";
     const myItemsAndSkills = [featureLine, skillLine, ...itemLines].filter(Boolean).join("\n");
 
-    const pastSessionsText = store.getRelevantPastContext
+    const localPast = store.getRelevantPastContext
       ? store.getRelevantPastContext(st.transcript.slice(-12))
       : "";
+    const pastSessionsText = [String(extraPastContext || "").trim(), localPast]
+      .filter(Boolean)
+      .join("\n\n")
+      .slice(0, 4200);
 
     return {
       myChar,
@@ -632,8 +674,14 @@
       return await global.DnDCopilot.LocalBrain.analyzeTableSituation(store);
     }
 
-    const ctx = buildCompactSessionContext(store);
+    const drivePastCtx = await fetchLocalDriveMemoryContext(store, "");
+    const ctx = buildCompactSessionContext(store, drivePastCtx);
     const existingClues = store.state.puzzle.clues.join(" | ");
+    const newSheetLines = store.getUnprocessedTranscriptLinesForSheets
+      ? store.getUnprocessedTranscriptLinesForSheets(18)
+      : [];
+    const newestLineId = newSheetLines.length ? newSheetLines[newSheetLines.length - 1].id : null;
+    const newLinesText = newSheetLines.map((t) => `[${t.speaker}] ${t.text}`).join("\n");
 
     const prompt = [
       "Summarize what is happening right now at our D&D table in plain, easy-to-read language.",
@@ -650,7 +698,14 @@
         : []),
       "--- RECENT TABLE CONVERSATION ---",
       ctx.recentTranscript || "None",
-      "Keep summaryBullets to 3 short, crisp sentences (filter out casual off-topic banter). Note any returning NPCs or quests from Past Sessions if mentioned."
+      ...(newLinesText
+        ? [
+            "--- NEW TABLE LINES SINCE LAST SHEET CHECK (ONLY extract committed partyUpdates from THESE lines) ---",
+            newLinesText
+          ]
+        : []),
+      "Keep summaryBullets to 3 short, crisp sentences (filter out casual off-topic banter). Note any returning NPCs or quests from Past Sessions if mentioned.",
+      "For partyUpdates, ONLY record committed party state changes explicitly spoken in the NEW TABLE LINES (damage taken, healing, set HP, temp HP, leveled/cantrip spell_cast, gain/spend inspiration, add/remove condition like Raging/Prone/Blessed/Poisoned, drop_concentration, short_rest, or long_rest). Ignore hypothetical brainstorms ('should I', 'what if', 'maybe'). Return [] if none."
     ].join("\n");
 
     let res;
@@ -668,7 +723,18 @@
           puzzleTitle: "",
           puzzleInscription: "",
           newPuzzleClues: [],
-          observedEnemyNotes: [{ enemyName: "Name", trait: "Trait" }]
+          observedEnemyNotes: [{ enemyName: "Name", trait: "Trait" }],
+          partyUpdates: [
+            {
+              characterName: "PC Name or all",
+              eventType: "spell_cast | damage | heal | set_hp | temp_hp | gain_inspiration | spend_inspiration | add_condition | remove_condition | drop_concentration | short_rest | long_rest",
+              spellName: "",
+              slotLevel: 0,
+              amount: 0,
+              condition: "",
+              isRitual: false
+            }
+          ]
         })
       });
     } else {
@@ -691,6 +757,38 @@
               properties: { enemyName: { type: "string" }, trait: { type: "string" } },
               required: ["enemyName", "trait"]
             }
+          },
+          partyUpdates: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                characterName: { type: "string" },
+                eventType: {
+                  type: "string",
+                  enum: [
+                    "spell_cast",
+                    "damage",
+                    "heal",
+                    "set_hp",
+                    "temp_hp",
+                    "gain_inspiration",
+                    "spend_inspiration",
+                    "add_condition",
+                    "remove_condition",
+                    "drop_concentration",
+                    "short_rest",
+                    "long_rest"
+                  ]
+                },
+                spellName: { type: "string" },
+                slotLevel: { type: "integer" },
+                amount: { type: "integer" },
+                condition: { type: "string" },
+                isRitual: { type: "boolean" }
+              },
+              required: ["characterName", "eventType"]
+            }
           }
         },
         required: [
@@ -701,7 +799,8 @@
           "notableNpcs",
           "puzzleDetected",
           "newPuzzleClues",
-          "observedEnemyNotes"
+          "observedEnemyNotes",
+          "partyUpdates"
         ]
       };
       res = await callInteractionsApi({
@@ -745,6 +844,11 @@
         }
       }
     }
+
+    const sheetRes = store.applyLivePartyUpdates
+      ? store.applyLivePartyUpdates(res.partyUpdates || [], newestLineId)
+      : { appliedCount: 0, descriptions: [] };
+    res._appliedPartyUpdates = sheetRes.descriptions;
 
     store.save();
     return res;
@@ -831,12 +935,17 @@
   }
 
   async function adviseTacticsAndSpells(store, customQuestion = "") {
+    const drivePastCtx = await fetchLocalDriveMemoryContext(store, customQuestion);
     const backend = resolveBrainBackend(store);
     if (backend === "local" && global.DnDCopilot?.LocalBrain) {
-      return await global.DnDCopilot.LocalBrain.adviseTacticsAndSpells(store, customQuestion);
+      return await global.DnDCopilot.LocalBrain.adviseTacticsAndSpells(
+        store,
+        customQuestion,
+        drivePastCtx
+      );
     }
 
-    const ctx = buildCompactSessionContext(store);
+    const ctx = buildCompactSessionContext(store, drivePastCtx);
     const sceneMode = store.state.situation?.sceneMode || (store.state.combat.inCombat ? "Combat" : "Exploration");
     const prompt = [
       `Current Scene Mode: ${sceneMode}.`,

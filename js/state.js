@@ -31,11 +31,56 @@
     return {
       ...pc,
       sheetUrl,
+      inspiration: Boolean(pc.inspiration),
+      conditions: Array.isArray(pc.conditions) ? pc.conditions : [],
+      concentratingOn: String(pc.concentratingOn || ""),
+      lastAutoUpdateNote: String(pc.lastAutoUpdateNote || ""),
       notableItems: Array.isArray(pc.notableItems) ? pc.notableItems : [],
       notableFeatures: Array.isArray(pc.notableFeatures) ? pc.notableFeatures : [],
       proficientSkills: Array.isArray(pc.proficientSkills) ? pc.proficientSkills : []
     };
   }
+
+  function buildRemoteBaseline(pc) {
+    if (!pc || typeof pc !== "object") return null;
+    const slotsUsed = Array.isArray(pc.spellSlots)
+      ? pc.spellSlots.map((s) => `${s.isPact ? "P" : "L"}${s.level}:${s.used}`).join(",")
+      : "";
+    return {
+      hpCurrent: Number(pc.hp?.current ?? 0),
+      hpTemp: Number(pc.hp?.temp ?? 0),
+      inspiration: Boolean(pc.inspiration),
+      conditions: Array.isArray(pc.conditions) ? [...pc.conditions].sort() : [],
+      slotsUsed
+    };
+  }
+
+  function toTitleCaseLabel(raw) {
+    return String(raw || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\b[a-z]/g, (ch) => ch.toUpperCase());
+  }
+
+  const SHORT_REST_CLEAR_BUFFS = new Set(["raging", "blessed", "hasted", "shield of faith"]);
+  const LONG_REST_CLEAR_CONDS = new Set([
+    "raging",
+    "blessed",
+    "hasted",
+    "shield of faith",
+    "poisoned",
+    "frightened",
+    "prone",
+    "unconscious",
+    "stunned",
+    "paralyzed",
+    "blinded",
+    "deafened",
+    "charmed",
+    "grappled",
+    "restrained",
+    "incapacitated"
+  ]);
 
   const DEFAULT_SETTINGS = {
     aiProvider: "auto", // "auto" | "local-free" | "groq" | "gemini"
@@ -54,7 +99,8 @@
     budgetCapUsd: 1.0,
     isFreeTierKey: false,
     autoSyncPartySheets: true,
-    autoUpdateIdeas: true
+    autoUpdateIdeas: true,
+    autoUpdatePartyFromTranscript: true
   };
 
   function createFreshSession() {
@@ -81,6 +127,9 @@
       },
       sessionBeats: [],
       sessionSummary: null,
+      lastSheetTrackedTranscriptId: null,
+      recentSheetUpdates: [],
+      lastAutoSheetBatch: null,
       transcript: [],
       puzzle: {
         isActive: false,
@@ -926,6 +975,14 @@
               parsed.sessionSummary && typeof parsed.sessionSummary === "object"
                 ? parsed.sessionSummary
                 : null,
+            lastSheetTrackedTranscriptId: parsed.lastSheetTrackedTranscriptId || null,
+            recentSheetUpdates: Array.isArray(parsed.recentSheetUpdates)
+              ? parsed.recentSheetUpdates
+              : [],
+            lastAutoSheetBatch:
+              parsed.lastAutoSheetBatch && typeof parsed.lastAutoSheetBatch === "object"
+                ? parsed.lastAutoSheetBatch
+                : null,
             puzzle: { ...fresh.puzzle, ...(parsed.puzzle || {}) },
             combat: { ...fresh.combat, ...(parsed.combat || {}) },
             advisor: { ...fresh.advisor, ...(parsed.advisor || {}) },
@@ -1148,6 +1205,10 @@
         });
       }
       this.state.transcript = mapped.slice(-20000);
+      this.state.lastSheetTrackedTranscriptId =
+        this.state.transcript.length > 0
+          ? this.state.transcript[this.state.transcript.length - 1].id
+          : null;
       this.save();
       return this.state.transcript;
     }
@@ -1275,6 +1336,14 @@
           sessionSummary:
             incomingState.sessionSummary && typeof incomingState.sessionSummary === "object"
               ? incomingState.sessionSummary
+              : null,
+          lastSheetTrackedTranscriptId: incomingState.lastSheetTrackedTranscriptId || null,
+          recentSheetUpdates: Array.isArray(incomingState.recentSheetUpdates)
+            ? incomingState.recentSheetUpdates
+            : [],
+          lastAutoSheetBatch:
+            incomingState.lastAutoSheetBatch && typeof incomingState.lastAutoSheetBatch === "object"
+              ? incomingState.lastAutoSheetBatch
               : null,
           puzzle: { ...fresh.puzzle, ...(incomingState.puzzle || {}) },
           combat: { ...fresh.combat, ...(incomingState.combat || {}) },
@@ -1573,6 +1642,8 @@
     upsertCharacter(rawCharObj, options = {}) {
       const charObj = normalizeCharacterRecord(rawCharObj);
       const manualAdd = Boolean(options.manualAdd);
+      const forceRemote = Boolean(options.forceRemote);
+      const remoteBaseline = buildRemoteBaseline(charObj);
 
       // If user was viewing Demo and imports a real sheet, switch straight into B.U.G.S.!
       if (this.partyGroups.activeGroupName === "__demo__" && !isDemoCharId(charObj.id)) {
@@ -1599,13 +1670,47 @@
 
       const idx = this.state.party.findIndex((p) => String(p.id) === String(charObj.id));
       if (idx >= 0) {
-        const existingConc = this.state.party[idx].concentratingOn;
-        this.state.party[idx] = {
-          ...charObj,
-          concentratingOn: charObj.concentratingOn || existingConc || ""
-        };
+        const existing = this.state.party[idx];
+        const prevBase = existing.lastSyncedRemoteBaseline || null;
+        const merged = { ...charObj, lastSyncedRemoteBaseline: remoteBaseline };
+
+        if (!forceRemote && existing.liveTrackedAt && prevBase) {
+          if (
+            remoteBaseline.hpCurrent === prevBase.hpCurrent &&
+            remoteBaseline.hpTemp === prevBase.hpTemp
+          ) {
+            merged.hp = {
+              ...charObj.hp,
+              current: Math.min(charObj.hp.max, Number(existing.hp?.current ?? charObj.hp.current)),
+              temp: Number(existing.hp?.temp ?? charObj.hp.temp)
+            };
+          }
+          if (
+            remoteBaseline.slotsUsed === prevBase.slotsUsed &&
+            Array.isArray(existing.spellSlots) &&
+            Array.isArray(charObj.spellSlots) &&
+            existing.spellSlots.length === charObj.spellSlots.length
+          ) {
+            merged.spellSlots = existing.spellSlots.map((s) => ({ ...s }));
+          }
+          if (remoteBaseline.inspiration === prevBase.inspiration) {
+            merged.inspiration = Boolean(existing.inspiration);
+          }
+          if (JSON.stringify(remoteBaseline.conditions) === JSON.stringify(prevBase.conditions)) {
+            merged.conditions = Array.isArray(existing.conditions) ? [...existing.conditions] : [];
+          }
+          merged.liveTrackedAt = existing.liveTrackedAt;
+          merged.lastAutoUpdateNote = existing.lastAutoUpdateNote || "";
+        } else if (forceRemote) {
+          merged.liveTrackedAt = null;
+          merged.lastAutoUpdateNote = "";
+        }
+
+        merged.concentratingOn =
+          charObj.concentratingOn || (!forceRemote ? existing.concentratingOn : "") || "";
+        this.state.party[idx] = merged;
       } else {
-        this.state.party.push(charObj);
+        this.state.party.push({ ...charObj, lastSyncedRemoteBaseline: remoteBaseline });
         if (!this.state.myCharacterId || isDemoCharId(this.state.myCharacterId)) {
           this.state.myCharacterId = charObj.id;
         }
@@ -1647,8 +1752,7 @@
       this.save();
     }
 
-    adjustPartyHp(charId, delta) {
-      const pc = this.state.party.find((p) => String(p.id) === String(charId));
+    #applyHpDeltaOnPc(pc, delta) {
       if (!pc) return;
       if (delta < 0 && pc.hp.temp > 0) {
         const absorb = Math.min(pc.hp.temp, Math.abs(delta));
@@ -1658,6 +1762,96 @@
       } else {
         pc.hp.current = Math.max(0, Math.min(pc.hp.max, pc.hp.current + delta));
       }
+      if (pc.hp.current === 0) {
+        pc.concentratingOn = "";
+        this.#addConditionOnPc(pc, "Unconscious");
+      } else if (delta > 0) {
+        this.#removeConditionOnPc(pc, "Unconscious");
+      }
+      pc.liveTrackedAt = Date.now();
+    }
+
+    #addConditionOnPc(pc, conditionName) {
+      const titleCond = toTitleCaseLabel(conditionName);
+      if (!pc || !titleCond) return false;
+      pc.conditions = Array.isArray(pc.conditions) ? pc.conditions : [];
+      const low = titleCond.toLowerCase();
+      if (pc.conditions.some((c) => String(c).toLowerCase() === low)) return false;
+      pc.conditions.push(titleCond);
+      pc.liveTrackedAt = Date.now();
+      return true;
+    }
+
+    #removeConditionOnPc(pc, conditionName) {
+      const low = String(conditionName || "").trim().toLowerCase();
+      if (!pc || !low || !Array.isArray(pc.conditions)) return false;
+      const before = pc.conditions.length;
+      pc.conditions = pc.conditions.filter((c) => String(c).toLowerCase() !== low);
+      if (pc.conditions.length !== before) {
+        pc.liveTrackedAt = Date.now();
+        return true;
+      }
+      return false;
+    }
+
+    #spendSlotByLevelOnPc(pc, minLevel) {
+      if (!pc) return null;
+      const req = Math.max(1, Math.min(9, Math.round(Number(minLevel) || 1)));
+      const candidates = (pc.spellSlots || []).filter(
+        (s) => Number(s.level) >= req && Number(s.remaining) > 0
+      );
+      if (candidates.length === 0) return null;
+      candidates.sort((a, b) => a.level - b.level || (a.isPact ? 1 : 0) - (b.isPact ? 1 : 0));
+      const slot = candidates[0];
+      slot.used = Math.min(slot.max, Number(slot.used || 0) + 1);
+      slot.remaining = Math.max(0, slot.max - slot.used);
+      pc.liveTrackedAt = Date.now();
+      return {
+        level: slot.level,
+        isPact: Boolean(slot.isPact),
+        remaining: slot.remaining,
+        max: slot.max
+      };
+    }
+
+    #applyRestOnPc(pc, restType) {
+      if (!pc) return;
+      const now = Date.now();
+      if (restType === "short_rest") {
+        for (const s of pc.spellSlots || []) {
+          if (s.isPact) {
+            s.used = 0;
+            s.remaining = s.max;
+          }
+        }
+        pc.concentratingOn = "";
+        if (Array.isArray(pc.conditions)) {
+          pc.conditions = pc.conditions.filter(
+            (c) => !SHORT_REST_CLEAR_BUFFS.has(String(c).toLowerCase())
+          );
+        }
+        pc.liveTrackedAt = now;
+      } else if (restType === "long_rest") {
+        pc.hp.current = pc.hp.max;
+        pc.hp.temp = 0;
+        for (const s of pc.spellSlots || []) {
+          s.used = 0;
+          s.remaining = s.max;
+        }
+        pc.concentratingOn = "";
+        if (Array.isArray(pc.conditions)) {
+          pc.conditions = pc.conditions.filter(
+            (c) => !LONG_REST_CLEAR_CONDS.has(String(c).toLowerCase())
+          );
+        }
+        pc.liveTrackedAt = now;
+      }
+    }
+
+    adjustPartyHp(charId, delta) {
+      const pc = this.state.party.find((p) => String(p.id) === String(charId));
+      if (!pc) return;
+      this.#applyHpDeltaOnPc(pc, delta);
       this.#syncActivePartyGroup();
       this.save();
     }
@@ -1668,6 +1862,7 @@
       const slot = pc.spellSlots[slotIndex];
       slot.used = Math.max(0, Math.min(slot.max, slot.used + deltaUsed));
       slot.remaining = Math.max(0, slot.max - slot.used);
+      pc.liveTrackedAt = Date.now();
       this.#syncActivePartyGroup();
       this.save();
     }
@@ -1676,8 +1871,331 @@
       const pc = this.state.party.find((p) => String(p.id) === String(charId));
       if (!pc) return;
       pc.concentratingOn = String(spellName || "").trim();
+      pc.liveTrackedAt = Date.now();
       this.#syncActivePartyGroup();
       this.save();
+    }
+
+    toggleInspiration(charId, explicitVal = null) {
+      const pc = this.state.party.find((p) => String(p.id) === String(charId));
+      if (!pc) return false;
+      pc.inspiration = explicitVal === null ? !pc.inspiration : Boolean(explicitVal);
+      pc.liveTrackedAt = Date.now();
+      this.#syncActivePartyGroup();
+      this.save();
+      return pc.inspiration;
+    }
+
+    adjustTempHp(charId, amount) {
+      const pc = this.state.party.find((p) => String(p.id) === String(charId));
+      if (!pc) return 0;
+      const amt = Math.max(0, Math.round(Number(amount) || 0));
+      pc.hp.temp = Math.max(Number(pc.hp?.temp || 0), amt);
+      pc.liveTrackedAt = Date.now();
+      this.#syncActivePartyGroup();
+      this.save();
+      return pc.hp.temp;
+    }
+
+    addCharacterCondition(charId, conditionName) {
+      const pc = this.state.party.find((p) => String(p.id) === String(charId));
+      if (!pc) return false;
+      const added = this.#addConditionOnPc(pc, conditionName);
+      if (added) {
+        this.#syncActivePartyGroup();
+        this.save();
+      }
+      return added;
+    }
+
+    removeCharacterCondition(charId, conditionName) {
+      const pc = this.state.party.find((p) => String(p.id) === String(charId));
+      if (!pc) return false;
+      const removed = this.#removeConditionOnPc(pc, conditionName);
+      if (removed) {
+        this.#syncActivePartyGroup();
+        this.save();
+      }
+      return removed;
+    }
+
+    spendSpellSlotByLevel(charId, minLevel) {
+      const pc = this.state.party.find((p) => String(p.id) === String(charId));
+      if (!pc) return null;
+      const res = this.#spendSlotByLevelOnPc(pc, minLevel);
+      if (res) {
+        this.#syncActivePartyGroup();
+        this.save();
+      }
+      return res;
+    }
+
+    applyRest(charIdOrAll, restType) {
+      const targets =
+        charIdOrAll === "ALL"
+          ? this.state.party
+          : this.state.party.filter((p) => String(p.id) === String(charIdOrAll));
+      if (targets.length === 0) return false;
+      for (const pc of targets) {
+        this.#applyRestOnPc(pc, restType);
+      }
+      this.#syncActivePartyGroup();
+      this.save();
+      return true;
+    }
+
+    findPartyCharacterByName(nameQuery, fallbackSpellName = "") {
+      const q = String(nameQuery || "").trim().toLowerCase();
+      if (q === "all" || q === "party" || q === "everyone") return "ALL";
+      const myChar =
+        this.state.party.find((p) => String(p.id) === String(this.state.myCharacterId)) ||
+        this.state.party[0] ||
+        null;
+      if (q === "me" || q === "i" || q === "myself") return myChar;
+
+      const ALIAS_MAP = {
+        rain: "raine",
+        rayne: "raine",
+        bonehawk: "bone hawk",
+        gonlor: "gonloar",
+        connie: "gonloar",
+        keel: "lusomorris",
+        kiel: "lusomorris",
+        lusomoris: "lusomorris",
+        munger: "munder",
+        munner: "munder",
+        patty: "patty the willing",
+        bonoc: "patty the willing"
+      };
+      const compactQ = q.replace(/\s+/g, "");
+      const normQ = ALIAS_MAP[compactQ] || ALIAS_MAP[q] || q;
+      const compactNormQ = normQ.replace(/\s+/g, "");
+
+      if (q) {
+        const exact = this.state.party.find((p) => {
+          const pn = String(p.name || "").trim().toLowerCase();
+          return pn === q || pn === normQ || pn.replace(/\s+/g, "") === compactNormQ;
+        });
+        if (exact) return exact;
+
+        const wordMatch = this.state.party.find((p) => {
+          const pn = String(p.name || "").trim().toLowerCase();
+          const firstTok = pn.split(/\s+/)[0];
+          const qFirst = normQ.split(/\s+/)[0];
+          return (
+            pn.split(/\s+/).includes(normQ) ||
+            (normQ.length >= 3 && pn.startsWith(normQ)) ||
+            (firstTok.length >= 4 && qFirst === firstTok)
+          );
+        });
+        if (wordMatch) return wordMatch;
+      }
+
+      if (fallbackSpellName) {
+        const spLower = String(fallbackSpellName).trim().toLowerCase();
+        const owners = this.state.party.filter((p) =>
+          (p.spells || []).some((s) => String(s.name || "").toLowerCase() === spLower)
+        );
+        if (owners.length === 1) return owners[0];
+      }
+
+      return null;
+    }
+
+    getUnprocessedTranscriptLinesForSheets(maxLines = 18) {
+      const lines = this.state.transcript || [];
+      if (lines.length === 0) return [];
+      const cursorId = this.state.lastSheetTrackedTranscriptId;
+      if (cursorId) {
+        const idx = lines.findIndex((l) => l.id === cursorId);
+        if (idx >= 0) {
+          return lines.slice(idx + 1).slice(-maxLines);
+        }
+      }
+      return lines.slice(-Math.min(6, maxLines));
+    }
+
+    applyLivePartyUpdates(updates, lastProcessedTranscriptId = null) {
+      const prevCursor = this.state.lastSheetTrackedTranscriptId;
+      if (lastProcessedTranscriptId) {
+        this.state.lastSheetTrackedTranscriptId = lastProcessedTranscriptId;
+      }
+
+      if (
+        this.settings.autoUpdatePartyFromTranscript === false ||
+        !Array.isArray(updates) ||
+        updates.length === 0
+      ) {
+        if (lastProcessedTranscriptId && prevCursor !== lastProcessedTranscriptId) {
+          this.save();
+        }
+        return { appliedCount: 0, descriptions: [] };
+      }
+
+      const previousParty = JSON.parse(JSON.stringify(this.state.party || []));
+      const seenKeys = new Set();
+      const descriptions = [];
+      const now = Date.now();
+
+      for (const u of updates) {
+        if (!u || !u.eventType) continue;
+        const ev = String(u.eventType).trim();
+        const spellName = String(u.spellName || "").trim();
+        const condName = String(u.condition || "").trim();
+        const amt = Number(u.amount);
+        const target = this.findPartyCharacterByName(u.characterName, spellName);
+        if (!target) continue;
+
+        const targetKey = target === "ALL" ? "ALL" : String(target.id);
+        const dedupeKey = `${targetKey}|${ev}|${Number.isFinite(amt) ? amt : ""}|${spellName.toLowerCase()}|${condName.toLowerCase()}`;
+        if (seenKeys.has(dedupeKey)) continue;
+        seenKeys.add(dedupeKey);
+
+        if (ev === "long_rest" || ev === "short_rest") {
+          const targets = target === "ALL" ? this.state.party : [target];
+          if (targets.length === 0) continue;
+          for (const pc of targets) {
+            this.#applyRestOnPc(pc, ev);
+            pc.lastAutoUpdateNote = ev === "long_rest" ? "Long Rest" : "Short Rest";
+          }
+          const who = target === "ALL" ? "Party" : target.name;
+          descriptions.push(
+            ev === "long_rest"
+              ? `${who} finished a Long Rest (HP & slots restored)`
+              : `${who} finished a Short Rest`
+          );
+          continue;
+        }
+
+        if (target === "ALL") continue;
+        const pc = target;
+
+        if (ev === "damage" && Number.isFinite(amt) && amt > 0) {
+          const dmg = Math.round(amt);
+          this.#applyHpDeltaOnPc(pc, -dmg);
+          pc.lastAutoUpdateNote = `-${dmg} HP`;
+          descriptions.push(`${pc.name} -${dmg} HP (${pc.hp.current}/${pc.hp.max})`);
+        } else if (ev === "heal" && Number.isFinite(amt) && amt > 0) {
+          const healAmt = Math.round(amt);
+          this.#applyHpDeltaOnPc(pc, healAmt);
+          pc.lastAutoUpdateNote = `+${healAmt} HP`;
+          descriptions.push(`${pc.name} +${healAmt} HP (${pc.hp.current}/${pc.hp.max})`);
+        } else if (ev === "set_hp" && Number.isFinite(amt) && amt >= 0) {
+          const exactHp = Math.max(0, Math.min(pc.hp.max, Math.round(amt)));
+          pc.hp.current = exactHp;
+          if (exactHp === 0) {
+            pc.concentratingOn = "";
+            this.#addConditionOnPc(pc, "Unconscious");
+          } else {
+            this.#removeConditionOnPc(pc, "Unconscious");
+          }
+          pc.liveTrackedAt = now;
+          pc.lastAutoUpdateNote = `${exactHp} HP`;
+          descriptions.push(`${pc.name} HP → ${exactHp}/${pc.hp.max}`);
+        } else if (ev === "temp_hp" && Number.isFinite(amt) && amt > 0) {
+          const tempAmt = Math.round(amt);
+          pc.hp.temp = Math.max(Number(pc.hp?.temp || 0), tempAmt);
+          pc.liveTrackedAt = now;
+          pc.lastAutoUpdateNote = `+${tempAmt} Temp HP`;
+          descriptions.push(`${pc.name} +${tempAmt} Temp HP`);
+        } else if (ev === "spell_cast" && spellName) {
+          const lowSpell = spellName.toLowerCase();
+          const matchedSpell =
+            (pc.spells || []).find((s) => String(s.name || "").toLowerCase() === lowSpell) ||
+            (pc.spells || []).find((s) => String(s.name || "").toLowerCase().includes(lowSpell)) ||
+            null;
+          const displayName = matchedSpell?.name || toTitleCaseLabel(spellName);
+          const baseLevel = matchedSpell ? Number(matchedSpell.level || 0) : Number(u.slotLevel || 0);
+          const castLevel = Number(u.slotLevel) > 0 ? Number(u.slotLevel) : baseLevel;
+          const isCantrip = baseLevel === 0 && !(Number(u.slotLevel) > 0);
+          const isRitual = Boolean(u.isRitual);
+          let spentSlot = null;
+          if (!isCantrip && !isRitual && castLevel >= 1) {
+            spentSlot = this.#spendSlotByLevelOnPc(pc, castLevel);
+          }
+          if (matchedSpell?.concentration) {
+            pc.concentratingOn = displayName;
+          }
+          pc.liveTrackedAt = now;
+          pc.lastAutoUpdateNote = spentSlot
+            ? `Cast ${displayName} (-${spentSlot.isPact ? "Pact " : ""}L${spentSlot.level})`
+            : `Cast ${displayName}`;
+          const slotSuffix = spentSlot
+            ? ` (-1 ${spentSlot.isPact ? "Pact " : ""}L${spentSlot.level} slot)`
+            : isRitual
+            ? " (Ritual)"
+            : "";
+          descriptions.push(
+            `${pc.name} cast ${displayName}${slotSuffix}${matchedSpell?.concentration ? " · Conc" : ""}`
+          );
+        } else if (ev === "gain_inspiration") {
+          pc.inspiration = true;
+          pc.liveTrackedAt = now;
+          pc.lastAutoUpdateNote = "✨ Inspired";
+          descriptions.push(`${pc.name} gained Inspiration ✨`);
+        } else if (ev === "spend_inspiration") {
+          pc.inspiration = false;
+          pc.liveTrackedAt = now;
+          pc.lastAutoUpdateNote = "Used Inspiration";
+          descriptions.push(`${pc.name} spent Inspiration`);
+        } else if (ev === "add_condition" && condName) {
+          const label = toTitleCaseLabel(condName);
+          if (this.#addConditionOnPc(pc, label)) {
+            pc.lastAutoUpdateNote = label;
+            descriptions.push(`${pc.name}: ${label}`);
+          }
+        } else if (ev === "remove_condition" && condName) {
+          const label = toTitleCaseLabel(condName);
+          if (this.#removeConditionOnPc(pc, label)) {
+            pc.lastAutoUpdateNote = `Cleared ${label}`;
+            descriptions.push(`${pc.name} cleared ${label}`);
+          }
+        } else if (ev === "drop_concentration") {
+          if (pc.concentratingOn) {
+            const old = pc.concentratingOn;
+            pc.concentratingOn = "";
+            pc.liveTrackedAt = now;
+            pc.lastAutoUpdateNote = "Conc dropped";
+            descriptions.push(`${pc.name} dropped Concentration (${old})`);
+          }
+        }
+      }
+
+      if (descriptions.length > 0) {
+        this.state.lastAutoSheetBatch = {
+          id: `batch-${now}`,
+          timestamp: now,
+          descriptions,
+          previousParty
+        };
+        if (!Array.isArray(this.state.recentSheetUpdates)) {
+          this.state.recentSheetUpdates = [];
+        }
+        this.state.recentSheetUpdates.unshift({ timestamp: now, descriptions });
+        this.state.recentSheetUpdates = this.state.recentSheetUpdates.slice(0, 12);
+        this.#syncActivePartyGroup();
+        this.save();
+      } else if (lastProcessedTranscriptId && prevCursor !== lastProcessedTranscriptId) {
+        this.save();
+      }
+
+      return { appliedCount: descriptions.length, descriptions };
+    }
+
+    dismissAutoSheetBanner() {
+      if (!this.state.lastAutoSheetBatch) return;
+      this.state.lastAutoSheetBatch = null;
+      this.save();
+    }
+
+    undoLastAutoSheetBatch() {
+      const prev = this.state.lastAutoSheetBatch?.previousParty;
+      if (!Array.isArray(prev)) return false;
+      this.state.party = prev.map(normalizeCharacterRecord);
+      this.state.lastAutoSheetBatch = null;
+      this.#syncActivePartyGroup();
+      this.save();
+      return true;
     }
 
     addManualEnemy(name) {

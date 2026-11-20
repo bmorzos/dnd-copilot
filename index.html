@@ -222,6 +222,7 @@
         </div>
       </div>
 
+      <div id="autoSheetBanner" class="auto-sheet-banner hidden"></div>
       <div id="partyList" class="party-list"></div>
     </section>
   </main>
@@ -292,16 +293,71 @@
         <button class="btn-close" data-close-modal="savedModal">✕</button>
       </div>
       <div class="modal-body">
+        <div id="gdriveArchiveSection" class="info-block">
+          <strong>☁️ Google Drive Campaign Archive</strong>
+          <p id="gdriveStatusText" class="muted-p">
+            Connect Google Drive or launch via start-windows / start-mac to sync &amp; search all past transcripts automatically.
+          </p>
+          <div class="simple-row" style="margin-top:8px;flex-wrap:wrap;">
+            <button id="btnConnectGdrive" type="button" class="btn btn-primary">
+              🔐 Connect Google Drive
+            </button>
+            <button id="btnSyncGdrive" type="button" class="btn btn-action">
+              🔄 Sync Drive Now
+            </button>
+            <button id="btnDisconnectGdrive" type="button" class="btn btn-quiet hidden">
+              Disconnect
+            </button>
+            <button id="btnExportDriveArchive" type="button" class="btn btn-quiet" title="Download all synced Drive transcripts &amp; summaries as one portable .json bundle for offline Mac use">
+              📦 Export Archive (.json)
+            </button>
+          </div>
+
+          <form id="driveArchiveSearchForm" class="simple-row" style="margin-top:10px;">
+            <input
+              id="driveArchiveSearchInput"
+              type="text"
+              class="input"
+              placeholder="Search all past Drive transcripts (e.g. Zorzula, Rusty Gates, Phandalin)..."
+            />
+            <button id="btnSearchDriveArchive" type="submit" class="btn btn-action">Search</button>
+          </form>
+          <div id="driveArchiveSearchResults" class="stack-list" style="margin-top:8px;"></div>
+
+          <details class="raw-details" style="margin-top:10px;">
+            <summary>Google Drive Folder &amp; OAuth Setup</summary>
+            <label class="field" style="margin-top:8px;">
+              <span class="field-hint">Transcripts Folder URL or ID</span>
+              <input id="gdriveFolderInput" type="text" class="input" placeholder="https://drive.google.com/drive/folders/..." />
+            </label>
+            <label class="field" style="margin-top:8px;">
+              <span class="field-hint">Master Summaries Doc URL or ID (optional)</span>
+              <input id="gdriveSummariesDocInput" type="text" class="input" placeholder="https://docs.google.com/document/d/..." />
+            </label>
+            <label class="field" style="margin-top:8px;">
+              <span class="field-hint">Character Backstories Doc URL or ID (optional)</span>
+              <input id="gdriveBackstoriesDocInput" type="text" class="input" placeholder="https://docs.google.com/document/d/..." />
+            </label>
+            <label class="field" style="margin-top:8px;">
+              <span class="field-hint">Optional Desktop OAuth Client JSON (only needed if not auto-detected locally)</span>
+              <textarea id="gdriveOauthJsonInput" class="textarea" rows="3" placeholder='{"installed":{"client_id":"...","client_secret":"..."}}'></textarea>
+            </label>
+            <button id="btnSaveGdriveOauth" type="button" class="btn btn-quiet" style="margin-top:8px;">
+              Save Drive Config &amp; OAuth JSON
+            </button>
+          </details>
+        </div>
+
         <div class="info-block">
           <strong>📚 Past Sessions (Campaign Memory)</strong>
           <p class="muted-p">
-            Import past session transcripts or recaps (.txt / .md) so <strong>Live Ideas</strong> automatically connects returning NPCs, clues, and quests to what is happening now.
+            Import past session transcripts or recaps (.txt / .md / Drive Archive .json) so <strong>Live Ideas</strong> automatically connects returning NPCs, clues, and quests to what is happening now.
           </p>
           <div class="simple-row" style="margin-top:8px;">
             <button id="btnImportPastSessionFiles" type="button" class="btn btn-primary">
-              📂 Import Past Recap / Transcript (.txt, .md)
+              📂 Import Past Recap / Transcript / Archive (.txt, .md, .json)
             </button>
-            <input id="pastSessionFileInput" type="file" accept=".txt,.md,.markdown,.log" multiple class="hidden" />
+            <input id="pastSessionFileInput" type="file" accept=".txt,.md,.markdown,.log,.json,application/json" multiple class="hidden" />
           </div>
           <details class="raw-details" style="margin-top:10px;">
             <summary>Or paste a past session recap</summary>
@@ -380,6 +436,14 @@
           <span>
             <strong>Raw Room Table Audio (Recommended)</strong><br />
             <span class="field-hint">Disables Zoom-style noise suppression &amp; AGC so quieter/farther players aren't muted, using a gentle room high-pass &amp; leveler instead.</span>
+          </span>
+        </label>
+
+        <label class="checkbox-row">
+          <input id="settingAutoUpdateSheets" type="checkbox" checked />
+          <span>
+            <strong>Auto-update Party Sheets from Live Speech (Recommended)</strong><br />
+            <span class="field-hint">Automatically deducts cast spell slots, tracks damage/healing, Inspiration, Concentration &amp; conditions while listening (with 1-click Undo).</span>
           </span>
         </label>
 

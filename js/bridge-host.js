@@ -150,7 +150,7 @@
       return digitsOnly ? digitsOnly[1] : null;
     }
 
-    async syncCharacterById(idOrUrl, silent = false, manualAdd = false) {
+    async syncCharacterById(idOrUrl, silent = false, manualAdd = false, forceRemote = false) {
       const charId = this.extractCharacterId(idOrUrl);
       if (!charId) {
         throw new Error("Enter a valid D&D Beyond character URL or numeric ID (e.g. 98765432).");
@@ -219,14 +219,14 @@
       if (!manualAdd && this.store.isCharacterExcluded(parsed.id, parsed.name)) {
         return null;
       }
-      this.store.upsertCharacter(parsed, { manualAdd });
+      this.store.upsertCharacter(parsed, { manualAdd, forceRemote });
       if (!silent) {
         this.onToast(`Synced ${parsed.name} (${parsed.classSummary})!`);
       }
       return parsed;
     }
 
-    async refreshAllPartySheets(silent = true) {
+    async refreshAllPartySheets(silent = true, forceRemote = false) {
       await this.requestAboveVttSync().catch(() => false);
 
       const seenIds = new Set();
@@ -253,7 +253,7 @@
       let lastError = "";
       for (const id of ids) {
         try {
-          const res = await this.syncCharacterById(id, true, false);
+          const res = await this.syncCharacterById(id, true, false, forceRemote);
           if (res) updated += 1;
         } catch (err) {
           lastError = err?.message || String(err);

@@ -13,6 +13,7 @@
   let currentLoadedAudioFile = null;
   let isUpdatingIdeas = false;
   let lastCustomAdvisorQuestionAt = 0;
+  let driveArchiveStatus = null;
 
   function el(id) {
     return document.getElementById(id);
@@ -156,7 +157,10 @@
     onHealthRecovered: () => clearHealthWarning(),
     onSpeechBatchReady: async () => {
       try {
-        await gemini.analyzeTableSituation(store);
+        const res = await gemini.analyzeTableSituation(store);
+        if (res?._appliedPartyUpdates?.length > 0) {
+          showToast(`Auto-updated sheets: ${res._appliedPartyUpdates.slice(0, 2).join("; ")}`);
+        }
         await refreshLiveIdeasSilently();
       } catch (err) {
         showToast(err.message || String(err), true);
@@ -264,8 +268,14 @@
     const extraArchivedCount = (store.savedTranscripts || []).filter(
       (s) => s && !seenMemTitles.has(String(s.title || "").toLowerCase())
     ).length;
+    const driveArchiveCount = Math.max(
+      Number(driveArchiveStatus?.cachedTranscriptCount || 0),
+      Number(driveArchiveStatus?.cachedSummaryCount || 0)
+    );
     const pastBadge = el("pastSessionCount");
-    if (pastBadge) pastBadge.textContent = String(enabledMem.length + extraArchivedCount);
+    if (pastBadge) {
+      pastBadge.textContent = String(enabledMem.length + extraArchivedCount + driveArchiveCount);
+    }
 
     const myChar =
       state.party.find((p) => String(p.id) === String(state.myCharacterId)) || state.party[0] || null;
@@ -483,6 +493,26 @@
   }
 
   function renderParty(state) {
+    const bannerEl = el("autoSheetBanner");
+    const batch = state.lastAutoSheetBatch;
+    if (bannerEl) {
+      if (batch?.descriptions?.length > 0) {
+        bannerEl.classList.remove("hidden");
+        bannerEl.innerHTML = `
+          <span class="auto-sheet-banner-text">🎙️ <strong>Auto-updated:</strong> ${escapeHtml(
+            batch.descriptions.join(" · ")
+          )}</span>
+          <span class="auto-sheet-banner-actions">
+            <button id="btnUndoAutoSheets" type="button" class="btn btn-quiet" style="padding:3px 9px;font-size:12.5px;">↩ Undo</button>
+            <button id="btnDismissAutoSheets" type="button" class="btn btn-quiet" style="padding:3px 8px;font-size:12.5px;">✕</button>
+          </span>
+        `;
+      } else {
+        bannerEl.classList.add("hidden");
+        bannerEl.innerHTML = "";
+      }
+    }
+
     const groupSelect = el("partyGroupSelect");
     if (groupSelect) {
       const names = store.getPartyGroupNames();
@@ -585,18 +615,51 @@
               pc.id
             )}" title="Link D&amp;D Beyond sheet URL so stats auto-update">🔗 Link</button>`
           : "";
+        const inspBtnHtml = `<button type="button" class="btn btn-quiet btn-insp ${
+          pc.inspiration ? "active" : ""
+        }" data-toggle-insp="${escapeHtml(pc.id)}" title="${
+          pc.inspiration
+            ? "Heroic Inspiration Active (click to spend)"
+            : "Click to grant Heroic Inspiration"
+        }">✨ Insp</button>`;
         const syncNote = pc.lastSyncedAt ? ` · Synced ${formatTime(pc.lastSyncedAt)}` : "";
+        const autoTagHtml = pc.lastAutoUpdateNote
+          ? ` <span class="auto-note-tag">🎙️ ${escapeHtml(pc.lastAutoUpdateNote)}</span>`
+          : "";
+
+        const statusChips = [];
+        if (pc.concentratingOn) {
+          statusChips.push(
+            `<button type="button" class="status-chip conc" data-clear-conc="${escapeHtml(
+              pc.id
+            )}" title="Click to drop Concentration">🔮 Conc: ${escapeHtml(
+              pc.concentratingOn
+            )} ✕</button>`
+          );
+        }
+        for (const cond of pc.conditions || []) {
+          statusChips.push(
+            `<button type="button" class="status-chip" data-cond-char="${escapeHtml(
+              pc.id
+            )}" data-remove-cond="${escapeHtml(
+              cond
+            )}" title="Click to clear condition">${escapeHtml(cond)} ✕</button>`
+          );
+        }
+        const statusRowHtml =
+          statusChips.length > 0 ? `<div class="hero-status-row">${statusChips.join("")}</div>` : "";
 
         return `
           <div class="hero-card ${isMe ? "is-me" : ""}">
             <div class="hero-top">
               <div>
                 <div class="hero-name">${nameHtml}</div>
-                <div class="hero-class">${escapeHtml(pc.classSummary)} · AC ${pc.ac}${
-          pc.concentratingOn ? ` · 🔮 ${escapeHtml(pc.concentratingOn)}` : ""
-        }${escapeHtml(syncNote)}</div>
+                <div class="hero-class">${escapeHtml(pc.classSummary)} · AC ${pc.ac}${escapeHtml(
+          syncNote
+        )}${autoTagHtml}</div>
               </div>
               <div class="simple-row">
+                ${inspBtnHtml}
                 ${sheetBtnHtml}
                 <button class="btn ${isMe ? "btn-action" : "btn-quiet"}" style="padding:5px 10px;font-size:14px;" data-set-me="${escapeHtml(
           pc.id
@@ -625,6 +688,7 @@
             </div>
 
             ${slotsHtml}
+            ${statusRowHtml}
             ${spellsHtml}
           </div>
         `;
@@ -657,8 +721,98 @@
     return mb >= 0.1 ? `${mb.toFixed(1)} MB` : `${Math.max(1, Math.round(Number(bytes || 0) / 1024))} KB`;
   }
 
+  async function refreshDriveArchiveStatus(silent = true) {
+    if (!bridge.isLocalServerContext()) {
+      driveArchiveStatus = null;
+      renderCenterFocus(store.state);
+      if (!el("savedModal")?.classList.contains("hidden")) renderDriveArchiveSection();
+      return null;
+    }
+    try {
+      const resp = await fetch(`/api/gdrive/status?_t=${Date.now()}`, { cache: "no-store" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      driveArchiveStatus = await resp.json();
+      renderCenterFocus(store.state);
+      if (!el("savedModal")?.classList.contains("hidden")) {
+        renderDriveArchiveSection();
+      }
+      return driveArchiveStatus;
+    } catch (err) {
+      if (!silent) showToast(`Drive status check failed: ${err.message || err}`, true);
+      return null;
+    }
+  }
+
+  function renderDriveArchiveSection() {
+    const statusEl = el("gdriveStatusText");
+    const btnConn = el("btnConnectGdrive");
+    const btnSync = el("btnSyncGdrive");
+    const btnDisc = el("btnDisconnectGdrive");
+    const btnExp = el("btnExportDriveArchive");
+    const btnSearch = el("btnSearchDriveArchive");
+    if (!statusEl) return;
+
+    const isLocal = bridge.isLocalServerContext();
+    if (!isLocal) {
+      statusEl.textContent =
+        "Launch via start-windows.bat / start-mac.command to connect Google Drive directly, or import an exported .json Drive archive bundle below.";
+      if (btnConn) btnConn.disabled = true;
+      if (btnSync) btnSync.disabled = true;
+      if (btnExp) btnExp.disabled = true;
+      if (btnSearch) btnSearch.disabled = true;
+      btnDisc?.classList.add("hidden");
+      return;
+    }
+
+    if (btnConn) btnConn.disabled = false;
+    if (btnSync) btnSync.disabled = false;
+    if (btnExp) btnExp.disabled = false;
+    if (btnSearch) btnSearch.disabled = false;
+
+    const st = driveArchiveStatus || {};
+    const countPart = `${st.cachedTranscriptCount || 0} transcript(s) · ${
+      st.cachedSummaryCount || 0
+    } session summaries${st.hasBackstories ? " · Backstories" : ""}`;
+    const syncPart = st.lastSyncedAt ? ` · Last synced ${formatTime(st.lastSyncedAt)}` : "";
+
+    if (st.connected) {
+      statusEl.textContent = `✅ Google Drive connected — ${countPart}${syncPart}`;
+      btnConn?.classList.add("hidden");
+      btnDisc?.classList.remove("hidden");
+    } else if (st.cachedTranscriptCount > 0 || st.cachedSummaryCount > 0) {
+      const cliNote = st.cliAvailable ? "Ready to sync" : "Connect Google Drive for auto-refresh";
+      statusEl.textContent = `📁 Local Drive Cache active (${countPart}${syncPart}) — ${cliNote}.`;
+      btnConn?.classList.remove("hidden");
+      btnDisc?.classList.add("hidden");
+    } else if (st.cliAvailable) {
+      statusEl.textContent =
+        "Ready to sync via local Drive plugin or click Connect Google Drive for 1-click OAuth.";
+      btnConn?.classList.remove("hidden");
+      btnDisc?.classList.add("hidden");
+    } else {
+      statusEl.textContent =
+        "Click Connect Google Drive to grant read-only access and sync all past session transcripts.";
+      btnConn?.classList.remove("hidden");
+      btnDisc?.classList.add("hidden");
+    }
+
+    const fInp = el("gdriveFolderInput");
+    const sInp = el("gdriveSummariesDocInput");
+    const bInp = el("gdriveBackstoriesDocInput");
+    if (fInp && document.activeElement !== fInp && !fInp.value && st.folderId) {
+      fInp.value = st.folderId;
+    }
+    if (sInp && document.activeElement !== sInp && !sInp.value && st.summariesDocId) {
+      sInp.value = st.summariesDocId;
+    }
+    if (bInp && document.activeElement !== bInp && !bInp.value && st.backstoriesDocId) {
+      bInp.value = st.backstoriesDocId;
+    }
+  }
+
   function renderSavedModal() {
     el("savedCurrentLineCount").textContent = String(store.state.transcript.length);
+    renderDriveArchiveSection();
 
     // 0. Past Sessions (Campaign Memory)
     const memBox = el("campaignMemoryList");
@@ -786,7 +940,7 @@
   }
 
   async function openSavedModal() {
-    await sessionRecorder.refreshSavedList();
+    await Promise.all([sessionRecorder.refreshSavedList(), refreshDriveArchiveStatus(true)]);
     renderSavedModal();
     el("savedModal").classList.remove("hidden");
   }
@@ -832,6 +986,9 @@
     }
     if (el("settingRawRoomAudio")) {
       el("settingRawRoomAudio").checked = store.settings.rawRoomAudio !== false;
+    }
+    if (el("settingAutoUpdateSheets")) {
+      el("settingAutoUpdateSheets").checked = store.settings.autoUpdatePartyFromTranscript !== false;
     }
     if (el("settingRecordingBitrate")) {
       el("settingRecordingBitrate").value = String(store.settings.recordingBitrate || 96000);
@@ -1198,6 +1355,45 @@
         for (const f of files) {
           const text = await f.text();
           if (!text.trim()) continue;
+          if (/\.json$/i.test(f.name)) {
+            let parsedJson = null;
+            try {
+              parsedJson = JSON.parse(text);
+            } catch (_) {}
+            if (
+              parsedJson &&
+              (parsedJson.kind === "dnd-copilot-drive-archive" ||
+                Array.isArray(parsedJson.transcripts))
+            ) {
+              if (bridge.isLocalServerContext()) {
+                const resp = await fetch("/api/campaign-memory/import-bundle", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(parsedJson)
+                });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                await refreshDriveArchiveStatus(true);
+                imported++;
+                continue;
+              }
+              const mdSections = String(parsedJson.summariesMd || "")
+                .split(/\n(?=##(?!#)\s+)/)
+                .filter((s) => s.trim().startsWith("##"))
+                .slice(-6)
+                .reverse();
+              for (const sec of mdSections) {
+                const lines = sec.trim().split(/\r?\n/);
+                const titleLine = (lines[0] || "Past Session").replace(/^##\s*/, "").replace(/\*/g, "").trim();
+                store.addCampaignMemoryEntry({
+                  title: titleLine,
+                  summary: lines.slice(1).join(" ").replace(/\*/g, "").slice(0, 600),
+                  rawText: sec
+                });
+                imported++;
+              }
+              continue;
+            }
+          }
           const cleanTitle = f.name.replace(/\.[^.]+$/, "");
           const sum = await gemini.summarizePastSession(store, cleanTitle, text);
           store.addCampaignMemoryEntry({ ...sum, rawText: text });
@@ -1321,7 +1517,10 @@
       btn.disabled = true;
       btn.textContent = "Updating...";
       try {
-        await gemini.analyzeTableSituation(store);
+        const res = await gemini.analyzeTableSituation(store);
+        if (res?._appliedPartyUpdates?.length > 0) {
+          showToast(`Updated sheets: ${res._appliedPartyUpdates.slice(0, 2).join("; ")}`);
+        }
         await refreshLiveIdeasSilently();
       } catch (err) {
         showToast(err.message || String(err), true);
@@ -1476,14 +1675,44 @@
       btn.disabled = true;
       btn.textContent = "...";
       try {
-        await bridge.refreshAllPartySheets(false);
+        await bridge.refreshAllPartySheets(false, true);
       } finally {
         btn.disabled = false;
         btn.textContent = "↻";
       }
     });
 
+    el("autoSheetBanner")?.addEventListener("click", (e) => {
+      if (e.target.closest("#btnUndoAutoSheets")) {
+        if (store.undoLastAutoSheetBatch()) {
+          showToast("Undid last automatic character sheet update.");
+        }
+        return;
+      }
+      if (e.target.closest("#btnDismissAutoSheets")) {
+        store.dismissAutoSheetBanner();
+      }
+    });
+
     el("partyList").addEventListener("click", (e) => {
+      const inspBtn = e.target.closest("[data-toggle-insp]");
+      if (inspBtn) {
+        store.toggleInspiration(inspBtn.getAttribute("data-toggle-insp"));
+        return;
+      }
+      const clearConcBtn = e.target.closest("[data-clear-conc]");
+      if (clearConcBtn) {
+        store.setCharacterConcentration(clearConcBtn.getAttribute("data-clear-conc"), "");
+        return;
+      }
+      const rmCondBtn = e.target.closest("[data-remove-cond]");
+      if (rmCondBtn) {
+        store.removeCharacterCondition(
+          rmCondBtn.getAttribute("data-cond-char"),
+          rmCondBtn.getAttribute("data-remove-cond")
+        );
+        return;
+      }
       const linkBtn = e.target.closest("[data-link-pc]");
       if (linkBtn) {
         const pcId = linkBtn.getAttribute("data-link-pc");
@@ -1602,6 +1831,9 @@
       const groqWhisperModel = el("settingGroqWhisperModel")?.value || "whisper-large-v3";
       const micDeviceId = el("settingMicDevice")?.value || "";
       const rawRoomAudio = el("settingRawRoomAudio") ? el("settingRawRoomAudio").checked : true;
+      const autoUpdatePartyFromTranscript = el("settingAutoUpdateSheets")
+        ? el("settingAutoUpdateSheets").checked
+        : true;
       const recordingBitrate = Number(el("settingRecordingBitrate")?.value) || 96000;
       const campaignGlossary = el("settingCampaignGlossary")
         ? el("settingCampaignGlossary").value.trim()
@@ -1624,6 +1856,7 @@
         deepgramApiKey: deepgramKey,
         micDeviceId,
         rawRoomAudio,
+        autoUpdatePartyFromTranscript,
         recordingBitrate,
         campaignGlossary,
         geminiApiKey: el("settingApiKey").value.trim(),
@@ -1695,9 +1928,173 @@
         showToast("New session started — B.U.G.S. party kept & previous transcript archived!");
       }
     });
+
+    // Google Drive Campaign Archive controls
+    window.addEventListener("message", (event) => {
+      if (event.data?.source === "dnd-copilot-gdrive" && event.data?.type === "GDRIVE_CONNECTED") {
+        refreshDriveArchiveStatus(true).then(() => {
+          el("btnSyncGdrive")?.click();
+        });
+        showToast("Google Drive connected! Syncing campaign transcripts...");
+      }
+    });
+
+    el("btnConnectGdrive")?.addEventListener("click", async () => {
+      if (!bridge.isLocalServerContext()) return;
+      try {
+        const redirectUri = `${window.location.origin}/api/gdrive/oauth-callback`;
+        const resp = await fetch(
+          `/api/gdrive/auth-url?redirect_uri=${encodeURIComponent(redirectUri)}`,
+          { cache: "no-store" }
+        );
+        const data = await resp.json();
+        if (!resp.ok || !data?.authUrl) {
+          throw new Error(data?.error || `HTTP ${resp.status}`);
+        }
+        window.open(data.authUrl, "dndCopilotGdriveAuth", "width=540,height=680");
+      } catch (err) {
+        showToast(err.message || String(err), true);
+      }
+    });
+
+    el("btnSyncGdrive")?.addEventListener("click", async () => {
+      if (!bridge.isLocalServerContext()) return;
+      const btn = el("btnSyncGdrive");
+      const orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "⏳ Syncing...";
+      try {
+        const resp = await fetch("/api/gdrive/sync", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            folderId: el("gdriveFolderInput")?.value?.trim() || "",
+            summariesDocId: el("gdriveSummariesDocInput")?.value?.trim() || "",
+            backstoriesDocId: el("gdriveBackstoriesDocInput")?.value?.trim() || ""
+          })
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data?.error || `HTTP ${resp.status}`);
+        driveArchiveStatus = data.status || driveArchiveStatus;
+        renderDriveArchiveSection();
+        renderCenterFocus(store.state);
+        refreshLiveIdeasSilently();
+        showToast(
+          `Synced ${driveArchiveStatus?.cachedTranscriptCount || 0} Drive transcript(s) & ${
+            driveArchiveStatus?.cachedSummaryCount || 0
+          } summaries!`
+        );
+      } catch (err) {
+        showToast(err.message || String(err), true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    });
+
+    el("btnDisconnectGdrive")?.addEventListener("click", async () => {
+      if (!bridge.isLocalServerContext()) return;
+      try {
+        await fetch("/api/gdrive/disconnect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}"
+        });
+        await refreshDriveArchiveStatus(true);
+        showToast("Disconnected Google Drive OAuth (local cache kept).");
+      } catch (err) {
+        showToast(err.message || String(err), true);
+      }
+    });
+
+    el("btnSaveGdriveOauth")?.addEventListener("click", async () => {
+      if (!bridge.isLocalServerContext()) return;
+      const rawOauth = el("gdriveOauthJsonInput")?.value?.trim() || "";
+      try {
+        const resp = await fetch("/api/gdrive/oauth-client", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...(rawOauth ? { rawJson: rawOauth } : {}),
+            folderId: el("gdriveFolderInput")?.value?.trim() || "",
+            summariesDocId: el("gdriveSummariesDocInput")?.value?.trim() || "",
+            backstoriesDocId: el("gdriveBackstoriesDocInput")?.value?.trim() || ""
+          })
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data?.error || `HTTP ${resp.status}`);
+        driveArchiveStatus = data.status;
+        if (rawOauth) el("gdriveOauthJsonInput").value = "";
+        renderDriveArchiveSection();
+        showToast("Saved Google Drive configuration!");
+      } catch (err) {
+        showToast(err.message || String(err), true);
+      }
+    });
+
+    el("btnExportDriveArchive")?.addEventListener("click", () => {
+      if (!bridge.isLocalServerContext()) return;
+      const a = document.createElement("a");
+      a.href = "/api/campaign-memory/export-bundle";
+      a.download = "bugs-drive-archive.json";
+      a.click();
+      showToast("Downloading portable Drive Archive (.json)...");
+    });
+
+    el("driveArchiveSearchForm")?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (!bridge.isLocalServerContext()) return;
+      const q = (el("driveArchiveSearchInput")?.value || "").trim();
+      const box = el("driveArchiveSearchResults");
+      if (!q || !box) return;
+      box.innerHTML = `<p class="muted-p">Searching Drive transcripts &amp; summaries...</p>`;
+      try {
+        const resp = await fetch("/api/campaign-memory/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: q, maxSummaries: 4, maxSnippets: 6 })
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data?.error || `HTTP ${resp.status}`);
+        const hits = [];
+        for (const ms of data.matchedSummaries || []) {
+          hits.push(`
+            <div class="gdrive-search-hit">
+              <div class="gdrive-search-hit-head">📘 Summary · ${escapeHtml(ms.title)}</div>
+              <div>${escapeHtml(ms.summary)}</div>
+            </div>
+          `);
+        }
+        for (const sn of data.matchedSnippets || []) {
+          hits.push(`
+            <div class="gdrive-search-hit">
+              <div class="gdrive-search-hit-head">🎙️ ${escapeHtml(sn.source)}</div>
+              <div>"${escapeHtml(sn.text)}"</div>
+            </div>
+          `);
+        }
+        for (const bs of data.matchedBackstories || []) {
+          hits.push(`
+            <div class="gdrive-search-hit">
+              <div class="gdrive-search-hit-head">📜 Character Backstory</div>
+              <div>${escapeHtml(bs)}</div>
+            </div>
+          `);
+        }
+        box.innerHTML =
+          hits.length > 0
+            ? hits.join("")
+            : `<p class="muted-p">No matches found for "${escapeHtml(q)}" across ${
+                data.totalTranscripts || 0
+              } transcript(s).</p>`;
+      } catch (err) {
+        box.innerHTML = `<p class="muted-p">Search failed: ${escapeHtml(err.message || err)}</p>`;
+      }
+    });
   }
 
   store.subscribe(renderAll);
   wireEvents();
   renderAll(store.state, store.settings);
+  refreshDriveArchiveStatus(true);
 })(window);

@@ -1326,3 +1326,300 @@ test("Parser extracts magic items/features/skills, backups backfill sheetUrl + c
   assert.equal(storeMac.state.party[0].hp.current, 35);
   assert.ok(toasts.some((t) => /Updated 1\/1 character sheet/i.test(t)));
 });
+
+test("DDBParser extracts inspiration and Live Speech auto-updates sheets with cursor dedupe, Undo, and smart DDB merge", async () => {
+  const sb = createBrowserSandbox();
+  const { parseCharacterJson } = sb.DnDCopilot.DDBParser;
+  const store = sb.DnDCopilot.Store;
+  const localBrain = sb.DnDCopilot.LocalBrain;
+
+  // 1. Parse inspiration flag from DDB JSON
+  const parsedInspired = parseCharacterJson({
+    id: 777001,
+    name: "Bone Hawk",
+    inspiration: true,
+    baseHitPoints: 48,
+    removedHitPoints: 0,
+    temporaryHitPoints: 0,
+    stats: [
+      { id: 1, value: 10 },
+      { id: 2, value: 18 },
+      { id: 3, value: 14 },
+      { id: 4, value: 12 },
+      { id: 5, value: 12 },
+      { id: 6, value: 10 }
+    ],
+    classes: [{ id: 1, level: 6, definition: { name: "Rogue" } }]
+  });
+  assert.equal(parsedInspired.inspiration, true);
+
+  store.resetSession();
+  store.updateSettings({ aiProvider: "local-free", autoUpdatePartyFromTranscript: true });
+
+  store.upsertCharacter(
+    {
+      id: "141442264",
+      name: "Raine",
+      classSummary: "Wizard 6",
+      level: 6,
+      hp: { current: 48, max: 48, temp: 0 },
+      ac: 13,
+      inspiration: false,
+      conditions: [],
+      spellSlots: [
+        { level: 1, max: 4, used: 0, remaining: 4, isPact: false },
+        { level: 2, max: 3, used: 0, remaining: 3, isPact: false },
+        { level: 3, max: 3, used: 0, remaining: 3, isPact: false }
+      ],
+      spells: [
+        { name: "Fireball", level: 3, concentration: false, ritual: false },
+        { name: "Hold Person", level: 2, concentration: true, ritual: false },
+        { name: "Detect Magic", level: 1, concentration: true, ritual: true },
+        { name: "Mage Armor", level: 1, concentration: false, ritual: false },
+        { name: "Fire Bolt", level: 0, concentration: false, ritual: false }
+      ]
+    },
+    { manualAdd: true }
+  );
+  store.upsertCharacter(
+    {
+      id: "156978335",
+      name: "Munder",
+      classSummary: "Barbarian 6",
+      level: 6,
+      hp: { current: 60, max: 60, temp: 5 },
+      ac: 16,
+      inspiration: false,
+      conditions: [],
+      spellSlots: [],
+      spells: []
+    },
+    { manualAdd: true }
+  );
+  store.upsertCharacter(parsedInspired, { manualAdd: true });
+  assert.equal(store.state.party.find((p) => p.name === "Bone Hawk").inspiration, true);
+  store.toggleInspiration("777001", false);
+  store.setMyCharacter("141442264");
+
+  // 2. Hypothetical brainstorming must NOT mutate sheets
+  store.addTranscriptLine("Player", "Maybe I should cast Fireball next turn or should we take a long rest?", false);
+  const sitHypo = await localBrain.analyzeTableSituation(store);
+  assert.deepEqual(Array.from(sitHypo._appliedPartyUpdates || []), []);
+  assert.equal(store.state.party[0].spellSlots[2].remaining, 3);
+
+  // 3. Committed speech updates spells, damage (absorbing Temp HP), and Inspiration
+  store.addTranscriptLine(
+    "Table",
+    "I cast Fireball and Munder takes 12 fire damage and Bone Hawk gains inspiration.",
+    false
+  );
+  const sit1 = await localBrain.analyzeTableSituation(store);
+  assert.equal(sit1._appliedPartyUpdates.length, 3);
+  const raine = store.state.party.find((p) => p.name === "Raine");
+  const munder = store.state.party.find((p) => p.name === "Munder");
+  const boneHawk = store.state.party.find((p) => p.name === "Bone Hawk");
+
+  assert.equal(raine.spellSlots[2].remaining, 2); // L3 slot deducted once
+  assert.equal(munder.hp.temp, 0);
+  assert.equal(munder.hp.current, 53); // 5 temp HP absorbed -> 7 net damage
+  assert.equal(boneHawk.inspiration, true);
+
+  // Running analyze again without new transcript lines must NOT double-count!
+  const sitRepeat = await localBrain.analyzeTableSituation(store);
+  assert.deepEqual(Array.from(sitRepeat._appliedPartyUpdates || []), []);
+  assert.equal(raine.spellSlots[2].remaining, 2);
+  assert.equal(munder.hp.current, 53);
+
+  // 4. Undo cleanly reverts the batch
+  assert.equal(store.undoLastAutoSheetBatch(), true);
+  assert.equal(store.state.party.find((p) => p.name === "Raine").spellSlots[2].remaining, 3);
+  assert.equal(store.state.party.find((p) => p.name === "Munder").hp.current, 60);
+  assert.equal(store.state.party.find((p) => p.name === "Munder").hp.temp, 5);
+  assert.equal(store.state.party.find((p) => p.name === "Bone Hawk").inspiration, false);
+
+  // 5. Upcasting, Ritual (0 slot cost), Concentration, Rage, Heal, explicit Set HP
+  store.addTranscriptLine(
+    "Table",
+    "Raine casts Detect Magic as a ritual. Raine casts Hold Person. Raine casts Mage Armor at 2nd level. Munder goes into a rage and heals for 6. Bone Hawk spends inspiration and is down to 20 HP.",
+    false
+  );
+  await localBrain.analyzeTableSituation(store);
+  const r2 = store.state.party.find((p) => p.name === "Raine");
+  const m2 = store.state.party.find((p) => p.name === "Munder");
+  const bh2 = store.state.party.find((p) => p.name === "Bone Hawk");
+
+  assert.equal(r2.spellSlots[0].remaining, 4); // Detect Magic as Ritual saved L1 slot, Mage Armor upcast used L2
+  assert.equal(r2.spellSlots[1].remaining, 1); // Hold Person (-1 L2) + Mage Armor at 2nd (-1 L2)
+  assert.equal(r2.concentratingOn, "Hold Person");
+  assert.ok(Array.from(m2.conditions).includes("Raging"));
+  assert.equal(m2.hp.current, 60);
+  assert.equal(bh2.inspiration, false);
+  assert.equal(bh2.hp.current, 20);
+
+  // 6. Smart DDB Merge: unchanged DDB poll preserves live voice-tracked changes; changed DDB wins; forceRemote resets
+  store.upsertCharacter(
+    {
+      id: "141442264",
+      name: "Raine",
+      classSummary: "Wizard 6",
+      level: 6,
+      hp: { current: 48, max: 48, temp: 0 }, // same baseline as before!
+      ac: 13,
+      inspiration: false,
+      conditions: [],
+      spellSlots: [
+        { level: 1, max: 4, used: 0, remaining: 4, isPact: false },
+        { level: 2, max: 3, used: 0, remaining: 3, isPact: false },
+        { level: 3, max: 3, used: 0, remaining: 3, isPact: false }
+      ],
+      spells: r2.spells
+    },
+    { forceRemote: false }
+  );
+  assert.equal(store.state.party.find((p) => p.name === "Raine").spellSlots[1].remaining, 1);
+
+  // Changed DDB HP updates HP while unchanged slots stay preserved
+  store.upsertCharacter(
+    {
+      id: "141442264",
+      name: "Raine",
+      classSummary: "Wizard 6",
+      level: 6,
+      hp: { current: 31, max: 48, temp: 0 },
+      ac: 13,
+      inspiration: false,
+      conditions: [],
+      spellSlots: [
+        { level: 1, max: 4, used: 0, remaining: 4, isPact: false },
+        { level: 2, max: 3, used: 0, remaining: 3, isPact: false },
+        { level: 3, max: 3, used: 0, remaining: 3, isPact: false }
+      ],
+      spells: r2.spells
+    },
+    { forceRemote: false }
+  );
+  assert.equal(store.state.party.find((p) => p.name === "Raine").hp.current, 31);
+  assert.equal(store.state.party.find((p) => p.name === "Raine").spellSlots[1].remaining, 1);
+
+  // forceRemote: true resets live voice tracking to DDB values
+  store.upsertCharacter(
+    {
+      id: "141442264",
+      name: "Raine",
+      classSummary: "Wizard 6",
+      level: 6,
+      hp: { current: 48, max: 48, temp: 0 },
+      ac: 13,
+      inspiration: false,
+      conditions: [],
+      spellSlots: [
+        { level: 1, max: 4, used: 0, remaining: 4, isPact: false },
+        { level: 2, max: 3, used: 0, remaining: 3, isPact: false },
+        { level: 3, max: 3, used: 0, remaining: 3, isPact: false }
+      ],
+      spells: r2.spells
+    },
+    { forceRemote: true }
+  );
+  assert.equal(store.state.party.find((p) => p.name === "Raine").spellSlots[1].remaining, 3);
+
+  // 7. Long rest restores everyone's HP, slots, and clears Rage/Concentration
+  store.applyRest("141442264", "long_rest");
+  store.addTranscriptLine("DM", "Everyone finishes a long rest safely at the inn.", false);
+  await localBrain.analyzeTableSituation(store);
+  assert.equal(store.state.party.find((p) => p.name === "Bone Hawk").hp.current, 60);
+  assert.equal(Array.from(store.state.party.find((p) => p.name === "Munder").conditions).includes("Raging"), false);
+});
+
+test("GeminiClient applies AI partyUpdates and merges localhost Google Drive archive search into advice prompts", async () => {
+  const sb = createBrowserSandbox();
+  sb.location.hostname = "localhost";
+  sb.location.href = "http://localhost:8765/index.html";
+  const store = sb.DnDCopilot.Store;
+  const gemini = sb.DnDCopilot.GeminiClient;
+
+  store.resetSession();
+  store.updateSettings({ aiProvider: "groq", groqApiKey: "gsk_live_sheets" });
+  store.upsertCharacter(
+    {
+      id: "141442264",
+      name: "Raine",
+      classSummary: "Wizard 6",
+      level: 6,
+      hp: { current: 48, max: 48, temp: 0 },
+      ac: 13,
+      spellSlots: [{ level: 3, max: 3, used: 0, remaining: 3, isPact: false }],
+      spells: [{ name: "Fireball", level: 3, concentration: false, castingTime: "Action", range: "150 ft", summary: "20-ft radius fire" }]
+    },
+    { manualAdd: true }
+  );
+  store.addTranscriptLine("Raine", "I cast Fireball at Zorzula's Rest!", false);
+
+  let capturedAdvisorPrompt = "";
+  sb.fetch = async (url, opts) => {
+    if (String(url).includes("/api/campaign-memory/search")) {
+      return {
+        ok: true,
+        json: async () => ({
+          contextText: "[Drive Matched Summary: BUGS 68] Gwen mentioned Zorzula's Rest under Phandalin's well."
+        })
+      };
+    }
+    const body = JSON.parse(opts.body);
+    const userMsg = body.messages[1].content;
+    if (userMsg.includes("partyUpdates")) {
+      return {
+        ok: true,
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  sceneMode: "Combat",
+                  headline: "Fireball hits near Zorzula's Rest",
+                  summaryBullets: ["Raine unleashed Fireball."],
+                  activeObjectives: [],
+                  notableNpcs: ["Gwen"],
+                  puzzleDetected: false,
+                  puzzleTitle: "",
+                  puzzleInscription: "",
+                  newPuzzleClues: [],
+                  observedEnemyNotes: [],
+                  partyUpdates: [{ characterName: "Raine", eventType: "spell_cast", spellName: "Fireball", slotLevel: 3 }]
+                })
+              }
+            }
+          ]
+        })
+      };
+    }
+    capturedAdvisorPrompt = userMsg;
+    return {
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                tacticalOverview: "Good opening blast.",
+                concentrationWarning: "",
+                pastSessionConnection: "Connected to Zorzula's Rest under the well.",
+                recommendations: [
+                  { rank: 1, spellOrAction: "Hold Fire Bolt", slotInfo: "Cantrip", whyBest: "Save remaining slots." }
+                ],
+                customAnswer: ""
+              })
+            }
+          }
+        ]
+      })
+    };
+  };
+
+  const sit = await gemini.analyzeTableSituation(store);
+  assert.equal(sit._appliedPartyUpdates.length, 1);
+  assert.equal(store.state.party[0].spellSlots[0].remaining, 2);
+
+  await gemini.adviseTacticsAndSpells(store, "What do we know about Zorzula?");
+  assert.match(capturedAdvisorPrompt, /Zorzula's Rest/);
+});

@@ -60,6 +60,385 @@
     { regex: /\b(non-?magical|normal\s+weapon)\b.*\b(barely|half|little|resist\w*)/i, trait: "Resists Nonmagical Weapons" }
   ];
 
+  const HYPO_SKIP_RE =
+    /\b(should\s+i|could\s+i|what\s+if|maybe\s+i|might\s+cast|thinking\s+about|wanna|want\s+to|if\s+i\s+cast|why\s+don'?t\s+(?:we|you)|do\s+i\s+have|would\s+it)\b/i;
+
+  const CONDITION_LIST_ALT =
+    "blinded|charmed|deafened|frightened|grappled|incapacitated|invisible|paralyzed|petrified|poisoned|prone|restrained|stunned|unconscious|blessed|hasted";
+
+  const FALLBACK_SPELL_NAMES = [
+    "Spirit Guardians",
+    "Healing Word",
+    "Cure Wounds",
+    "Guiding Bolt",
+    "Hunter's Mark",
+    "Misty Step",
+    "Magic Missile",
+    "Hold Person",
+    "Silvery Barbs",
+    "Eldritch Blast",
+    "Hunger of Hadar",
+    "Sacred Flame",
+    "Scorching Ray",
+    "Vortex Warp",
+    "Counterspell",
+    "Fireball",
+    "Fire Bolt",
+    "Polymorph",
+    "Shield",
+    "Bless",
+    "Bane",
+    "Haste",
+    "Hex"
+  ];
+
+  function escapeRegex(str) {
+    return String(str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function buildActorPattern(party) {
+    const tokens = new Set([
+      "i",
+      "i'm",
+      "im",
+      "i'll",
+      "i've",
+      "me",
+      "rain",
+      "rayne",
+      "bonehawk",
+      "bone hawk",
+      "gonlor",
+      "keel",
+      "kiel",
+      "munger",
+      "munner",
+      "patty",
+      "bonoc"
+    ]);
+    for (const pc of party || []) {
+      const nm = String(pc?.name || "").trim().toLowerCase();
+      if (!nm) continue;
+      tokens.add(nm);
+      tokens.add(nm.replace(/\s+/g, ""));
+      const parts = nm.split(/\s+/);
+      if (parts[0] && parts[0].length >= 3) {
+        tokens.add(parts[0]);
+      }
+    }
+    return Array.from(tokens)
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)
+      .map(escapeRegex)
+      .join("|");
+  }
+
+  function resolveRawActorToken(rawActor, speaker, party, myChar, fallbackSpellName = "") {
+    const clean = String(rawActor || "").trim().toLowerCase();
+    if (/^(i|i'm|im|i'll|i've|me|my)$/.test(clean)) {
+      if (speaker) {
+        const spkLow = String(speaker).trim().toLowerCase();
+        const bySpk = (party || []).find((p) => {
+          const pn = String(p.name || "").toLowerCase();
+          return pn === spkLow || (pn.split(/\s+/)[0] && spkLow.includes(pn.split(/\s+/)[0]));
+        });
+        if (bySpk) return bySpk.name;
+      }
+      return myChar?.name || "me";
+    }
+    if (clean) return clean;
+    if (speaker) {
+      const spkLow = String(speaker).trim().toLowerCase();
+      const bySpk = (party || []).find((p) => {
+        const pn = String(p.name || "").toLowerCase();
+        return pn === spkLow || (pn.split(/\s+/)[0] && spkLow.includes(pn.split(/\s+/)[0]));
+      });
+      if (bySpk) return bySpk.name;
+    }
+    if (fallbackSpellName) {
+      const spLow = String(fallbackSpellName).trim().toLowerCase();
+      const owners = (party || []).filter((p) =>
+        (p.spells || []).some((s) => String(s.name || "").toLowerCase() === spLow)
+      );
+      if (owners.length === 1) return owners[0].name;
+    }
+    return myChar?.name || "";
+  }
+
+  function extractPartySheetUpdatesFromLines(lines, party = [], myCharacterId = null) {
+    if (!Array.isArray(lines) || lines.length === 0 || !Array.isArray(party) || party.length === 0) {
+      return [];
+    }
+
+    const myChar =
+      party.find((p) => String(p.id) === String(myCharacterId)) || party[0] || null;
+    const actorAlt = buildActorPattern(party);
+
+    const spellSet = new Set(FALLBACK_SPELL_NAMES);
+    for (const pc of party) {
+      for (const sp of pc.spells || []) {
+        if (sp?.name) spellSet.add(String(sp.name).trim());
+      }
+    }
+    const spellsAlt = Array.from(spellSet)
+      .filter((s) => s.length >= 3)
+      .sort((a, b) => b.length - a.length)
+      .map(escapeRegex)
+      .join("|");
+
+    const updates = [];
+
+    for (const entry of lines) {
+      const rawText = String(entry?.text || "").trim();
+      if (!rawText) continue;
+      const speaker = String(entry?.speaker || "");
+
+      const sentences = rawText
+        .split(/\s*[.;!\n]+\s*/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      for (const sentence of sentences) {
+        if (HYPO_SKIP_RE.test(sentence)) continue;
+
+        const clauses = sentence
+          .split(
+            /\s+\b(?:and\s+then|then)\b\s+|\s+\band\b\s+(?=(?:[A-Z][a-z]+|I|is|am|are|was|takes?|took|heals?|regains?|gains?|gets?|casts?|uses?|spends?|drops?|loses?|lost|goes?|starts?|becomes?|shakes?|ends?|clears?|removes?)\b)/i
+          )
+          .map((c) => c.trim())
+          .filter(Boolean);
+
+        let lastSubjectActor = "";
+
+        for (const rawClause of clauses) {
+          if (HYPO_SKIP_RE.test(rawClause)) continue;
+
+          const actorPrefixMatch = actorAlt
+            ? rawClause.match(new RegExp(`\\b(${actorAlt})\\b`, "i"))
+            : null;
+          const startsBareVerb =
+            /^(?:is|am|i'm|are|was|down\s+to|takes?|took|heals?|regains?|recovers?|gains?|gets?|goes?|starts?|becomes?|loses?|lost|drops?|dropped|shakes?|ends?|clears?|removes?|spends?|uses?|casts?)\b/i.test(
+              rawClause
+            );
+
+          let clause = rawClause;
+          if (!actorPrefixMatch && startsBareVerb && lastSubjectActor) {
+            clause = `${lastSubjectActor} ${rawClause}`;
+          }
+
+          const effectiveActorMatch = actorAlt
+            ? clause.match(new RegExp(`\\b(${actorAlt})\\b`, "i"))
+            : null;
+          if (effectiveActorMatch && !/^(?:the\s+)?(?:enemy|goblin|orc|ogre|dragon|boss|monster)/i.test(rawClause)) {
+            const resolved = resolveRawActorToken(effectiveActorMatch[1], speaker, party, myChar);
+            if (resolved && resolved !== "me") lastSubjectActor = resolved;
+          }
+
+          if (/\b(?:finish(?:ed|es)?|take(?:s|n)?|completes?|had)\s+(?:a\s+|our\s+|the\s+)?long\s+rest\b/i.test(clause)) {
+            updates.push({ characterName: "all", eventType: "long_rest" });
+            continue;
+          }
+          if (/\b(?:finish(?:ed|es)?|take(?:s|n)?|completes?|had)\s+(?:a\s+|our\s+|the\s+)?short\s+rest\b/i.test(clause)) {
+            updates.push({ characterName: "all", eventType: "short_rest" });
+            continue;
+          }
+
+          // Damage taken
+          const dmgReg1 = new RegExp(
+            `\\b(${actorAlt})\\b(?:\\s+is|\\s+am|\\s+just)?\\s+(?:takes?|took|suffers?|suffered|loses?|lost)\\s+(\\d{1,3})\\s*(?:points?\\s+of\\s+)?(?:[a-z]+\\s+)?damage\\b`,
+            "i"
+          );
+          const dmgReg2 = new RegExp(
+            `\\b(\\d{1,3})\\s*(?:points?\\s+of\\s+)?(?:[a-z]+\\s+)?damage\\s+(?:to|on)\\s+(${actorAlt})\\b`,
+            "i"
+          );
+          const dm1 = clause.match(dmgReg1);
+          const dm2 = clause.match(dmgReg2);
+          if (dm1) {
+            updates.push({
+              characterName: resolveRawActorToken(dm1[1], speaker, party, myChar),
+              eventType: "damage",
+              amount: Number(dm1[2])
+            });
+          } else if (dm2) {
+            updates.push({
+              characterName: resolveRawActorToken(dm2[2], speaker, party, myChar),
+              eventType: "damage",
+              amount: Number(dm2[1])
+            });
+          }
+
+          // Temp HP
+          const tempReg = new RegExp(
+            `\\b(${actorAlt})\\s+(?:gains?|gets?|has|now\\s+has)\\s+(\\d{1,3})\\s+temp(?:orary)?\\s*(?:hp|hit\\s+points?)\\b`,
+            "i"
+          );
+          const tm = clause.match(tempReg);
+          if (tm) {
+            updates.push({
+              characterName: resolveRawActorToken(tm[1], speaker, party, myChar),
+              eventType: "temp_hp",
+              amount: Number(tm[2])
+            });
+          }
+
+          // Healing
+          const healReg1 = new RegExp(
+            `\\b(${actorAlt})\\s+(?:heals?|regains?|recovers?|gets?\\s+healed)\\s+(?:for\\s+)?(\\d{1,3})\\b`,
+            "i"
+          );
+          const healReg2 = new RegExp(
+            `\\bheals?\\s+(${actorAlt})\\s+(?:for\\s+)?(\\d{1,3})\\b`,
+            "i"
+          );
+          const hm1 = clause.match(healReg1);
+          const hm2 = clause.match(healReg2);
+          if (hm1) {
+            updates.push({
+              characterName: resolveRawActorToken(hm1[1], speaker, party, myChar),
+              eventType: "heal",
+              amount: Number(hm1[2])
+            });
+          } else if (hm2) {
+            updates.push({
+              characterName: resolveRawActorToken(hm2[1], speaker, party, myChar),
+              eventType: "heal",
+              amount: Number(hm2[2])
+            });
+          }
+
+          // Explicit HP set
+          const setHpReg = new RegExp(
+            `\\b(${actorAlt})(?:'s|\\s+is|\\s+am|\\s+drops?|\\s+dropped|\\s+goes?|\\s+went)?\\s*(?:now\\s+)?(?:at|down\\s+to)\\s+(\\d{1,3})\\s*(?:hp|health|hit\\s+points?)\\b`,
+            "i"
+          );
+          const shm = clause.match(setHpReg);
+          if (shm) {
+            updates.push({
+              characterName: resolveRawActorToken(shm[1], speaker, party, myChar),
+              eventType: "set_hp",
+              amount: Number(shm[2])
+            });
+          }
+
+          // Heroic Inspiration
+          const gainInspReg1 = new RegExp(
+            `\\b(${actorAlt})\\s+(?:gains?|gets?|earns?|receives?|is\\s+awarded|has)\\s+(?:a\\s+|an\\s+)?(?:heroic\\s+)?inspiration\\b`,
+            "i"
+          );
+          const gainInspReg2 = new RegExp(
+            `\\bgive(?:s)?\\s+(${actorAlt})\\s+(?:a\\s+|an\\s+)?(?:heroic\\s+)?inspiration\\b`,
+            "i"
+          );
+          const spendInspReg = new RegExp(
+            `\\b(${actorAlt})\\s+(?:uses?|spends?|spent|used|burns?)\\s+(?:my\\s+|their\\s+|his\\s+|her\\s+|a\\s+)?(?:heroic\\s+)?inspiration\\b`,
+            "i"
+          );
+          const gi1 = clause.match(gainInspReg1);
+          const gi2 = clause.match(gainInspReg2);
+          const si = clause.match(spendInspReg);
+          if (gi1 || gi2) {
+            updates.push({
+              characterName: resolveRawActorToken((gi1 || gi2)[1], speaker, party, myChar),
+              eventType: "gain_inspiration"
+            });
+          } else if (si) {
+            updates.push({
+              characterName: resolveRawActorToken(si[1], speaker, party, myChar),
+              eventType: "spend_inspiration"
+            });
+          }
+
+          // Drop concentration
+          const concDropReg = new RegExp(
+            `\\b(${actorAlt})\\s+(?:loses?|lost|drops?|dropped|breaks?|broke|ends?|ended)\\s+concentration\\b`,
+            "i"
+          );
+          const cdm = clause.match(concDropReg);
+          if (cdm) {
+            updates.push({
+              characterName: resolveRawActorToken(cdm[1], speaker, party, myChar),
+              eventType: "drop_concentration"
+            });
+          }
+
+          // Conditions (Rage + 5e conditions)
+          const rageAddReg = new RegExp(
+            `\\b(${actorAlt})\\s+(?:(?:starts?|begins?|goes?|is|enters?|pops?)\\s+(?:into\\s+)?(?:a\\s+)?(?:rage|raging)|rages)\\b`,
+            "i"
+          );
+          const rmAdd = clause.match(rageAddReg);
+          if (rmAdd) {
+            updates.push({
+              characterName: resolveRawActorToken(rmAdd[1], speaker, party, myChar),
+              eventType: "add_condition",
+              condition: "Raging"
+            });
+          }
+          const condRemoveReg = new RegExp(
+            `\\b(${actorAlt})\\s+(?:is\\s+no\\s+longer|shakes?\\s+off|ends?|clears?|removes?|stops?)\\s+(${CONDITION_LIST_ALT}|rage|raging)\\b`,
+            "i"
+          );
+          const crm = clause.match(condRemoveReg);
+          if (crm) {
+            const cond = /^rag/i.test(crm[2]) ? "Raging" : crm[2];
+            updates.push({
+              characterName: resolveRawActorToken(crm[1], speaker, party, myChar),
+              eventType: "remove_condition",
+              condition: cond
+            });
+          } else {
+            const condAddReg = new RegExp(
+              `\\b(${actorAlt})\\s+(?:is|am|becomes?|gets?|got|knocked|turns?|feels?)\\s+(${CONDITION_LIST_ALT})\\b`,
+              "i"
+            );
+            const cam = clause.match(condAddReg);
+            if (cam) {
+              updates.push({
+                characterName: resolveRawActorToken(cam[1], speaker, party, myChar),
+                eventType: "add_condition",
+                condition: cam[2]
+              });
+            }
+          }
+
+          // Spell casts
+          if (spellsAlt) {
+            const spellReg = new RegExp(
+              `(?:\\b(${actorAlt})\\b\\s+(?:(?:i'll|ill|will|am\\s+going\\s+to|gonna|go\\s+ahead\\s+and)\\s+)?)?(?:casts?|casting|uses?|pops?|drops?|unleashes?)\\s+(?:out\\s+)?(?:my\\s+|their\\s+|his\\s+|her\\s+|a\\s+|an\\s+)?(?:(\\d)(?:st|nd|rd|th)[-\\s]?level\\s+)?(${spellsAlt})\\b(?:\\s+at\\s+(?:level\\s+)?(\\d)(?:st|nd|rd|th)?(?:\\s+level)?)?`,
+              "i"
+            );
+            const spm = clause.match(spellReg);
+            if (spm) {
+              const spellMatched = spm[3];
+              const slotLevel = Number(spm[2] || spm[4] || 0);
+              const isRitual = /\bas\s+a\s+ritual\b|\britual\s+cast/i.test(clause);
+              const rawAct = spm[1] || (effectiveActorMatch ? effectiveActorMatch[1] : "");
+              const actorName = resolveRawActorToken(
+                rawAct,
+                speaker,
+                party,
+                myChar,
+                spellMatched
+              );
+              if (actorName) {
+                updates.push({
+                  characterName: actorName,
+                  eventType: "spell_cast",
+                  spellName: spellMatched,
+                  ...(slotLevel > 0 ? { slotLevel } : {}),
+                  isRitual
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return updates;
+  }
+
   async function tryChromeBuiltInPrompt(systemPrompt, userPrompt) {
     try {
       const lm = global.LanguageModel || global.ai?.languageModel;
@@ -122,8 +501,16 @@
         lastUpdatedAt: Date.now()
       };
       store.recordSessionBeat?.(st.situation);
+      const newSheetLines = store.getUnprocessedTranscriptLinesForSheets
+        ? store.getUnprocessedTranscriptLinesForSheets(18)
+        : [];
+      const newestId = newSheetLines.length ? newSheetLines[newSheetLines.length - 1].id : null;
+      const updates = extractPartySheetUpdatesFromLines(newSheetLines, st.party, st.myCharacterId);
+      const sheetRes = store.applyLivePartyUpdates
+        ? store.applyLivePartyUpdates(updates, newestId)
+        : { appliedCount: 0, descriptions: [] };
       store.save();
-      return st.situation;
+      return { ...st.situation, _appliedPartyUpdates: sheetRes.descriptions };
     }
 
     // Deterministic Local Digest Engine ($0, instant, works in every Chrome version)
@@ -216,8 +603,16 @@
     };
 
     store.recordSessionBeat?.(st.situation);
+    const newSheetLines = store.getUnprocessedTranscriptLinesForSheets
+      ? store.getUnprocessedTranscriptLinesForSheets(18)
+      : [];
+    const newestId = newSheetLines.length ? newSheetLines[newSheetLines.length - 1].id : null;
+    const updates = extractPartySheetUpdatesFromLines(newSheetLines, st.party, st.myCharacterId);
+    const sheetRes = store.applyLivePartyUpdates
+      ? store.applyLivePartyUpdates(updates, newestId)
+      : { appliedCount: 0, descriptions: [] };
     store.save();
-    return st.situation;
+    return { ...st.situation, _appliedPartyUpdates: sheetRes.descriptions };
   }
 
   async function summarizeFullSession(store) {
@@ -371,20 +766,21 @@
     };
   }
 
-  async function adviseTacticsAndSpells(store, customQuestion = "") {
+  async function adviseTacticsAndSpells(store, customQuestion = "", extraPastContext = "") {
     const st = store.state;
     const myChar =
       st.party.find((p) => String(p.id) === String(st.myCharacterId)) || st.party[0] || null;
 
-    // Extract optional tie-in from campaign memory / saved transcripts
+    // Extract optional tie-in from campaign memory / saved transcripts / Drive archive
     let pastSessionConnection = "";
-    const pastContext = store.getRelevantPastContext
+    const localPast = store.getRelevantPastContext
       ? store.getRelevantPastContext(st.transcript.slice(-10))
       : "";
+    const pastContext = [extraPastContext, localPast].filter(Boolean).join("\n");
     if (pastContext) {
       const relevantLines = pastContext
         .split("\n")
-        .filter((l) => l.startsWith("[Past: "));
+        .filter((l) => l.startsWith("[Past: ") || l.startsWith("[Drive"));
       if (relevantLines.length > 0) {
         pastSessionConnection = relevantLines.slice(0, 2).join(" · ");
       } else {
@@ -697,6 +1093,7 @@
     solvePuzzle,
     adviseTacticsAndSpells,
     summarizePastSession,
-    summarizeFullSession
+    summarizeFullSession,
+    extractPartySheetUpdatesFromLines
   };
 })(window);
