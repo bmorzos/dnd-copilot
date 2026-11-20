@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import sys
+
+sys.dont_write_bytecode = True
+
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -11,7 +15,6 @@ import re
 import secrets
 import shutil
 import subprocess
-import sys
 import threading
 import time
 import urllib.error

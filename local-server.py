@@ -8,6 +8,9 @@ import os
 from pathlib import Path
 import re
 import sys
+
+sys.dont_write_bytecode = True
+
 import threading
 import time
 import urllib.error
