@@ -16,6 +16,7 @@
   let cobaltToken = null;
   let cobaltTokenExpiresAt = 0;
   const seenRollFingerprints = new Set();
+  const seenGameLogElements = new WeakSet();
   let hasBaselineGameLog = false;
   let lastSnapshotHash = "";
   let rollContext = { myChar: null, party: [] };
@@ -306,11 +307,25 @@
     const breakdownEl = li.querySelector(
       ".dice_result__info__breakdown, [class*='breakdown'], [class*='Notation'], [class*='Values']"
     );
-    const cleanedBreakdown = (titleAttr || breakdownEl?.textContent || "")
+    let cleanedBreakdown = (titleAttr || breakdownEl?.textContent || "")
       .replace(/<br\s*\/?>/gi, " · ")
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, 120);
+
+    const formulaMatch = rawText.match(
+      /\b(\d+d\d+(?:(?:kh|kl|min|ro[<>=]*)\d+)?(?:\s*[+-]\s*\d+)?)\b/i
+    );
+    const formula = formulaMatch ? formulaMatch[1].replace(/\s+/g, "") : "";
+    const hasMin2 = /min2\b/i.test(`${titleAttr} ${rawText}`);
+
+    if (!cleanedBreakdown) {
+      const exprMatch = rawText.match(/(?:^|\s)(\d{1,3}(?:\s*[+-]\s*\d{1,3})+)(?=\s|$|=)/);
+      if (exprMatch) {
+        cleanedBreakdown = exprMatch[1].replace(/\s+/g, " ").trim();
+      }
+    }
+
     const upgradedOnes = (String(titleAttr).match(/\b2\^/g) || []).length;
     const rawDiceValues = [];
     if (cleanedBreakdown) {
@@ -327,10 +342,18 @@
           if (dm) rawDiceValues.push(parseInt(dm[1], 10));
         }
       }
+      if (
+        rawDiceValues.length === 0 &&
+        /^\d+(?:\s*\+\s*\d+)+$/.test(beforeEq.trim()) &&
+        formula &&
+        !/[+-]\d+$/.test(formula)
+      ) {
+        for (const tok of beforeEq.split("+")) {
+          const num = parseInt(tok.trim(), 10);
+          if (Number.isFinite(num)) rawDiceValues.push(num);
+        }
+      }
     }
-
-    const formulaMatch = rawText.match(/\b(\d+d\d+(?:\s*[+-]\s*\d+)?)\b/i);
-    const formula = formulaMatch ? formulaMatch[1].replace(/\s+/g, "") : "";
 
     // Fallback numeric extraction for AboveVTT / DDB dice toast cards
     if (total === null && (formula || li.matches(".noty_body, .dice_result, [class*='DiceResult'], [class*='DiceNotification']"))) {
@@ -350,14 +373,23 @@
       Boolean(li.querySelector("[class*='fumble'], [class*='fail'], .nat1")) ||
       /\b(critical miss|nat(?:ural)? 1)\b/i.test(rawText);
 
-    const timeLabel = li.querySelector("time")?.textContent?.trim() || "";
     const kind = total !== null ? classifyRollKind(rawText, `${actionLabel} ${rollTypeLabel}`) : "chat";
     if (!actionLabel || /^roll$/i.test(actionLabel)) {
       const inferred = inferCatalogActionFromText(rawText);
       if (inferred) actionLabel = inferred;
     }
 
-    const fingerprint = `${sender}|${actionLabel}|${kind}|${total}|${rawText.slice(0, 120)}|${timeLabel}`;
+    const stableText = rawText
+      .replace(
+        /\b(?:<\s*1\s*min|\d+\s*(?:secs?|mins?|hours?|days?))\s*ago\b|\b\d{1,2}:\d{2}\s*(?:am|pm)\b|\bjust now\b/gi,
+        ""
+      )
+      .replace(/\s+/g, " ")
+      .trim();
+    const isStaleEntry = /\b(?:[2-9]|\d{2,})\s*(?:mins?|hours?|days?)\s*ago\b|\b\d{1,2}:\d{2}\s*(?:am|pm)\b/i.test(
+      rawText
+    );
+    const fingerprint = `${sender}|${actionLabel}|${kind}|${total}|${stableText.slice(0, 120)}`;
 
     return {
       fingerprint,
@@ -368,8 +400,10 @@
       total,
       formula,
       breakdown: cleanedBreakdown,
+      hasMin2,
       upgradedOnes,
       rawDiceValues,
+      isStaleEntry,
       isCrit,
       isFumble,
       rawText: rawText.slice(0, 280)
@@ -407,15 +441,18 @@
     const seenInPass = new Set();
 
     topNodes.forEach((node) => {
+      const isNewEl = !seenGameLogElements.has(node);
+      seenGameLogElements.add(node);
+
       const parsed = parseGameLogEntry(node);
       if (!parsed || seenInPass.has(parsed.fingerprint)) return;
       seenInPass.add(parsed.fingerprint);
 
-      const isNew = !seenRollFingerprints.has(parsed.fingerprint);
-      if (isNew) {
+      const isNewFp = !seenRollFingerprints.has(parsed.fingerprint);
+      if (isNewFp) {
         seenRollFingerprints.add(parsed.fingerprint);
       }
-      if (!onlyNew || isNew) {
+      if (!onlyNew || (isNewEl && isNewFp)) {
         entries.push(parsed);
       }
     });
@@ -1609,28 +1646,41 @@
     return bonusTxt ? `${baseName} (${bonusTxt})` : baseName;
   }
 
-  function buildCoachNotesFromAnalysis(scaledSpec, activeMods, includedSet, cmdOptions = {}, upcastLabel = "") {
+  function buildCoachNotesFromAnalysis(
+    scaledSpec,
+    activeMods,
+    includedSet,
+    cmdOptions = {},
+    upcastLabel = "",
+    partScope = {}
+  ) {
     const rm = window.DnDCopilot?.RollMaximizer;
     const inVttNotes = [];
     const tellDmNotes = [];
     let coldAdeptMod = null;
+
+    const includeHitNotes = partScope.wantsHit !== false;
+    const includeDmgNotes = Boolean(partScope.wantsDamage || partScope.isSaveSpell);
 
     if (upcastLabel) {
       inVttNotes.push(upcastLabel);
     } else if (scaledSpec.upcastNote) {
       inVttNotes.push(scaledSpec.upcastNote);
     }
-    if (cmdOptions?.setD20To != null) {
+    if (includeHitNotes && cmdOptions?.setD20To != null) {
       inVttNotes.push(`Clockwork Amulet: d20 = ${cmdOptions.setD20To}`);
     }
 
     for (const m of activeMods) {
       if (m.id === "help_advantage" || m.id === "heroic_inspiration") continue;
       if (m.id.startsWith("elemental_adept_")) {
-        coldAdeptMod = m;
+        if (includeDmgNotes) coldAdeptMod = m;
         continue;
       }
       if (m.id === "clockwork_amulet") continue;
+      if (!includeHitNotes && (m.id === "wand_half_cover" || m.id === "party_bless" || m.id === "gnome_cunning")) {
+        continue;
+      }
 
       const compactTxt = rm?.formatCompactModifierNote
         ? rm.formatCompactModifierNote(m, { upcastNote: scaledSpec.upcastNote })
@@ -1664,6 +1714,8 @@
     const isDamagePart = part === "damage";
     const isSaveSpell = matchedSpec.kind === "spell_save" || matchedSpec.kind === "item_save";
     const isD20Roll = !isSaveSpell && matchedSpec.kind !== "spell_auto";
+    const wantsHit = rollMeta?.wantsHit !== undefined ? rollMeta.wantsHit : !isDamagePart && isD20Roll;
+    const wantsDamage = rollMeta?.wantsDamage !== undefined ? rollMeta.wantsDamage : isDamagePart;
 
     const bakedIds = rollMeta?.bakedIds instanceof Set ? rollMeta.bakedIds : new Set();
     const { inVttNotes, tellDmNotes, coldAdeptMod } = buildCoachNotesFromAnalysis(
@@ -1671,15 +1723,21 @@
       activeMods,
       bakedIds,
       rollMeta?.cmdOptions || {},
-      rollMeta?.upcastLabel || ""
+      rollMeta?.upcastLabel || "",
+      { wantsHit, wantsDamage, isSaveSpell }
     );
 
-    if (matchedSpec.kind === "spell_attack" && Number(myChar.spellAttackBonus || 0) > 0 && !rollMeta?.skipBaseInNote) {
+    if (wantsHit && matchedSpec.kind === "spell_attack" && Number(myChar.spellAttackBonus || 0) > 0 && !rollMeta?.skipBaseInNote) {
       inVttNotes.unshift(`+${Number(myChar.spellAttackBonus)} to hit (incl. Wand +${Number(myChar.spellAttackItemBonus || 0)})`);
     }
 
     const addons = activeMods
-      .filter((m) => (m.flatBonus || m.diceBonus) && !bakedIds.has(m.id))
+      .filter(
+        (m) =>
+          (m.flatBonus || m.diceBonus) &&
+          !bakedIds.has(m.id) &&
+          (wantsHit || m.damageDiceBonus || m.damageFlatBonus)
+      )
       .map((m) => ({
         id: m.id,
         shortLabel: formatCoachAddonLabel(m),
@@ -1687,9 +1745,6 @@
         diceBonus: m.diceBonus || "",
         isDamage: Boolean(m.damageDiceBonus || m.damageFlatBonus)
       }));
-
-    const wantsHit = rollMeta?.wantsHit !== undefined ? rollMeta.wantsHit : !isDamagePart && isD20Roll;
-    const wantsDamage = rollMeta?.wantsDamage !== undefined ? rollMeta.wantsDamage : isDamagePart;
 
     activeCoachState = {
       matchedSpec,
@@ -1782,7 +1837,7 @@
 
     const myFirst = String(myChar.name || "").trim().split(/\s+/)[0].toLowerCase();
     for (const roll of newRolls) {
-      if (!roll || roll.kind === "chat") continue;
+      if (!roll || roll.kind === "chat" || roll.isStaleEntry) continue;
       const actorLow = String(roll.actor || "").toLowerCase();
       if (actorLow !== String(myChar.name || "").toLowerCase() && !(myFirst.length >= 3 && actorLow.includes(myFirst))) {
         continue;
@@ -1799,6 +1854,7 @@
         Date.now() - (activeCoachState.updatedAt || 0) < 12000;
 
       if (sameSpecActive && roll.total != null) {
+        if (roll.hasMin2) activeCoachState.usedMin2 = true;
         if (part === "damage" || (activeCoachState.wantsDamage && !activeCoachState.wantsHit)) {
           activeCoachState.damageTotal = roll.total;
           activeCoachState.damageBreakdown = roll.breakdown || "";
@@ -1819,6 +1875,7 @@
       if (res.matchedSpec) {
         showAnalyzedRollCoach(res.matchedSpec, part, roll.total, roll.action, "sent", {
           breakdown: roll.breakdown || "",
+          usedMin2: Boolean(roll.hasMin2),
           upgradedOnes: Number(roll.upgradedOnes || 0),
           rawOnes,
           rawDiceCount: rawDice.length,

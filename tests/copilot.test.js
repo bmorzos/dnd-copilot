@@ -2394,6 +2394,9 @@ test("AboveVTT slash command builder & Shadow DOM cross-frame VTT relay contract
   assert.ok(csCode.includes(".aboveDiceTotal"));
   assert.ok(csCode.includes("prepRollState"));
   assert.ok(!csCode.includes("🗣️ Say:"));
+  assert.ok(csCode.includes("seenGameLogElements"));
+  assert.ok(csCode.includes("isStaleEntry"));
+  assert.ok(csCode.includes("hasMin2"));
   assert.ok(bgCode.includes("REGISTER_FRAME"));
   assert.ok(bgCode.includes("RELAY_TRIGGER_SHEET_ROLL"));
   assert.ok(bgCode.includes("FORWARD_ROLL_COACH_TO_TOP"));
