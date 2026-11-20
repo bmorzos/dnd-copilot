@@ -595,19 +595,31 @@ test("B.U.G.S. party group saves character sheets permanently and transcripts ar
   assert.equal(store.state.party.length, 2);
   assert.equal(store.state.party[1].name, "Gimble");
 
-  // Drone is excluded from B.U.G.S. and never re-imported by auto-sync
+  // Drone and NPCs (Thenoeght, Zahra Ellian) are excluded from B.U.G.S. and never re-imported by auto-sync
   assert.equal(store.isCharacterExcluded("999999", "Drone"), true);
-  store.upsertCharacter({
-    id: "999999",
-    name: "Drone",
-    classSummary: "Fighter 6",
-    level: 6,
-    hp: { current: 50, max: 50, temp: 0 },
-    ac: 17,
-    spellSlots: [],
-    spells: []
-  });
-  assert.equal(store.state.party.some((p) => p.name === "Drone"), false);
+  assert.equal(store.isCharacterExcluded("46609350", "Thenoeght"), true);
+  assert.equal(store.isCharacterExcluded("", "Theno"), true);
+  assert.equal(store.isCharacterExcluded("154372629", "Zahra Ellian"), true);
+  for (const npc of [
+    { id: "999999", name: "Drone" },
+    { id: "46609350", name: "Thenoeght" },
+    { id: "154372629", name: "Zahra Ellian" }
+  ]) {
+    store.upsertCharacter({
+      id: npc.id,
+      name: npc.name,
+      classSummary: "NPC",
+      level: 6,
+      hp: { current: 50, max: 50, temp: 0 },
+      ac: 17,
+      spellSlots: [],
+      spells: []
+    });
+  }
+  assert.equal(
+    store.state.party.some((p) => ["Drone", "Thenoeght", "Zahra Ellian"].includes(p.name)),
+    false
+  );
 
   // Portable backup includes API keys + settings + B.U.G.S. party so nothing has to be re-entered
   store.updateSettings({ groqApiKey: "gsk_portable_key_777", speechMode: "groq" });

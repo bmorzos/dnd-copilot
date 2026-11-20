@@ -9,6 +9,8 @@
   const SAVED_TRANSCRIPTS_KEY = "dnd_copilot_saved_transcripts_v1";
   const CAMPAIGN_MEMORY_KEY = "dnd_copilot_campaign_memory_v1";
   const DEFAULT_PARTY_GROUP = "B.U.G.S.";
+  const DEFAULT_BUGS_EXCLUDED_NAMES = ["drone", "thenoeght", "theno", "zahra"];
+  const DEFAULT_BUGS_EXCLUDED_IDS = ["46609350", "154372629"];
 
   function isDemoCharId(id) {
     return String(id || "").startsWith("demo-");
@@ -616,8 +618,8 @@
         name: DEFAULT_PARTY_GROUP,
         myCharacterId: null,
         characters: [],
-        excludedIds: [],
-        excludedNames: ["drone"],
+        excludedIds: [...DEFAULT_BUGS_EXCLUDED_IDS],
+        excludedNames: [...DEFAULT_BUGS_EXCLUDED_NAMES],
         updatedAt: Date.now()
       });
       try {
@@ -631,8 +633,15 @@
               const bg = parsed.groups[DEFAULT_PARTY_GROUP];
               bg.excludedIds = Array.isArray(bg.excludedIds) ? bg.excludedIds : [];
               bg.excludedNames = Array.isArray(bg.excludedNames) ? bg.excludedNames : [];
-              if (!bg.excludedNames.includes("drone")) {
-                bg.excludedNames.push("drone");
+              for (const exId of DEFAULT_BUGS_EXCLUDED_IDS) {
+                if (!bg.excludedIds.includes(exId)) {
+                  bg.excludedIds.push(exId);
+                }
+              }
+              for (const exName of DEFAULT_BUGS_EXCLUDED_NAMES) {
+                if (!bg.excludedNames.includes(exName)) {
+                  bg.excludedNames.push(exName);
+                }
               }
             }
             return parsed;
@@ -698,8 +707,19 @@
         if (!grp) continue;
         grp.excludedIds = Array.isArray(grp.excludedIds) ? grp.excludedIds : [];
         grp.excludedNames = Array.isArray(grp.excludedNames) ? grp.excludedNames : [];
-        if (gName === DEFAULT_PARTY_GROUP && !grp.excludedNames.includes("drone")) {
-          grp.excludedNames.push("drone");
+        if (gName === DEFAULT_PARTY_GROUP) {
+          for (const exId of DEFAULT_BUGS_EXCLUDED_IDS) {
+            if (!grp.excludedIds.includes(exId)) {
+              grp.excludedIds.push(exId);
+              modified = true;
+            }
+          }
+          for (const exName of DEFAULT_BUGS_EXCLUDED_NAMES) {
+            if (!grp.excludedNames.includes(exName)) {
+              grp.excludedNames.push(exName);
+              modified = true;
+            }
+          }
         }
         if (Array.isArray(grp.characters)) {
           const before = grp.characters.length;
