@@ -479,6 +479,10 @@ body.has-audio-bar .main-grid {
   gap: 14px;
 }
 
+.focus-body > * {
+  flex-shrink: 0;
+}
+
 .sub-bar {
   display: flex;
   align-items: center;
@@ -581,12 +585,19 @@ body.has-audio-bar .main-grid {
 /* PUZZLE */
 .riddle-input {
   font-style: italic;
+  min-height: 86px;
+  resize: vertical;
+  font-size: 14.5px;
+  line-height: 1.45;
 }
 
 .clues-box {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 5px;
+  max-height: 168px;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .clue-row {
@@ -594,10 +605,11 @@ body.has-audio-bar .main-grid {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 9px 12px;
+  padding: 6px 10px;
   border-radius: 8px;
   background: var(--bg-card);
-  font-size: 16px;
+  font-size: 14.5px;
+  line-height: 1.35;
 }
 
 .checks-box {
