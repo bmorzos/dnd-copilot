@@ -21,10 +21,12 @@
       this.#initExtensionListeners();
       this.#initPostMessageListeners();
 
-      // Periodic character sheet refresh every 30s in BOTH Extension and Bookmarklet modes
+      // Periodic character sheet refresh every 30s in Extension, Bookmarklet, and Local Server modes
       setInterval(() => {
         const canRefresh =
-          this.isExtensionContext() || (this.remoteWindow && !this.remoteWindow.closed);
+          this.isExtensionContext() ||
+          this.isLocalServerContext() ||
+          (this.remoteWindow && !this.remoteWindow.closed);
         if (
           canRefresh &&
           this.store.settings.autoSyncPartySheets &&
@@ -41,6 +43,14 @@
           chrome.runtime &&
           chrome.runtime.id &&
           window.location.protocol === "chrome-extension:"
+      );
+    }
+
+    isLocalServerContext() {
+      const host = String(window.location?.hostname || "");
+      return Boolean(
+        (host === "localhost" || host === "127.0.0.1") &&
+          window.location?.protocol === "http:"
       );
     }
 
@@ -170,6 +180,21 @@
         }
       }
 
+      // 2b. Local proxy fallback when running via start-windows.bat / start-mac.command (avoids CORS on public DDB sheets)
+      if (!rawJson && this.isLocalServerContext()) {
+        try {
+          const proxyResp = await fetch(`/api/ddb-character/${charId}?_t=${Date.now()}`, {
+            cache: "no-store",
+            headers: { Accept: "application/json" }
+          });
+          if (proxyResp.ok) {
+            rawJson = await proxyResp.json();
+          }
+        } catch (_) {
+          rawJson = null;
+        }
+      }
+
       // 3. Direct browser fetch (works if CORS permits or via local proxy)
       if (!rawJson) {
         const url = `https://character-service.dndbeyond.com/character/v5/character/${charId}?includeCustomItems=true&_t=${Date.now()}`;
@@ -236,8 +261,13 @@
       }
 
       if (!silent) {
-        if (updated > 0) {
+        if (updated > 0 && updated === ids.length) {
           this.onToast(`Updated ${updated}/${ids.length} character sheet(s) from D&D Beyond!`);
+        } else if (updated > 0 && updated < ids.length) {
+          const privateCount = ids.length - updated;
+          this.onToast(
+            `Updated ${updated}/${ids.length} public sheet(s) from D&D Beyond! (${privateCount} private sheet(s) need the Extension or Bookmarklet)`
+          );
         } else if (!this.isExtensionContext() && (!this.remoteWindow || this.remoteWindow.closed)) {
           this.onToast(
             "To update sheets in web mode, click your ⚔️ Sync AboveVTT bookmarklet on your D&D Beyond tab once!"
