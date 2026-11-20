@@ -120,7 +120,10 @@
       };
     }
 
-    const resp = await fetch(INTERACTIONS_ENDPOINT, {
+    const endpoint = isLocalServerContext()
+      ? "/api/proxy/gemini-interactions"
+      : INTERACTIONS_ENDPOINT;
+    const resp = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -158,7 +161,10 @@
       throw new Error("Add your free Groq API Key in Settings to use Groq.");
     }
 
-    const resp = await fetch(GROQ_CHAT_ENDPOINT, {
+    const endpoint = isLocalServerContext()
+      ? "/api/proxy/groq-chat"
+      : GROQ_CHAT_ENDPOINT;
+    const resp = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -263,7 +269,10 @@
       form.append("prompt", vocabPrompt);
 
       try {
-        const resp = await fetch(GROQ_WHISPER_ENDPOINT, {
+        const endpoint = isLocalServerContext()
+          ? "/api/proxy/groq-whisper"
+          : GROQ_WHISPER_ENDPOINT;
+        const resp = await fetch(endpoint, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${groqKey}`
@@ -668,25 +677,89 @@
     };
   }
 
-  async function analyzeTableSituation(store) {
+  function canFallbackToGroq(store, err) {
+    const msg = String(err?.message || err || "");
+    if (/budget cap/i.test(msg)) return false;
+    return Boolean(String(store.settings?.groqApiKey || "").trim());
+  }
+
+  async function runStructuredAi({
+    store,
+    backend,
+    geminiModel,
+    systemInstruction,
+    prompt,
+    geminiSchema,
+    groqSchemaHint
+  }) {
+    if (backend === "groq") {
+      return await callGroqJson({
+        store,
+        systemInstruction,
+        userPrompt: prompt,
+        schemaHint: groqSchemaHint
+      });
+    }
+    try {
+      return await callInteractionsApi({
+        store,
+        model: geminiModel,
+        systemInstruction,
+        input: prompt,
+        jsonSchema: geminiSchema
+      });
+    } catch (err) {
+      if (canFallbackToGroq(store, err)) {
+        return await callGroqJson({
+          store,
+          systemInstruction,
+          userPrompt: prompt,
+          schemaHint: groqSchemaHint
+        });
+      }
+      throw err;
+    }
+  }
+
+  async function analyzeTableSituation(store, options = {}) {
+    const overrideLines = Array.isArray(options?.overrideLines) ? options.overrideLines : null;
+    const forceRecordBeat = Boolean(options?.forceRecordBeat);
+    const actLabel = String(options?.actLabel || "").trim();
+
     const backend = resolveBrainBackend(store);
     if (backend === "local" && global.DnDCopilot?.LocalBrain) {
-      return await global.DnDCopilot.LocalBrain.analyzeTableSituation(store);
+      return await global.DnDCopilot.LocalBrain.analyzeTableSituation(store, options);
     }
 
-    const drivePastCtx = await fetchLocalDriveMemoryContext(store, "");
+    const drivePastCtx = await fetchLocalDriveMemoryContext(
+      store,
+      overrideLines ? overrideLines.slice(-10).map((l) => l.text).join(" ") : ""
+    );
     const ctx = buildCompactSessionContext(store, drivePastCtx);
+    const activeTranscriptText = overrideLines
+      ? overrideLines.map((t) => `[${t.speaker}] ${t.text}`).join("\n")
+      : ctx.recentTranscript;
     const existingClues = store.state.puzzle.clues.join(" | ");
-    const newSheetLines = store.getUnprocessedTranscriptLinesForSheets
+    const newSheetLines = overrideLines
+      ? overrideLines
+      : store.getUnprocessedTranscriptLinesForSheets
       ? store.getUnprocessedTranscriptLinesForSheets(18)
       : [];
-    const newestLineId = newSheetLines.length ? newSheetLines[newSheetLines.length - 1].id : null;
+    const newestLineId = overrideLines
+      ? store.state.transcript.length
+        ? store.state.transcript[store.state.transcript.length - 1].id
+        : null
+      : newSheetLines.length
+      ? newSheetLines[newSheetLines.length - 1].id
+      : null;
     const newLinesText = newSheetLines.map((t) => `[${t.speaker}] ${t.text}`).join("\n");
 
     const prompt = [
       "Summarize what is happening right now at our D&D table in plain, easy-to-read language.",
+      actLabel ? `Chronological Segment: ${actLabel}` : "",
       `Current Combat Active: ${store.state.combat.inCombat} (Round ${store.state.combat.round || 1})`,
       `Known Puzzle Clues So Far: ${existingClues || "None"}`,
+      `Playing As: ${ctx.myChar ? `${ctx.myChar.name} (${ctx.myChar.classSummary})` : "Party Member"}`,
       "--- PARTY ---",
       ctx.partyText || "None synced",
       "--- VISIBLE ENEMIES ---",
@@ -696,132 +769,177 @@
       ...(ctx.pastSessionsText
         ? ["--- PAST SESSIONS / CAMPAIGN MEMORY ---", ctx.pastSessionsText]
         : []),
-      "--- RECENT TABLE CONVERSATION ---",
-      ctx.recentTranscript || "None",
+      "--- TABLE CONVERSATION ---",
+      activeTranscriptText || "None",
       ...(newLinesText
         ? [
-            "--- NEW TABLE LINES SINCE LAST SHEET CHECK (ONLY extract committed partyUpdates from THESE lines) ---",
+            "--- NEW TABLE LINES SINCE LAST SHEET CHECK (ONLY extract committed partyUpdates & combatEvents from THESE lines) ---",
             newLinesText
           ]
         : []),
-      "Keep summaryBullets to 3 short, crisp sentences (filter out casual off-topic banter). Note any returning NPCs or quests from Past Sessions if mentioned.",
-      "For partyUpdates, ONLY record committed party state changes explicitly spoken in the NEW TABLE LINES (damage taken, healing, set HP, temp HP, leveled/cantrip spell_cast, gain/spend inspiration, add/remove condition like Raging/Prone/Blessed/Poisoned, drop_concentration, short_rest, or long_rest). Ignore hypothetical brainstorms ('should I', 'what if', 'maybe'). Return [] if none."
-    ].join("\n");
+      "Keep summaryBullets to 3 short, crisp sentences focused strictly on story/combat/clerical events (ignore off-topic banter like mic setup, snacks, or printer issues).",
+      "For location, give a short scene location name (e.g. 'Stonehill Inn', 'Forest Clearing Camp', 'Phandalin Well') or ''.",
+      "For suggestedNextMoves, give 2-3 specific, practical things the 'Playing As' hero can DO, ASK THE DM, CHECK, or CAST right now.",
+      "For detectedEnemies and combatEvents, track player-fair observed foes, damage dealt TO foes, bloodied/defeated states, observed resistances/traits, hit/miss AC roll bounds, and key combat actions. Never reveal secret Monster Manual max HP.",
+      "For partyUpdates, ONLY record committed party state changes explicitly spoken in the NEW TABLE LINES (damage taken by PCs, healing, set HP, temp HP, spell_cast, gain/spend inspiration, add/remove condition like Raging/Prone/Blessed/Poisoned, drop_concentration, short_rest, or long_rest). Ignore hypothetical brainstorms ('should I', 'what if', 'maybe'). Return [] if none."
+    ]
+      .filter(Boolean)
+      .join("\n");
 
-    let res;
-    if (backend === "groq") {
-      res = await callGroqJson({
-        store,
-        userPrompt: prompt,
-        schemaHint: JSON.stringify({
-          sceneMode: "Exploration | Social | Puzzle | Combat",
-          headline: "Short 1-sentence headline",
-          summaryBullets: ["Bullet 1", "Bullet 2", "Bullet 3"],
-          activeObjectives: ["Objective 1"],
-          notableNpcs: ["NPC Name"],
-          puzzleDetected: false,
-          puzzleTitle: "",
-          puzzleInscription: "",
-          newPuzzleClues: [],
-          observedEnemyNotes: [{ enemyName: "Name", trait: "Trait" }],
-          partyUpdates: [
-            {
-              characterName: "PC Name or all",
-              eventType: "spell_cast | damage | heal | set_hp | temp_hp | gain_inspiration | spend_inspiration | add_condition | remove_condition | drop_concentration | short_rest | long_rest",
-              spellName: "",
-              slotLevel: 0,
-              amount: 0,
-              condition: "",
-              isRitual: false
-            }
-          ]
-        })
-      });
-    } else {
-      const schema = {
-        type: "object",
-        properties: {
-          sceneMode: { type: "string", enum: ["Exploration", "Social", "Puzzle", "Combat"] },
-          headline: { type: "string" },
-          summaryBullets: { type: "array", items: { type: "string" } },
-          activeObjectives: { type: "array", items: { type: "string" } },
-          notableNpcs: { type: "array", items: { type: "string" } },
-          puzzleDetected: { type: "boolean" },
-          puzzleTitle: { type: "string" },
-          puzzleInscription: { type: "string" },
-          newPuzzleClues: { type: "array", items: { type: "string" } },
-          observedEnemyNotes: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: { enemyName: { type: "string" }, trait: { type: "string" } },
-              required: ["enemyName", "trait"]
-            }
-          },
-          partyUpdates: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                characterName: { type: "string" },
-                eventType: {
-                  type: "string",
-                  enum: [
-                    "spell_cast",
-                    "damage",
-                    "heal",
-                    "set_hp",
-                    "temp_hp",
-                    "gain_inspiration",
-                    "spend_inspiration",
-                    "add_condition",
-                    "remove_condition",
-                    "drop_concentration",
-                    "short_rest",
-                    "long_rest"
-                  ]
-                },
-                spellName: { type: "string" },
-                slotLevel: { type: "integer" },
-                amount: { type: "integer" },
-                condition: { type: "string" },
-                isRitual: { type: "boolean" }
-              },
-              required: ["characterName", "eventType"]
-            }
+    const schema = {
+      type: "object",
+      properties: {
+        sceneMode: { type: "string", enum: ["Exploration", "Social", "Puzzle", "Combat"] },
+        location: { type: "string" },
+        headline: { type: "string" },
+        summaryBullets: { type: "array", items: { type: "string" } },
+        activeObjectives: { type: "array", items: { type: "string" } },
+        suggestedNextMoves: { type: "array", items: { type: "string" } },
+        notableNpcs: { type: "array", items: { type: "string" } },
+        puzzleDetected: { type: "boolean" },
+        puzzleTitle: { type: "string" },
+        puzzleInscription: { type: "string" },
+        newPuzzleClues: { type: "array", items: { type: "string" } },
+        observedEnemyNotes: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { enemyName: { type: "string" }, trait: { type: "string" } },
+            required: ["enemyName", "trait"]
           }
         },
-        required: [
-          "sceneMode",
-          "headline",
-          "summaryBullets",
-          "activeObjectives",
-          "notableNpcs",
-          "puzzleDetected",
-          "newPuzzleClues",
-          "observedEnemyNotes",
-          "partyUpdates"
-        ]
-      };
-      res = await callInteractionsApi({
-        store,
-        model: store.settings.fastModel || "gemini-3.5-flash-lite",
-        systemInstruction: PLAYER_FAIR_SYSTEM_PROMPT,
-        input: prompt,
-        jsonSchema: schema
-      });
-    }
+        detectedEnemies: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              damageDealt: { type: "integer" },
+              isBloodied: { type: "boolean" },
+              isDefeated: { type: "boolean" },
+              trait: { type: "string" },
+              missRoll: { type: "integer" },
+              hitRoll: { type: "integer" }
+            },
+            required: ["name"]
+          }
+        },
+        combatEvents: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              actor: { type: "string" },
+              target: { type: "string" },
+              action: { type: "string" },
+              detail: { type: "string" },
+              kind: { type: "string" }
+            },
+            required: ["actor", "action", "detail"]
+          }
+        },
+        partyUpdates: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              characterName: { type: "string" },
+              eventType: {
+                type: "string",
+                enum: [
+                  "spell_cast",
+                  "damage",
+                  "heal",
+                  "set_hp",
+                  "temp_hp",
+                  "gain_inspiration",
+                  "spend_inspiration",
+                  "add_condition",
+                  "remove_condition",
+                  "drop_concentration",
+                  "short_rest",
+                  "long_rest"
+                ]
+              },
+              spellName: { type: "string" },
+              slotLevel: { type: "integer" },
+              amount: { type: "integer" },
+              condition: { type: "string" },
+              isRitual: { type: "boolean" }
+            },
+            required: ["characterName", "eventType"]
+          }
+        }
+      },
+      required: [
+        "sceneMode",
+        "headline",
+        "summaryBullets",
+        "activeObjectives",
+        "notableNpcs",
+        "puzzleDetected",
+        "newPuzzleClues",
+        "observedEnemyNotes",
+        "partyUpdates"
+      ]
+    };
+
+    const groqSchemaHint = JSON.stringify({
+      sceneMode: "Exploration | Social | Puzzle | Combat",
+      location: "Short current location name",
+      headline: "Short 1-sentence headline",
+      summaryBullets: ["Bullet 1", "Bullet 2", "Bullet 3"],
+      activeObjectives: ["Objective 1"],
+      suggestedNextMoves: ["Actionable move or DM question 1", "Actionable move 2"],
+      notableNpcs: ["NPC Name"],
+      puzzleDetected: false,
+      puzzleTitle: "",
+      puzzleInscription: "",
+      newPuzzleClues: [],
+      observedEnemyNotes: [{ enemyName: "Name", trait: "Trait" }],
+      detectedEnemies: [
+        { name: "Goblin", damageDealt: 0, isBloodied: false, isDefeated: false, trait: "", missRoll: 0, hitRoll: 0 }
+      ],
+      combatEvents: [
+        { actor: "Actor", target: "Target", action: "Action/Spell", detail: "Brief observed outcome", kind: "action" }
+      ],
+      partyUpdates: [
+        {
+          characterName: "PC Name or all",
+          eventType: "spell_cast | damage | heal | set_hp | temp_hp | gain_inspiration | spend_inspiration | add_condition | remove_condition | drop_concentration | short_rest | long_rest",
+          spellName: "",
+          slotLevel: 0,
+          amount: 0,
+          condition: "",
+          isRitual: false
+        }
+      ]
+    });
+
+    const res = await runStructuredAi({
+      store,
+      backend,
+      geminiModel: store.settings.fastModel || "gemini-3.5-flash-lite",
+      systemInstruction: PLAYER_FAIR_SYSTEM_PROMPT,
+      prompt,
+      geminiSchema: schema,
+      groqSchemaHint
+    });
 
     store.state.situation = {
       sceneMode: res.sceneMode || "Exploration",
+      location: String(res.location || store.state.situation?.location || "").trim(),
       headline: res.headline || store.state.situation.headline,
       summaryBullets: Array.isArray(res.summaryBullets) ? res.summaryBullets.slice(0, 4) : [],
       activeObjectives: Array.isArray(res.activeObjectives) ? res.activeObjectives.slice(0, 3) : [],
-      notableNpcs: Array.isArray(res.notableNpcs) ? res.notableNpcs.slice(0, 4) : [],
+      suggestedNextMoves: Array.isArray(res.suggestedNextMoves)
+        ? res.suggestedNextMoves.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 4)
+        : [],
+      notableNpcs: Array.isArray(res.notableNpcs) ? res.notableNpcs.slice(0, 5) : [],
       lastUpdatedAt: Date.now()
     };
 
-    store.recordSessionBeat?.(store.state.situation);
+    store.recordSessionBeat?.(store.state.situation, forceRecordBeat);
 
     if (res.puzzleDetected || (Array.isArray(res.newPuzzleClues) && res.newPuzzleClues.length > 0)) {
       store.state.puzzle.isActive = true;
@@ -832,6 +950,20 @@
           store.state.puzzle.clues.push(c);
         }
       }
+    }
+
+    if (
+      Array.isArray(res.detectedEnemies) ||
+      Array.isArray(res.combatEvents) ||
+      res.sceneMode === "Combat"
+    ) {
+      store.ingestSpokenCombatState?.({
+        inCombat:
+          res.sceneMode === "Combat" ||
+          (Array.isArray(res.detectedEnemies) && res.detectedEnemies.some((e) => !e.isDefeated)),
+        detectedEnemies: res.detectedEnemies || [],
+        combatEvents: res.combatEvents || []
+      });
     }
 
     if (Array.isArray(res.observedEnemyNotes)) {
@@ -855,12 +987,20 @@
   }
 
   async function solvePuzzle(store, extraUserNote = "") {
+    const puzzleQuery = [
+      store.state.puzzle.promptOrInscription || "",
+      ...(store.state.puzzle.clues || []).slice(-4),
+      extraUserNote || ""
+    ]
+      .filter(Boolean)
+      .join(" ");
+    const drivePastCtx = await fetchLocalDriveMemoryContext(store, puzzleQuery);
     const backend = resolveBrainBackend(store);
     if (backend === "local" && global.DnDCopilot?.LocalBrain) {
-      return await global.DnDCopilot.LocalBrain.solvePuzzle(store, extraUserNote);
+      return await global.DnDCopilot.LocalBrain.solvePuzzle(store, extraUserNote, drivePastCtx);
     }
 
-    const ctx = buildCompactSessionContext(store);
+    const ctx = buildCompactSessionContext(store, drivePastCtx);
     const prompt = [
       "Help solve this D&D puzzle, riddle, or mechanism clearly and concisely.",
       `Inscription / Riddle: ${store.state.puzzle.promptOrInscription || "(Check transcript)"}`,
@@ -868,56 +1008,55 @@
       extraUserNote ? `Extra Note: ${extraUserNote}` : "",
       "--- MY SPELLS ---",
       ctx.mySpellsText,
+      ...(ctx.pastSessionsText
+        ? ["--- PAST SESSIONS / DRIVE ARCHIVE ---", ctx.pastSessionsText]
+        : []),
       "--- RECENT CONVERSATION ---",
       ctx.recentTranscript || "None"
-    ].join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
 
-    let res;
-    if (backend === "groq") {
-      res = await callGroqJson({
-        store,
-        userPrompt: prompt,
-        schemaHint: JSON.stringify({
-          title: "Puzzle Title",
-          promptOrInscription: "Riddle text if found",
-          extractedClues: ["Clue 1"],
-          hypotheses: [
-            { solution: "Best Solution", confidence: "High", reasoning: "Short clear reason" }
-          ],
-          nextChecks: ["Ask DM to check X"]
-        })
-      });
-    } else {
-      const schema = {
-        type: "object",
-        properties: {
-          title: { type: "string" },
-          promptOrInscription: { type: "string" },
-          extractedClues: { type: "array", items: { type: "string" } },
-          hypotheses: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                solution: { type: "string" },
-                confidence: { type: "string" },
-                reasoning: { type: "string" }
-              },
-              required: ["solution", "confidence", "reasoning"]
-            }
-          },
-          nextChecks: { type: "array", items: { type: "string" } }
+    const schema = {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        promptOrInscription: { type: "string" },
+        extractedClues: { type: "array", items: { type: "string" } },
+        hypotheses: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              solution: { type: "string" },
+              confidence: { type: "string" },
+              reasoning: { type: "string" }
+            },
+            required: ["solution", "confidence", "reasoning"]
+          }
         },
-        required: ["title", "promptOrInscription", "extractedClues", "hypotheses", "nextChecks"]
-      };
-      res = await callInteractionsApi({
-        store,
-        model: store.settings.advisorModel || "gemini-3.8-flash",
-        systemInstruction: PLAYER_FAIR_SYSTEM_PROMPT,
-        input: prompt,
-        jsonSchema: schema
-      });
-    }
+        nextChecks: { type: "array", items: { type: "string" } }
+      },
+      required: ["title", "promptOrInscription", "extractedClues", "hypotheses", "nextChecks"]
+    };
+
+    const res = await runStructuredAi({
+      store,
+      backend,
+      geminiModel: store.settings.advisorModel || "gemini-3.8-flash",
+      systemInstruction: PLAYER_FAIR_SYSTEM_PROMPT,
+      prompt,
+      geminiSchema: schema,
+      groqSchemaHint: JSON.stringify({
+        title: "Puzzle Title",
+        promptOrInscription: "Riddle text if found",
+        extractedClues: ["Clue 1"],
+        hypotheses: [
+          { solution: "Best Solution", confidence: "High", reasoning: "Short clear reason" }
+        ],
+        nextChecks: ["Ask DM to check X"]
+      })
+    });
 
     store.state.puzzle.isActive = true;
     if (res.title) store.state.puzzle.title = res.title;
@@ -970,68 +1109,67 @@
       .filter(Boolean)
       .join("\n");
 
-    let res;
-    if (backend === "groq") {
-      res = await callGroqJson({
-        store,
-        userPrompt: prompt,
-        schemaHint: JSON.stringify({
-          tacticalOverview: "1-sentence read on the moment and our best angle",
-          concentrationWarning: "",
-          pastSessionConnection: "1-2 sentence tie-in to a past session NPC/clue/quest if relevant right now, otherwise empty string",
-          recommendations: [
-            {
-              rank: 1,
-              spellOrAction: "Action, Spell, Check, or Question to Try",
-              slotInfo: "Category / Slot Cost / Skill (e.g. L2 Slot · Action OR Investigation Check OR Ask DM)",
-              whyBest: "1-2 clear sentences explaining why to try this now"
-            }
-          ],
-          customAnswer: ""
-        })
-      });
-    } else {
-      const schema = {
-        type: "object",
-        properties: {
-          tacticalOverview: { type: "string" },
-          concentrationWarning: { type: "string" },
-          pastSessionConnection: { type: "string" },
-          recommendations: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                rank: { type: "integer" },
-                spellOrAction: { type: "string" },
-                slotInfo: { type: "string" },
-                whyBest: { type: "string" }
-              },
-              required: ["rank", "spellOrAction", "slotInfo", "whyBest"]
-            }
-          },
-          customAnswer: { type: "string" }
+    const schema = {
+      type: "object",
+      properties: {
+        tacticalOverview: { type: "string" },
+        concentrationWarning: { type: "string" },
+        pastSessionConnection: { type: "string" },
+        recommendations: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              rank: { type: "integer" },
+              spellOrAction: { type: "string" },
+              slotInfo: { type: "string" },
+              whyBest: { type: "string" }
+            },
+            required: ["rank", "spellOrAction", "slotInfo", "whyBest"]
+          }
         },
-        required: [
-          "tacticalOverview",
-          "concentrationWarning",
-          "pastSessionConnection",
-          "recommendations",
-          "customAnswer"
-        ]
-      };
-      res = await callInteractionsApi({
-        store,
-        model: store.settings.advisorModel || "gemini-3.8-flash",
-        systemInstruction: PLAYER_FAIR_SYSTEM_PROMPT,
-        input: prompt,
-        jsonSchema: schema
-      });
-    }
+        customAnswer: { type: "string" }
+      },
+      required: [
+        "tacticalOverview",
+        "concentrationWarning",
+        "pastSessionConnection",
+        "recommendations",
+        "customAnswer"
+      ]
+    };
+
+    const res = await runStructuredAi({
+      store,
+      backend,
+      geminiModel: store.settings.advisorModel || "gemini-3.8-flash",
+      systemInstruction: PLAYER_FAIR_SYSTEM_PROMPT,
+      prompt,
+      geminiSchema: schema,
+      groqSchemaHint: JSON.stringify({
+        tacticalOverview: "1-sentence read on the moment and our best angle",
+        concentrationWarning: "Leave EMPTY string unless PC is actively concentrating on a spell",
+        pastSessionConnection: "1-2 sentence tie-in to a past session NPC/clue/quest if relevant right now, otherwise empty string",
+        recommendations: [
+          {
+            rank: 1,
+            spellOrAction: "Action, Spell, Check, or Question to Try",
+            slotInfo: "Category / Slot Cost / Skill (e.g. L2 Slot (2/3 left) · Action OR Investigation Check OR Ask DM)",
+            whyBest: "1-2 clear sentences explaining why to try this now"
+          }
+        ],
+        customAnswer: ""
+      })
+    });
+
+    const isActivelyConcentrating = Boolean(ctx.myChar?.concentratingOn);
+    const rawWarn = String(res.concentrationWarning || "").trim();
+    const safeWarn =
+      !isActivelyConcentrating || /concentration\s+is\s+free/i.test(rawWarn) ? "" : rawWarn;
 
     store.state.advisor = {
       tacticalOverview: res.tacticalOverview || "",
-      concentrationWarning: res.concentrationWarning || "",
+      concentrationWarning: safeWarn,
       pastSessionConnection: res.pastSessionConnection || "",
       recommendations: Array.isArray(res.recommendations) ? res.recommendations.slice(0, 4) : [],
       customAnswer: customQuestion ? res.customAnswer || "" : "",
@@ -1223,38 +1361,235 @@
       .filter(Boolean)
       .join("\n");
 
-    let res;
-    if (backend === "groq") {
-      res = await callGroqJson({
-        store,
-        userPrompt: prompt,
-        schemaHint: JSON.stringify({
-          headline: "Short 1-sentence full-session headline",
-          bullets: ["Chronological bullet 1", "Chronological bullet 2", "Chronological bullet 3", "Chronological bullet 4"]
-        })
-      });
-    } else {
-      const schema = {
-        type: "object",
-        properties: {
-          headline: { type: "string" },
-          bullets: { type: "array", items: { type: "string" } }
-        },
-        required: ["headline", "bullets"]
-      };
-      res = await callInteractionsApi({
-        store,
-        model: store.settings.fastModel || "gemini-3.5-flash-lite",
-        systemInstruction: PLAYER_FAIR_SYSTEM_PROMPT,
-        input: prompt,
-        jsonSchema: schema
-      });
-    }
+    const schema = {
+      type: "object",
+      properties: {
+        headline: { type: "string" },
+        bullets: { type: "array", items: { type: "string" } }
+      },
+      required: ["headline", "bullets"]
+    };
+
+    const res = await runStructuredAi({
+      store,
+      backend,
+      geminiModel: store.settings.fastModel || "gemini-3.5-flash-lite",
+      systemInstruction: PLAYER_FAIR_SYSTEM_PROMPT,
+      prompt,
+      geminiSchema: schema,
+      groqSchemaHint: JSON.stringify({
+        headline: "Short 1-sentence full-session headline",
+        bullets: ["Chronological bullet 1", "Chronological bullet 2", "Chronological bullet 3", "Chronological bullet 4"]
+      })
+    });
 
     return store.setSessionSummary({
       headline: res.headline || store.state.situation?.headline || "Full Session Summary",
       bullets: Array.isArray(res.bullets) ? res.bullets.slice(0, 8) : []
     });
+  }
+
+  function parseTranscriptTextToLines(rawText, defaultSpeaker = "Table") {
+    const clean = String(rawText || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const rawLines = clean.split("\n");
+    const result = [];
+    let currentSpeaker = defaultSpeaker;
+    let buf = [];
+    const baseTs = Date.now() - Math.min(rawLines.length, 3000) * 2000;
+    let lineIdx = 0;
+
+    const flush = () => {
+      const joined = buf.join(" ").replace(/\s+/g, " ").trim();
+      buf = [];
+      if (!joined) return;
+      if (/^(?:===|---|TRANSCRIPT\s+ATTRIBUTION)/i.test(joined)) return;
+      result.push({
+        speaker: currentSpeaker || defaultSpeaker,
+        text: joined,
+        timestamp: baseTs + lineIdx * 2000
+      });
+      lineIdx++;
+    };
+
+    for (const raw of rawLines) {
+      const line = raw.trim();
+      if (!line) {
+        flush();
+        continue;
+      }
+      const standaloneSpeaker = line.match(/^\[([^\]]{1,40})\]$/);
+      if (standaloneSpeaker) {
+        flush();
+        currentSpeaker = standaloneSpeaker[1].trim();
+        continue;
+      }
+      const tsPrefix = line.match(/^\[(?:\d{1,2}:){1,2}\d{2}(?:\s*[AP]M)?\]\s*([^:\n]{1,40}):\s+(.+)$/i);
+      if (tsPrefix) {
+        flush();
+        currentSpeaker = tsPrefix[1].trim();
+        result.push({
+          speaker: currentSpeaker,
+          text: tsPrefix[2].trim(),
+          timestamp: baseTs + lineIdx * 2000
+        });
+        lineIdx++;
+        continue;
+      }
+      const inlineSpeaker = line.match(/^([A-Z][a-zA-Z0-9 _.'()-]{1,28}):\s+(.+)$/);
+      if (inlineSpeaker && !/^(?:Note|Summary|Date|Session|Chapter|http|https)$/i.test(inlineSpeaker[1])) {
+        flush();
+        currentSpeaker = inlineSpeaker[1].trim();
+        result.push({
+          speaker: currentSpeaker,
+          text: inlineSpeaker[2].trim(),
+          timestamp: baseTs + lineIdx * 2000
+        });
+        lineIdx++;
+        continue;
+      }
+      buf.push(line);
+    }
+    flush();
+    return result;
+  }
+
+  function selectSalientActLines(actLines, maxChars = 5500) {
+    if (!Array.isArray(actLines) || actLines.length === 0) return [];
+    const formatted = actLines.map((l, idx) => ({
+      idx,
+      line: l,
+      score: 0
+    }));
+    const SALIENCE_RE =
+      /\b(cast(?:s|ing)?|fireball|hold\s+person|hunter'?s\s+mark|sneak\s+attack|smite|uncanny\s+dodge|damage|heal(?:s|ed)?|hp|hit\s+points?|inspiration|bloodied|unconscious|rage|raging|goblin|duergar|dragon|zorzula|phandalin|stonehill|well|stone|axe|clue|secret|riddle|puzzle|save|saving\s+throw|persuasion|investigation|perception|insight|intimidation|raine|munder|gonloar|bone\s*hawk|lusomorris|keel|patty|scrap|gwen)\b/i;
+
+    for (let i = 0; i < formatted.length; i++) {
+      const txt = String(formatted[i].line.text || "");
+      let sc = txt.length >= 28 ? 1 : 0;
+      const matches = txt.match(new RegExp(SALIENCE_RE.source, "gi"));
+      if (matches) sc += matches.length * 4;
+      if (/\d{1,3}/.test(txt)) sc += 2;
+      if (i < 2 || i >= formatted.length - 6) sc += 3;
+      formatted[i].score = sc;
+    }
+
+    const pickedIdx = new Set();
+    let totalChars = 0;
+    const byScore = [...formatted].sort((a, b) => b.score - a.score || b.idx - a.idx);
+    for (const item of byScore) {
+      const cost = (item.line.speaker?.length || 6) + (item.line.text?.length || 0) + 5;
+      if (totalChars + cost > maxChars && pickedIdx.size >= 8) continue;
+      pickedIdx.add(item.idx);
+      totalChars += cost;
+      if (totalChars >= maxChars) break;
+    }
+
+    return Array.from(pickedIdx)
+      .sort((a, b) => a - b)
+      .map((i) => formatted[i].line);
+  }
+
+  async function fastPlayTranscript(store, rawText, options = {}) {
+    const title = String(options?.title || "Transcript Replay").trim();
+    const targetActs = Math.max(1, Math.min(8, Number(options?.acts) || 5));
+    const resetFirst = options?.resetFirst !== false;
+    const onProgress = typeof options?.onProgress === "function" ? options.onProgress : () => {};
+    const shouldCancel = typeof options?.shouldCancel === "function" ? options.shouldCancel : () => false;
+
+    const parsedLines = parseTranscriptTextToLines(rawText);
+    if (parsedLines.length === 0) {
+      throw new Error("No dialogue lines found in transcript to fast-play.");
+    }
+
+    if (resetFirst) {
+      store.resetSession();
+      store.state.sessionTitle = title;
+    }
+
+    const numActs = Math.min(targetActs, Math.max(1, Math.ceil(parsedLines.length / 25)));
+    const chunkSize = Math.ceil(parsedLines.length / numActs);
+    let actsProcessed = 0;
+
+    for (let a = 0; a < numActs; a++) {
+      if (shouldCancel()) break;
+      const slice = parsedLines.slice(a * chunkSize, (a + 1) * chunkSize);
+      if (slice.length === 0) continue;
+
+      const actItems = slice.map((item, j) => ({
+        id: `tr-fp-${Date.now()}-${a}-${j}-${Math.random().toString(36).slice(2, 5)}`,
+        timestamp: item.timestamp,
+        speaker: item.speaker || "Table",
+        text: item.text,
+        pinnedAsClue: false
+      }));
+      store.state.transcript.push(...actItems);
+      if (store.state.transcript.length > 20000) {
+        store.state.transcript = store.state.transcript.slice(-20000);
+      }
+      store.save();
+
+      const salient = selectSalientActLines(actItems, 5500);
+      const actLabel = `Act ${a + 1}/${numActs} (${title})`;
+      let res = null;
+      try {
+        res = await analyzeTableSituation(store, {
+          overrideLines: salient,
+          forceRecordBeat: true,
+          actLabel
+        });
+      } catch (_) {
+        if (global.DnDCopilot?.LocalBrain) {
+          res = await global.DnDCopilot.LocalBrain.analyzeTableSituation(store, {
+            overrideLines: salient,
+            forceRecordBeat: true
+          });
+        }
+      }
+      actsProcessed++;
+      onProgress({
+        phase: "act",
+        act: a + 1,
+        totalActs: numActs,
+        headline: store.state.situation?.headline || "",
+        updatesCount: res?._appliedPartyUpdates?.length || 0
+      });
+
+      if (a < numActs - 1 && !shouldCancel()) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+
+    if (!shouldCancel()) {
+      onProgress({ phase: "advisor", act: actsProcessed, totalActs: numActs, headline: "Updating Live Ideas..." });
+      try {
+        await adviseTacticsAndSpells(store, "");
+      } catch (_) {
+        await global.DnDCopilot?.LocalBrain?.adviseTacticsAndSpells?.(store, "");
+      }
+
+      if (store.state.puzzle?.isActive || (store.state.puzzle?.clues || []).length > 0) {
+        onProgress({ phase: "puzzle", act: actsProcessed, totalActs: numActs, headline: "Analyzing Clues & Puzzles..." });
+        try {
+          await solvePuzzle(store, "");
+        } catch (_) {
+          await global.DnDCopilot?.LocalBrain?.solvePuzzle?.(store, "");
+        }
+      }
+
+      onProgress({ phase: "summary", act: actsProcessed, totalActs: numActs, headline: "Building Session Story..." });
+      try {
+        await summarizeFullSession(store);
+      } catch (_) {
+        await global.DnDCopilot?.LocalBrain?.summarizeFullSession?.(store);
+      }
+    }
+
+    return {
+      title,
+      totalLines: parsedLines.length,
+      actsProcessed,
+      headline: store.state.situation?.headline || ""
+    };
   }
 
   global.DnDCopilot = global.DnDCopilot || {};
@@ -1267,6 +1602,9 @@
     adviseTacticsAndSpells,
     summarizePastSession,
     analyzeTabScreenshot,
-    summarizeFullSession
+    summarizeFullSession,
+    parseTranscriptTextToLines,
+    selectSalientActLines,
+    fastPlayTranscript
   };
 })(window);

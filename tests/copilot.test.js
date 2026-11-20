@@ -82,6 +82,11 @@ test("Manifest V3 and index.html pass strict Chrome Extension CSP rules", () => 
     assert.match(tag, /\bsrc=/i, `Found disallowed inline script tag: ${tag}`);
   }
   assert.doesNotMatch(html, /\bon\w+\s*=/i, "index.html must not contain inline on* event attributes");
+  assert.match(html, /id="colSplitter1"/);
+  assert.match(html, /id="colSplitter2"/);
+  assert.match(html, /id="driveMysteriesSection"/);
+  assert.match(html, /id="combatEventsList"/);
+  assert.match(html, /id="fastPlayModal"/);
 });
 
 test("D&D Beyond v5 parser computes HP, AC, Spell Slots, Pact Magic, and Prepared Spells accurately", () => {
@@ -1622,4 +1627,201 @@ test("GeminiClient applies AI partyUpdates and merges localhost Google Drive arc
 
   await gemini.adviseTacticsAndSpells(store, "What do we know about Zorzula?");
   assert.match(capturedAdvisorPrompt, /Zorzula's Rest/);
+});
+
+test("LocalBrain hides Concentration is FREE, Store ingests spoken combat, and Fast Play replays multi-act transcripts with proxy & fallback", async () => {
+  const sb = createBrowserSandbox();
+  sb.location.hostname = "localhost";
+  sb.location.protocol = "http:";
+  sb.location.href = "http://localhost:8765/index.html";
+  const store = sb.DnDCopilot.Store;
+  const localBrain = sb.DnDCopilot.LocalBrain;
+  const gemini = sb.DnDCopilot.GeminiClient;
+
+  store.resetSession();
+  store.upsertCharacter(
+    {
+      id: "141442264",
+      name: "Raine",
+      classSummary: "Wizard 6",
+      level: 6,
+      hp: { current: 48, max: 48, temp: 0 },
+      ac: 13,
+      concentratingOn: "",
+      spellSlots: [{ level: 3, max: 3, used: 0, remaining: 3, isPact: false }],
+      spells: [
+        {
+          name: "Fireball",
+          level: 3,
+          concentration: false,
+          castingTime: "Action",
+          range: "150 ft",
+          summary: "20-ft radius fire explosion"
+        },
+        {
+          name: "Hold Person",
+          level: 2,
+          concentration: true,
+          castingTime: "Action",
+          range: "60 ft",
+          summary: "Paralyze humanoid"
+        }
+      ]
+    },
+    { manualAdd: true }
+  );
+
+  // 1. No misleading "Concentration is FREE" when not concentrating; warns only when concentrating
+  store.updateSettings({ aiProvider: "local-free" });
+  const advFree = await localBrain.adviseTacticsAndSpells(store, "");
+  assert.equal(advFree.concentrationWarning, "");
+
+  store.setCharacterConcentration("141442264", "Hold Person");
+  const advBusy = await localBrain.adviseTacticsAndSpells(store, "");
+  assert.match(advBusy.concentrationWarning, /Hold Person/);
+  store.setCharacterConcentration("141442264", "");
+
+  // 2. Spoken combat ingestion creates/merges enemies & dedupes combat action feed
+  store.ingestSpokenCombatState({
+    inCombat: true,
+    round: 2,
+    detectedEnemies: [
+      { name: "Psychic Goblin", damageDealt: 18, isBloodied: true, trait: "Psychic Burst", missRoll: 14, hitRoll: 17 }
+    ],
+    combatEvents: [
+      { actor: "Raine", target: "Psychic Goblin", action: "Fireball", detail: "Dealt 18 fire damage", kind: "damage" },
+      { actor: "Raine", target: "Psychic Goblin", action: "Fireball", detail: "Dealt 18 fire damage", kind: "damage" }
+    ]
+  });
+  assert.equal(store.state.combat.enemies.length, 1);
+  assert.equal(store.state.combat.enemies[0].damageTaken, 18);
+  assert.equal(store.state.combat.enemies[0].highestMissRoll, 14);
+  assert.equal(store.state.combat.enemies[0].lowestHitRoll, 17);
+  assert.equal(store.state.combat.combatEvents.length, 1);
+
+  // 3. Localhost proxy routing + Gemini -> Groq fallback + Fast Play multi-act replay
+  const proxyUrls = [];
+  store.updateSettings({
+    aiProvider: "gemini",
+    geminiApiKey: "AIza_test_proxy",
+    groqApiKey: "gsk_fallback_key"
+  });
+  sb.fetch = async (url, opts) => {
+    proxyUrls.push(String(url));
+    if (String(url).includes("/api/campaign-memory/search")) {
+      return { ok: true, json: async () => ({ contextText: "" }) };
+    }
+    if (String(url).includes("/api/proxy/gemini-interactions")) {
+      return { ok: false, status: 503, json: async () => ({ error: { message: "Overloaded" } }) };
+    }
+    assert.match(String(url), /\/api\/proxy\/groq-chat/);
+    const body = JSON.parse(opts.body);
+    const sys = body.messages[0].content;
+    if (sys.includes("partyUpdates")) {
+      return {
+        ok: true,
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  sceneMode: "Combat",
+                  location: "Goblin Camp",
+                  headline: "B.U.G.S. ambush psychic goblins in the clearing",
+                  summaryBullets: ["Raine scorched the goblins cleanly."],
+                  activeObjectives: ["Subdue Scrap for answers"],
+                  suggestedNextMoves: ["Ask the DM for an Arcana check on the green glow"],
+                  notableNpcs: ["Scrap"],
+                  puzzleDetected: true,
+                  puzzleTitle: "Green Glow Black Stones",
+                  puzzleInscription: "",
+                  newPuzzleClues: ["Black stones glow with green psychic energy"],
+                  observedEnemyNotes: [],
+                  detectedEnemies: [
+                    { name: "Psychic Goblin", damageDealt: 28, isBloodied: true, isDefeated: false, trait: "Green Eye Glow" }
+                  ],
+                  combatEvents: [
+                    { actor: "Raine", target: "Psychic Goblin", action: "Fireball", detail: "Sculpted around allies", kind: "damage" }
+                  ],
+                  partyUpdates: [{ characterName: "Raine", eventType: "spell_cast", spellName: "Fireball", slotLevel: 3 }]
+                })
+              }
+            }
+          ]
+        })
+      };
+    }
+    if (sys.includes("hypotheses")) {
+      return {
+        ok: true,
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  title: "Green Glow Black Stones",
+                  promptOrInscription: "",
+                  extractedClues: [],
+                  hypotheses: [{ solution: "Duergar psionic resonance", confidence: "High", reasoning: "Matches underdark axes" }],
+                  nextChecks: ["Ask DM for Arcana check on stones"]
+                })
+              }
+            }
+          ]
+        })
+      };
+    }
+    if (sys.includes("recommendations")) {
+      return {
+        ok: true,
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  tacticalOverview: "Goblins broken; press Scrap for info.",
+                  concentrationWarning: "",
+                  pastSessionConnection: "",
+                  recommendations: [
+                    { rank: 1, spellOrAction: "Detect Thoughts or Insight", slotInfo: "L2 or Skill", whyBest: "Verify Scrap isn't bluffing." }
+                  ],
+                  customAnswer: ""
+                })
+              }
+            }
+          ]
+        })
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                headline: "Ambush & Interrogation of Scrap",
+                bullets: ["Party tracked goblins from Phandalin", "Defeated psychic ambushers and questioned Scrap"]
+              })
+            }
+          }
+        ]
+      })
+    };
+  };
+
+  const sampleRaw = [
+    "[Speaker 1]\nWe follow the tracks from Phandalin into the clearing.",
+    "[Speaker 2]\nRaine casts Fireball at the goblin camp!",
+    "[Speaker 3]\nScrap surrenders and mentions Zorzula's Rest and the black stone."
+  ].join("\n\n");
+  const fpRes = await gemini.fastPlayTranscript(store, sampleRaw, { title: "BUGS 69 Test", acts: 2 });
+  assert.equal(fpRes.actsProcessed, 1);
+  assert.ok(proxyUrls.some((u) => u.includes("/api/proxy/gemini-interactions")));
+  assert.ok(proxyUrls.some((u) => u.includes("/api/proxy/groq-chat")));
+  assert.equal(store.state.situation.location, "Goblin Camp");
+  assert.ok(store.state.situation.suggestedNextMoves.length >= 1);
+  assert.equal(store.state.party[0].spellSlots[0].remaining, 2);
+  assert.equal(store.state.combat.enemies[0].damageTaken, 28);
+  assert.equal(store.state.advisor.concentrationWarning, "");
 });

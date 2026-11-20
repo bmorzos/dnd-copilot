@@ -115,6 +115,7 @@
       },
       situation: {
         sceneMode: "Exploration", // "Exploration" | "Social" | "Puzzle" | "Combat"
+        location: "",
         headline: "Waiting for table conversation or AboveVTT activity...",
         summaryBullets: [
           "Click 'Start Listening' to capture live table conversation.",
@@ -122,6 +123,7 @@
           "Or click 'Load Demo' in the top bar to test every panel right now."
         ],
         activeObjectives: [],
+        suggestedNextMoves: [],
         notableNpcs: [],
         lastUpdatedAt: null
       },
@@ -145,7 +147,8 @@
         round: 1,
         activeTargetTokenId: null,
         enemies: [], // Player-fair enemy records: { tokenId, name, damageTaken, isBloodied, visibleHealthPercent, minAcMiss, maxAcHit, conditions, observedTraits, isDefeated, isCurrentTurn, initiative }
-        initiativeOrder: []
+        initiativeOrder: [],
+        combatEvents: []
       },
       gameLog: [],
       party: [],
@@ -969,7 +972,13 @@
             ...fresh,
             ...parsed,
             bridgeStatus: { ...fresh.bridgeStatus, ...(parsed.bridgeStatus || {}) },
-            situation: { ...fresh.situation, ...(parsed.situation || {}) },
+            situation: {
+              ...fresh.situation,
+              ...(parsed.situation || {}),
+              suggestedNextMoves: Array.isArray(parsed.situation?.suggestedNextMoves)
+                ? parsed.situation.suggestedNextMoves
+                : []
+            },
             sessionBeats: Array.isArray(parsed.sessionBeats) ? parsed.sessionBeats : [],
             sessionSummary:
               parsed.sessionSummary && typeof parsed.sessionSummary === "object"
@@ -984,7 +993,13 @@
                 ? parsed.lastAutoSheetBatch
                 : null,
             puzzle: { ...fresh.puzzle, ...(parsed.puzzle || {}) },
-            combat: { ...fresh.combat, ...(parsed.combat || {}) },
+            combat: {
+              ...fresh.combat,
+              ...(parsed.combat || {}),
+              combatEvents: Array.isArray(parsed.combat?.combatEvents)
+                ? parsed.combat.combatEvents
+                : []
+            },
             advisor: { ...fresh.advisor, ...(parsed.advisor || {}) },
             usage: { ...fresh.usage, ...(parsed.usage || {}) }
           };
@@ -1126,7 +1141,7 @@
       return terms;
     }
 
-    recordSessionBeat(situation) {
+    recordSessionBeat(situation, forceRecord = false) {
       const sit = situation || this.state.situation;
       const headline = String(sit?.headline || "").trim();
       if (
@@ -1154,6 +1169,7 @@
 
       const elapsed = last ? now - (last.timestamp || 0) : Infinity;
       const shouldAppend =
+        Boolean(forceRecord) ||
         !last ||
         last.sceneMode !== sceneMode ||
         elapsed >= 10 * 60 * 1000 ||
@@ -1164,6 +1180,7 @@
       this.state.sessionBeats.push({
         timestamp: now,
         sceneMode,
+        location: String(sit?.location || "").trim(),
         headline,
         summary
       });
@@ -1331,7 +1348,13 @@
           ...fresh,
           ...incomingState,
           bridgeStatus: { ...fresh.bridgeStatus, ...(incomingState.bridgeStatus || {}) },
-          situation: { ...fresh.situation, ...(incomingState.situation || {}) },
+          situation: {
+            ...fresh.situation,
+            ...(incomingState.situation || {}),
+            suggestedNextMoves: Array.isArray(incomingState.situation?.suggestedNextMoves)
+              ? incomingState.situation.suggestedNextMoves
+              : []
+          },
           sessionBeats: Array.isArray(incomingState.sessionBeats) ? incomingState.sessionBeats : [],
           sessionSummary:
             incomingState.sessionSummary && typeof incomingState.sessionSummary === "object"
@@ -1346,7 +1369,13 @@
               ? incomingState.lastAutoSheetBatch
               : null,
           puzzle: { ...fresh.puzzle, ...(incomingState.puzzle || {}) },
-          combat: { ...fresh.combat, ...(incomingState.combat || {}) },
+          combat: {
+            ...fresh.combat,
+            ...(incomingState.combat || {}),
+            combatEvents: Array.isArray(incomingState.combat?.combatEvents)
+              ? incomingState.combat.combatEvents
+              : []
+          },
           advisor: { ...fresh.advisor, ...(incomingState.advisor || {}) }
         };
       }
@@ -2252,6 +2281,147 @@
       if (!enemy) return;
       enemy[field] = !enemy[field];
       this.save();
+    }
+
+    ingestSpokenCombatState(payload = {}) {
+      if (!payload || typeof payload !== "object") return false;
+      let changed = false;
+
+      if (typeof payload.inCombat === "boolean") {
+        if (this.state.combat.inCombat !== payload.inCombat) {
+          this.state.combat.inCombat = payload.inCombat;
+          changed = true;
+        }
+      }
+      const roundNum = Number(payload.round);
+      if (Number.isFinite(roundNum) && roundNum > 0 && Math.round(roundNum) !== this.state.combat.round) {
+        this.state.combat.round = Math.round(roundNum);
+        changed = true;
+      }
+
+      const detectedEnemies = Array.isArray(payload.detectedEnemies) ? payload.detectedEnemies : [];
+      for (const rawEnemy of detectedEnemies) {
+        const cleanName = String(rawEnemy?.name || "").trim();
+        if (!cleanName || cleanName.length < 2) continue;
+        const lowName = cleanName.toLowerCase();
+
+        let enemy = this.state.combat.enemies.find((e) => {
+          const enLow = String(e.name || "").trim().toLowerCase();
+          return (
+            enLow === lowName ||
+            (lowName.length >= 4 && enLow.includes(lowName)) ||
+            (enLow.length >= 4 && lowName.includes(enLow))
+          );
+        });
+
+        if (!enemy) {
+          const tokenId = `spoken-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
+          enemy = {
+            tokenId,
+            name: cleanName,
+            isNameRevealed: true,
+            damageTaken: 0,
+            isBloodied: false,
+            visibleHealthPercent: null,
+            highestMissRoll: null,
+            lowestHitRoll: null,
+            conditions: [],
+            observedTraits: [],
+            isDefeated: false,
+            isCurrentTurn: false,
+            initiative: null
+          };
+          this.state.combat.enemies.push(enemy);
+          if (!this.state.combat.activeTargetTokenId) {
+            this.state.combat.activeTargetTokenId = tokenId;
+          }
+          if (!enemy.isDefeated) {
+            this.state.combat.inCombat = true;
+          }
+          changed = true;
+        }
+
+        const dmg = Number(rawEnemy?.damageDealt || 0);
+        if (Number.isFinite(dmg) && dmg > 0) {
+          enemy.damageTaken = (enemy.damageTaken || 0) + Math.round(dmg);
+          changed = true;
+        }
+        if (rawEnemy?.isBloodied && !enemy.isBloodied) {
+          enemy.isBloodied = true;
+          changed = true;
+        }
+        if (rawEnemy?.isDefeated && !enemy.isDefeated) {
+          enemy.isDefeated = true;
+          changed = true;
+        }
+        const rawTraits = [
+          ...(rawEnemy?.trait ? [rawEnemy.trait] : []),
+          ...(Array.isArray(rawEnemy?.observedTraits) ? rawEnemy.observedTraits : [])
+        ];
+        for (const tr of rawTraits) {
+          const cleanTrait = String(tr || "").trim();
+          if (cleanTrait && !enemy.observedTraits.includes(cleanTrait)) {
+            enemy.observedTraits.push(cleanTrait);
+            changed = true;
+          }
+        }
+        const missRoll = Number(rawEnemy?.missRoll);
+        if (Number.isFinite(missRoll) && missRoll > 1) {
+          if (enemy.highestMissRoll === null || missRoll > enemy.highestMissRoll) {
+            enemy.highestMissRoll = Math.round(missRoll);
+            changed = true;
+          }
+        }
+        const hitRoll = Number(rawEnemy?.hitRoll);
+        if (Number.isFinite(hitRoll) && hitRoll > 1) {
+          if (enemy.lowestHitRoll === null || hitRoll < enemy.lowestHitRoll) {
+            enemy.lowestHitRoll = Math.round(hitRoll);
+            changed = true;
+          }
+        }
+      }
+
+      if (!Array.isArray(this.state.combat.combatEvents)) {
+        this.state.combat.combatEvents = [];
+      }
+      const events = Array.isArray(payload.combatEvents) ? payload.combatEvents : [];
+      if (events.length > 0) {
+        const recentKeys = new Set(
+          this.state.combat.combatEvents
+            .slice(-12)
+            .map((ev) => `${ev.actor}|${ev.action}|${ev.detail}`.toLowerCase())
+        );
+        for (const rawEv of events) {
+          const actor = String(rawEv?.actor || "Table").trim();
+          const target = String(rawEv?.target || "").trim();
+          const action = String(rawEv?.action || "").trim();
+          const detail = String(rawEv?.detail || "").trim();
+          const kind = String(rawEv?.kind || "action").trim();
+          if (!action && !detail) continue;
+          const key = `${actor}|${action}|${detail}`.toLowerCase();
+          if (recentKeys.has(key)) continue;
+          recentKeys.add(key);
+          this.state.combat.combatEvents.push({
+            id: `cev-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+            timestamp: Date.now(),
+            round: this.state.combat.round || 1,
+            actor,
+            target,
+            action,
+            detail,
+            kind
+          });
+          changed = true;
+        }
+        if (this.state.combat.combatEvents.length > 30) {
+          this.state.combat.combatEvents = this.state.combat.combatEvents.slice(-30);
+        }
+      }
+
+      if (changed) {
+        this.save();
+      }
+      return changed;
     }
 
     syncAboveVttSnapshot(snapshot, modeLabel) {

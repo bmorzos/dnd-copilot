@@ -33,6 +33,10 @@
       </button>
       <input id="audioFileInput" type="file" accept="audio/*,video/*" class="hidden" />
 
+      <button id="btnOpenFastPlay" class="btn btn-quiet" title="Fast-play a past Drive or uploaded transcript across all panels">
+        ⏩ Fast Play
+      </button>
+
       <!-- 1-CLICK CHROME <-> GROQ <-> DEEPGRAM SWITCH -->
       <div class="engine-switch" role="group" aria-label="Speech Engine">
         <button id="btnEngineChrome" class="engine-opt active" type="button">Chrome</button>
@@ -77,7 +81,7 @@
   <div id="toastBanner" class="toast hidden" role="status" aria-live="polite"></div>
 
   <!-- SIMPLE, SPACIOUS 3-COLUMN LAYOUT -->
-  <main class="main-grid">
+  <main id="mainGrid" class="main-grid">
     <!-- COLUMN 1: WHAT'S GOING ON (LARGE & EASY TO READ) + MINIMIZED TRANSCRIPT -->
     <section class="panel col-whats-going-on">
       <div class="panel-header">
@@ -89,11 +93,18 @@
       </div>
 
       <div class="whats-going-on-body">
+        <div id="situationLocation" class="scene-location hidden"></div>
         <p id="situationHeadline" class="big-headline">
           Ready to listen to your game.
         </p>
         <ul id="situationBullets" class="big-bullets"></ul>
         <div id="situationObjectives" class="objectives-box hidden"></div>
+        <div id="situationNextMoves" class="next-moves-box hidden"></div>
+        <div id="situationNpcs" class="npc-chips-box hidden"></div>
+        <details id="sessionTimelineDrawer" class="timeline-drawer hidden">
+          <summary>📜 Session Story So Far (<span id="beatCount">0</span>)</summary>
+          <div id="sessionTimelineList" class="timeline-list"></div>
+        </details>
       </div>
 
       <div id="interimSpeechBanner" class="live-hearing hidden"></div>
@@ -122,6 +133,8 @@
         </div>
       </details>
     </section>
+
+    <div id="colSplitter1" class="col-splitter" role="separator" aria-orientation="vertical" title="Drag to resize columns (double-click to reset)"></div>
 
     <!-- COLUMN 2: ONE FOCUS AT A TIME (LIVE IDEAS | PUZZLE | COMBAT) -->
     <section class="panel col-focus">
@@ -185,6 +198,19 @@
         <div id="puzzleCluesList" class="clues-box"></div>
         <div id="puzzleHypothesesList" class="stack-list"></div>
         <div id="puzzleNextChecks" class="checks-box"></div>
+
+        <div id="driveMysteriesSection" class="mysteries-section">
+          <div class="sub-bar" style="flex-wrap:wrap;">
+            <span class="muted-label">📜 Open Mysteries &amp; Past Puzzles (<span id="mysteryCount">0</span>)</span>
+            <div class="mystery-filter-row">
+              <button type="button" class="btn btn-quiet active" data-mystery-filter="all" style="padding:4px 9px;font-size:13px;">All</button>
+              <button type="button" class="btn btn-quiet" data-mystery-filter="mystery" style="padding:4px 9px;font-size:13px;">Open Mysteries</button>
+              <button type="button" class="btn btn-quiet" data-mystery-filter="puzzle" style="padding:4px 9px;font-size:13px;">Past Puzzles</button>
+              <button id="btnRefreshMysteries" type="button" class="btn btn-quiet" style="padding:4px 9px;font-size:13px;" title="Refresh mysteries from synced Drive archive">↻</button>
+            </div>
+          </div>
+          <div id="driveMysteriesList" class="stack-list"></div>
+        </div>
       </div>
 
       <!-- TAB 3: PLAYER-FAIR COMBAT & ROLLS -->
@@ -194,6 +220,8 @@
           <button id="btnSyncAboveVttNow" class="btn btn-quiet">↻ Sync VTT</button>
         </div>
 
+        <div id="myCombatStatsBar" class="combat-stats-strip hidden"></div>
+        <div id="combatPartyTriage" class="combat-triage-box hidden"></div>
         <div id="initiativeStrip" class="init-strip hidden"></div>
 
         <form id="addEnemyForm" class="simple-row">
@@ -203,10 +231,15 @@
 
         <div id="enemyList" class="stack-list"></div>
 
-        <h3 class="section-heading">Recent Rolls</h3>
+        <h3 class="section-heading">⚔️ Combat Action Feed</h3>
+        <div id="combatEventsList" class="rolls-list"></div>
+
+        <h3 class="section-heading">Recent Rolls (AboveVTT)</h3>
         <div id="gameLogList" class="rolls-list"></div>
       </div>
     </section>
+
+    <div id="colSplitter2" class="col-splitter" role="separator" aria-orientation="vertical" title="Drag to resize columns (double-click to reset)"></div>
 
     <!-- COLUMN 3: PARTY HEALTH & SPELL SLOTS (SAVED IN EXTENSION AS B.U.G.S.) -->
     <section class="panel col-party">
@@ -529,6 +562,64 @@
             <button id="btnResetSession" class="btn btn-danger" type="button">New Session</button>
           </div>
           <button id="btnSaveSettings" class="btn btn-primary" type="button">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 4: TRANSCRIPT FAST PLAY / REPLAY -->
+  <div id="fastPlayModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>⏩ Fast Play Transcript</h2>
+        <button class="btn-close" data-close-modal="fastPlayModal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="info-block">
+          <strong>☁️ Replay Episode from Google Drive</strong>
+          <p class="muted-p">
+            Steps chronologically through the transcript in 5 acts, updating <strong>What's Going On</strong>, <strong>Party Sheets</strong> (damage, spell slots, conditions), <strong>Combat</strong>, <strong>Puzzle</strong>, and <strong>Live Ideas</strong>.
+          </p>
+          <div class="simple-row" style="margin-top:8px;flex-wrap:wrap;">
+            <select id="fastPlayDriveSelect" class="select" style="flex:1;min-width:220px;">
+              <option value="">Loading Drive transcripts...</option>
+            </select>
+            <button id="btnFastPlayDrive" type="button" class="btn btn-primary">
+              ⏩ Fast Play Selected Episode
+            </button>
+          </div>
+        </div>
+
+        <div class="info-block">
+          <strong>📂 Or Upload / Paste Any Transcript (.txt, .md)</strong>
+          <div class="simple-row" style="margin-top:8px;">
+            <button id="btnUploadFastPlayFile" type="button" class="btn btn-action">
+              📂 Choose Transcript File &amp; Fast Play
+            </button>
+            <input id="fastPlayFileInput" type="file" accept=".txt,.md,.markdown,.log" class="hidden" />
+          </div>
+          <textarea
+            id="fastPlayPasteInput"
+            class="textarea"
+            rows="4"
+            style="margin-top:10px;"
+            placeholder="Or paste raw transcript text here ([Speaker 1] ... or Raine: ...)"
+          ></textarea>
+          <button id="btnFastPlayPaste" type="button" class="btn btn-quiet" style="margin-top:8px;">
+            ⏩ Fast Play Pasted Text
+          </button>
+        </div>
+
+        <div id="fastPlayProgressBox" class="info-block hidden">
+          <div class="simple-row" style="justify-content:space-between;">
+            <strong id="fastPlayProgressText">Preparing replay...</strong>
+            <button id="btnCancelFastPlay" type="button" class="btn btn-danger" style="padding:4px 10px;font-size:13px;">
+              Cancel
+            </button>
+          </div>
+          <div class="hp-bar" style="margin-top:10px;height:14px;">
+            <div id="fastPlayProgressFill" class="hp-fill" style="width:0%;background:var(--gold);"></div>
+          </div>
         </div>
       </div>
     </div>

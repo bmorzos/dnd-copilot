@@ -34,6 +34,14 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 _OAUTH_LOCK = threading.Lock()
 _PENDING_OAUTH: dict[str, dict] = {}
+_SYNC_LOCK = threading.Lock()
+_AUTO_SYNC_STATE = {
+    "enabled": True,
+    "intervalMinutes": 10,
+    "lastCheckAt": None,
+    "lastNewCount": 0,
+    "lastError": "",
+}
 
 _SESSION_NUM_RE = re.compile(r"\b(?:BUGS|Session)\s+(\d+)\b", re.IGNORECASE)
 _STOPWORDS = {
@@ -382,6 +390,15 @@ def sync_from_drive_api(
     backstories_doc_id: str = "",
 ) -> dict:
     """Incrementally syncs transcripts, master summaries, and backstories using OAuth Drive v3 REST API."""
+    with _SYNC_LOCK:
+        return _sync_from_drive_api_locked(folder_id, summaries_doc_id, backstories_doc_id)
+
+
+def _sync_from_drive_api_locked(
+    folder_id: str = "",
+    summaries_doc_id: str = "",
+    backstories_doc_id: str = "",
+) -> dict:
     cfg = save_drive_config(folder_id, summaries_doc_id, backstories_doc_id)
     fid = cfg["folderId"]
     sid = cfg["summariesDocId"]
@@ -529,6 +546,15 @@ def sync_from_gdrive_cli(
     backstories_doc_id: str = "",
 ) -> dict:
     """Incrementally syncs transcripts, summaries, and backstories using the installed gdrive plugin CLI."""
+    with _SYNC_LOCK:
+        return _sync_from_gdrive_cli_locked(folder_id, summaries_doc_id, backstories_doc_id)
+
+
+def _sync_from_gdrive_cli_locked(
+    folder_id: str = "",
+    summaries_doc_id: str = "",
+    backstories_doc_id: str = "",
+) -> dict:
     cli = _find_gdrive_cli()
     if not cli:
         raise RuntimeError("gdrive CLI is not installed on PATH.")
@@ -694,6 +720,187 @@ def get_status() -> dict:
         "hasBackstories": BACKSTORIES_TXT_FILE.exists() and BACKSTORIES_TXT_FILE.stat().st_size > 20,
         "lastSyncedAt": idx.get("lastSyncedAt") or None,
         "lastSyncSource": idx.get("lastSyncSource") or "",
+        "autoSyncEnabled": bool(_AUTO_SYNC_STATE["enabled"]),
+        "autoSyncIntervalMinutes": int(_AUTO_SYNC_STATE["intervalMinutes"]),
+        "lastAutoCheckAt": _AUTO_SYNC_STATE["lastCheckAt"],
+        "lastAutoNewCount": _AUTO_SYNC_STATE["lastNewCount"],
+    }
+
+
+def auto_sync_if_due(min_age_seconds: int = 600) -> dict:
+    """Runs an incremental Google Drive sync in the background when due."""
+    st = get_status()
+    fid = st.get("folderId")
+    if not fid or (not st.get("connected") and not st.get("cliAvailable")):
+        return st
+    last_ts = st.get("lastSyncedAt") or 0
+    if last_ts and ((time.time() * 1000) - last_ts) < (min_age_seconds * 1000):
+        return st
+    before_count = int(st.get("cachedTranscriptCount") or 0)
+    try:
+        updated = (
+            sync_from_drive_api(fid, st.get("summariesDocId", ""), st.get("backstoriesDocId", ""))
+            if st.get("connected")
+            else sync_from_gdrive_cli(fid, st.get("summariesDocId", ""), st.get("backstoriesDocId", ""))
+        )
+        idx = _read_json(INDEX_FILE, {})
+        dl = int(idx.get("downloadedCount") or 0)
+        delta = max(0, int(updated.get("cachedTranscriptCount") or 0) - before_count, dl)
+        _AUTO_SYNC_STATE["lastCheckAt"] = int(time.time() * 1000)
+        _AUTO_SYNC_STATE["lastNewCount"] = delta
+        _AUTO_SYNC_STATE["lastError"] = ""
+        return get_status()
+    except Exception as exc:
+        _AUTO_SYNC_STATE["lastCheckAt"] = int(time.time() * 1000)
+        _AUTO_SYNC_STATE["lastError"] = str(exc)[:200]
+        return st
+
+
+_OPEN_MYSTERY_RE = re.compile(
+    r"\b(secret|mystery|cliffhanger|unresolved|investigat|graffiti|stone|well|boss|unseen\s+peril|missing|hidden|plot|quest|clue|door|path|goblin|axe|where|who)\b",
+    re.IGNORECASE,
+)
+_PAST_PUZZLE_RE = re.compile(
+    r"\b(puzzle|riddle|inscription|cipher|rune|glyph|orb|door|locked|mechanism|statue|lever|altar|mirror|portal|maze|trap|secret|clue|prophecy|stone)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_campaign_mysteries(max_open: int = 8, max_puzzles: int = 16) -> dict:
+    """Extracts open campaign mysteries and past puzzles/riddles from synced summaries and transcripts."""
+    summaries = parse_master_summaries_md(
+        SUMMARIES_MD_FILE.read_text(encoding="utf-8") if SUMMARIES_MD_FILE.exists() else ""
+    )
+    idx = _read_json(INDEX_FILE, {})
+    files_map = idx.get("files") if isinstance(idx.get("files"), dict) else {}
+
+    open_mysteries = []
+    past_puzzles = []
+    seen_excerpts = set()
+
+    for s in summaries[:6]:
+        sents = [seg.strip() for seg in re.split(r"(?<=[.!?])\s+", s["summary"]) if len(seg.strip()) >= 24]
+        if not sents:
+            continue
+        candidate = None
+        # Prefer closing cliffhanger/unresolved sentence
+        for cand in reversed(sents):
+            if _OPEN_MYSTERY_RE.search(cand):
+                candidate = cand
+                break
+        if not candidate:
+            candidate = sents[-1]
+        norm = candidate.lower()[:120]
+        if norm not in seen_excerpts:
+            seen_excerpts.add(norm)
+            open_mysteries.append({
+                "id": f"open-{s['id']}",
+                "title": s["title"],
+                "sessionNumber": s["sessionNumber"],
+                "dateLabel": s["dateLabel"],
+                "category": "mystery",
+                "excerpt": candidate[:320] + ("..." if len(candidate) > 320 else ""),
+            })
+        if len(open_mysteries) >= max_open:
+            break
+
+    for s in summaries:
+        sents = [seg.strip() for seg in re.split(r"(?<=[.!?])\s+", s["summary"]) if len(seg.strip()) >= 24]
+        matches = [seg for seg in sents if _PAST_PUZZLE_RE.search(seg)]
+        if not matches:
+            continue
+        excerpt = " ".join(matches[:2]).strip()
+        norm = excerpt.lower()[:120]
+        if norm in seen_excerpts:
+            continue
+        seen_excerpts.add(norm)
+        past_puzzles.append({
+            "id": f"puz-{s['id']}",
+            "title": s["title"],
+            "sessionNumber": s["sessionNumber"],
+            "dateLabel": s["dateLabel"],
+            "category": "puzzle",
+            "excerpt": excerpt[:320] + ("..." if len(excerpt) > 320 else ""),
+        })
+        if len(past_puzzles) >= max_puzzles:
+            break
+
+    # Fallback: scan newest cached transcripts if master summaries are empty
+    if not open_mysteries and not past_puzzles and files_map:
+        for meta in list_cached_transcripts()[:6]:
+            t_path = TRANSCRIPTS_DIR / f"{meta['id']}.txt"
+            if not t_path.exists():
+                continue
+            for utt in _split_transcript_utterances(t_path.read_text(encoding="utf-8", errors="replace")):
+                if 28 <= len(utt) <= 300 and _PAST_PUZZLE_RE.search(utt):
+                    norm = utt.lower()[:120]
+                    if norm not in seen_excerpts:
+                        seen_excerpts.add(norm)
+                        past_puzzles.append({
+                            "id": f"puz-{meta['id']}-{len(past_puzzles)}",
+                            "title": meta["name"],
+                            "sessionNumber": meta.get("sessionNumber"),
+                            "dateLabel": "",
+                            "category": "puzzle",
+                            "excerpt": utt,
+                        })
+                        if len(past_puzzles) >= max_puzzles:
+                            break
+            if len(past_puzzles) >= max_puzzles:
+                break
+
+    return {
+        "openMysteries": open_mysteries,
+        "pastPuzzles": past_puzzles,
+        "totalSummaries": len(summaries),
+        "totalTranscripts": len(files_map),
+    }
+
+
+def list_cached_transcripts() -> list[dict]:
+    """Lists all locally cached Drive transcripts sorted newest-first by session number."""
+    idx = _read_json(INDEX_FILE, {})
+    files_map = idx.get("files") if isinstance(idx.get("files"), dict) else {}
+    rows = []
+    for meta in files_map.values():
+        if not isinstance(meta, dict) or not meta.get("id"):
+            continue
+        rows.append({
+            "id": meta["id"],
+            "name": meta.get("name") or meta["id"],
+            "sessionNumber": meta.get("sessionNumber"),
+            "charCount": int(meta.get("charCount") or 0),
+            "modifiedTime": meta.get("modifiedTime") or "",
+        })
+    rows.sort(
+        key=lambda r: (r["sessionNumber"] if r["sessionNumber"] is not None else -1, str(r["name"])),
+        reverse=True,
+    )
+    return rows
+
+
+def get_cached_transcript(file_id: str = "latest") -> dict | None:
+    """Loads a cached Drive transcript by ID (or 'latest' for the newest episode)."""
+    rows = list_cached_transcripts()
+    if not rows:
+        return None
+    if not file_id or file_id == "latest":
+        target = rows[0]
+    else:
+        target = next((r for r in rows if r["id"] == file_id), None)
+    if not target:
+        return None
+    t_path = TRANSCRIPTS_DIR / f"{target['id']}.txt"
+    if not t_path.exists():
+        return None
+    text = t_path.read_text(encoding="utf-8", errors="replace")
+    return {
+        "id": target["id"],
+        "name": target["name"],
+        "sessionNumber": target["sessionNumber"],
+        "charCount": len(text),
+        "lineCount": len(text.splitlines()),
+        "text": text,
     }
 
 

@@ -95,6 +95,18 @@ class GdriveSyncTests(unittest.TestCase):
                 self.assertEqual(status["cachedTranscriptCount"], 1)
                 self.assertEqual(status["cachedSummaryCount"], 2)
                 self.assertTrue(status["hasBackstories"])
+                self.assertTrue(status["autoSyncEnabled"])
+                self.assertEqual(status["autoSyncIntervalMinutes"], 10)
+
+                mysteries = gdrive_sync.extract_campaign_mysteries()
+                self.assertTrue(len(mysteries["openMysteries"]) >= 1)
+                self.assertTrue(any("Zorzula" in m["excerpt"] for m in mysteries["openMysteries"]))
+
+                listed = gdrive_sync.list_cached_transcripts()
+                self.assertEqual(len(listed), 1)
+                latest_tr = gdrive_sync.get_cached_transcript("latest")
+                self.assertEqual(latest_tr["name"], "BUGS 69 11-12-2026.txt")
+                self.assertIn("Scrap warned us", latest_tr["text"])
 
                 res = gdrive_sync.search_campaign_archive("Who is the glowing green boss at Zorzula's Rest?")
                 self.assertTrue(len(res["recentSummaries"]) >= 1)

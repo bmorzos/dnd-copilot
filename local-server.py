@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -16,6 +17,16 @@ import gdrive_sync
 
 ROOT_DIR = Path(__file__).resolve().parent
 DDB_PROXY_RE = re.compile(r"^/api/ddb-character/(\d{4,12})(?:\?.*)?$")
+TRANSCRIPT_GET_RE = re.compile(r"^/api/campaign-memory/transcript/([a-zA-Z0-9_-]+)$")
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+AI_PROXY_TARGETS = {
+    "/api/proxy/gemini-interactions": "https://generativelanguage.googleapis.com/v1beta/interactions",
+    "/api/proxy/groq-chat": "https://api.groq.com/openai/v1/chat/completions",
+    "/api/proxy/groq-whisper": "https://api.groq.com/openai/v1/audio/transcriptions",
+}
 
 
 class CopilotRequestHandler(SimpleHTTPRequestHandler):
@@ -59,6 +70,21 @@ class CopilotRequestHandler(SimpleHTTPRequestHandler):
         if path == "/api/campaign-memory/overview":
             return self._send_json_obj(200, gdrive_sync.get_overview())
 
+        if path == "/api/campaign-memory/mysteries":
+            return self._send_json_obj(200, gdrive_sync.extract_campaign_mysteries())
+
+        if path == "/api/campaign-memory/transcripts":
+            return self._send_json_obj(200, {"transcripts": gdrive_sync.list_cached_transcripts()})
+
+        if path == "/api/campaign-memory/latest-transcript":
+            tr = gdrive_sync.get_cached_transcript("latest")
+            return self._send_json_obj(200 if tr else 404, tr or {"error": "No cached transcripts yet."})
+
+        tr_match = TRANSCRIPT_GET_RE.match(path)
+        if tr_match:
+            tr = gdrive_sync.get_cached_transcript(tr_match.group(1))
+            return self._send_json_obj(200 if tr else 404, tr or {"error": "Transcript not found."})
+
         if path == "/api/campaign-memory/export-bundle":
             bundle = gdrive_sync.export_archive_bundle()
             payload = json.dumps(bundle, indent=2).encode("utf-8")
@@ -77,6 +103,10 @@ class CopilotRequestHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+
+        if path in AI_PROXY_TARGETS:
+            return self._handle_ai_proxy(AI_PROXY_TARGETS[path])
+
         body = self._read_json_body()
         if body is None:
             return self._send_json_obj(400, {"error": "Invalid JSON request body."})
@@ -140,6 +170,35 @@ class CopilotRequestHandler(SimpleHTTPRequestHandler):
             return self._send_json_obj(404, {"error": f"Unknown API endpoint: {path}"})
         except Exception as exc:
             return self._send_json_obj(500, {"error": str(exc)})
+
+    def _handle_ai_proxy(self, target_url: str):
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+            if length < 0 or length > 30 * 1024 * 1024:
+                return self._send_json_obj(413, {"error": "Request body too large for AI proxy."})
+            raw_body = self.rfile.read(length) if length > 0 else b""
+            fwd_headers = {
+                "User-Agent": BROWSER_UA,
+                "Accept": "application/json",
+            }
+            for h_name in ("Content-Type", "Authorization", "x-goog-api-key", "Api-Revision"):
+                val = self.headers.get(h_name)
+                if val:
+                    fwd_headers[h_name] = val
+            req = urllib.request.Request(
+                target_url,
+                data=raw_body,
+                method="POST",
+                headers=fwd_headers,
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                resp_bytes = resp.read()
+                self._send_json(resp.status, resp_bytes)
+        except urllib.error.HTTPError as err:
+            err_bytes = err.read() or json.dumps({"error": {"message": f"Upstream HTTP {err.code}"}}).encode("utf-8")
+            self._send_json(err.code, err_bytes)
+        except Exception as exc:
+            self._send_json_obj(502, {"error": {"message": f"AI proxy error: {exc}"}})
 
     def _read_json_body(self):
         try:
@@ -227,8 +286,24 @@ class CopilotRequestHandler(SimpleHTTPRequestHandler):
         self.wfile.write(payload)
 
 
+def _start_drive_auto_sync_thread():
+    """Starts a daemon thread that incrementally checks Drive every 10 minutes for new episodes."""
+    def _loop():
+        time.sleep(15)
+        while True:
+            try:
+                gdrive_sync.auto_sync_if_due(min_age_seconds=600)
+            except Exception:
+                pass
+            time.sleep(600)
+
+    t = threading.Thread(target=_loop, name="GDriveAutoSync", daemon=True)
+    t.start()
+
+
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+    _start_drive_auto_sync_thread()
     handler = partial(CopilotRequestHandler, directory=str(ROOT_DIR))
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     print(f"Serving D&D Table Copilot + DDB proxy on http://127.0.0.1:{port}", flush=True)

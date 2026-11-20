@@ -480,31 +480,206 @@
       .map(([name]) => name);
   }
 
-  async function analyzeTableSituation(store) {
-    const st = store.state;
-    const recentLines = st.transcript.slice(-25);
-    const fullText = recentLines.map((t) => t.text).join(" ");
+  const MONSTER_NOUN_RE =
+    /\b(goblin|goblins|duergar|dragon|guardian|golem|construct|bugbear|skeleton|zombie|ogre|bandit|cultist|reaver|mimic|spider|orc|wolf|troll|wraith|banshee|kobold|owlbear|giant|cultists?)\b/i;
 
-    // Try Chrome on-device Gemini Nano first if present ($0 local)
-    const nanoRes = await tryChromeBuiltInPrompt(
-      "Respond ONLY with valid JSON: {\"sceneMode\":\"Exploration|Social|Puzzle|Combat\",\"headline\":\"string\",\"summaryBullets\":[\"string\"],\"activeObjectives\":[\"string\"]}",
-      `Summarize this D&D table transcript:\n${recentLines.map((t) => `${t.speaker}: ${t.text}`).join("\n")}`
+  const BANTER_LINE_RE =
+    /\b(recording going|click on|printer stuff|can you move them|check the mic|testing 1|can you hear me|little comp)\b/i;
+
+  function toTitleMonster(raw) {
+    const clean = String(raw || "").trim().replace(/s$/i, (m, offset, str) => {
+      return /goblins|orcs|wolves|skeletons|zombies|ogres|bandits|cultists|reavers|spiders|trolls|kobolds/i.test(str)
+        ? ""
+        : m;
+    });
+    return clean.replace(/\b[a-z]/g, (c) => c.toUpperCase());
+  }
+
+  function extractSpokenCombatFromLines(lines, party = []) {
+    if (!Array.isArray(lines) || lines.length === 0) {
+      return { inCombat: false, detectedEnemies: [], combatEvents: [] };
+    }
+    const partySet = new Set((party || []).map((p) => String(p.name || "").toLowerCase()));
+    const enemyMap = new Map();
+    const combatEvents = [];
+    let combatCueCount = 0;
+
+    for (const entry of lines) {
+      const text = String(entry?.text || "").trim();
+      if (!text || BANTER_LINE_RE.test(text)) continue;
+
+      if (COMBAT_WORDS.test(text) || /\b(sneak attack|grapple|fireball|eldritch blast|psychic blades|uncanny dodge|smite|saves?)\b/i.test(text)) {
+        combatCueCount++;
+      }
+
+      const mHit = text.match(MONSTER_NOUN_RE);
+      if (mHit) {
+        const name = toTitleMonster(mHit[1]);
+        if (!partySet.has(name.toLowerCase())) {
+          if (!enemyMap.has(name)) {
+            enemyMap.set(name, {
+              name,
+              damageDealt: 0,
+              isBloodied: false,
+              isDefeated: false,
+              observedTraits: []
+            });
+          }
+          const rec = enemyMap.get(name);
+          const dmgToMonster = text.match(
+            /(?:for|takes?|took|suffers?|dealt?)\s+(\d{1,3})\s*(?:points?\s+of\s+)?(?:[a-z]+\s+)?(?:damage|psychic|fire|radiant|slashing|piercing|bludgeoning)/i
+          );
+          if (dmgToMonster && !new RegExp(`\\b(${Array.from(partySet).join("|") || "__none__"})\\s+takes?`, "i").test(text)) {
+            rec.damageDealt += Number(dmgToMonster[1]);
+          }
+          if (/\bbloodied\b/i.test(text)) rec.isBloodied = true;
+          if (/\b(dead|defeated|killed|unconscious|dies|drops\s+dead|finished\s+it)\b/i.test(text) && !/\btied\s+up\b/i.test(text)) {
+            rec.isDefeated = true;
+          }
+          for (const pat of DAMAGE_RESIST_PATTERNS) {
+            if (pat.regex.test(text) && !rec.observedTraits.includes(pat.trait)) {
+              rec.observedTraits.push(pat.trait);
+            }
+          }
+          if (/\bpsychic\b/i.test(text) && !rec.observedTraits.includes("Psychic Attacks / Resistance Check")) {
+            rec.observedTraits.push("Psychic Capabilities");
+          }
+        }
+      }
+
+      // Extract notable combat events for the Combat Action Feed
+      const actionVerb = text.match(
+        /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b.*?\b(casts?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?|sneak\s+attack|divine\s+smite|uncanny\s+dodge|grapple[ds]?|takes?\s+\d+\s+[a-z]*\s*damage|fireball|hold\s+person|hunter'?s\s+mark|abjure\s+enemy)\b/i
+      );
+      if (actionVerb) {
+        combatEvents.push({
+          actor: actionVerb[1],
+          target: mHit ? toTitleMonster(mHit[1]) : "",
+          action: actionVerb[2],
+          detail: text.slice(0, 140),
+          kind: /damage|took|takes/i.test(actionVerb[2]) ? "damage" : "action"
+        });
+      }
+    }
+
+    const detectedEnemies = Array.from(enemyMap.values());
+    const inCombat = combatCueCount >= 2 || detectedEnemies.some((e) => e.damageDealt > 0 || combatCueCount >= 1);
+    return { inCombat, detectedEnemies, combatEvents: combatEvents.slice(-10) };
+  }
+
+  function extractLocationFromLines(lines) {
+    const locPatterns = [
+      /\b(?:in|at|into|inside|outside|under|near)\s+(Stonehill\s+Inn|Phandalin|Zorzula's?\s+Rest|Miners'?\s+Exchange|Sleeping\s+Giant|Town\s+Hall|Axeholm|Cragmaw\s+\w+|Tavern|Inn)\b/i
+    ];
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const txt = String(lines[i]?.text || "");
+      for (const re of locPatterns) {
+        const m = txt.match(re);
+        if (m) return m[1];
+      }
+    }
+    return "";
+  }
+
+  function buildLocalSuggestedMoves(sceneMode, myChar, enemies, npcs, puzzleActive) {
+    const moves = [];
+    const activeFoes = (enemies || []).filter((e) => !e.isDefeated);
+    const topSkill = (myChar?.proficientSkills || [])[0] || "Investigation";
+    const utilSpells = (myChar?.spells || []).filter(
+      (s) => s.ritual || s.level === 0 || /detect|identify|hold|fireball|bless|healing|misty|message/i.test(s.name)
     );
 
+    if (sceneMode === "Combat" && activeFoes.length > 0) {
+      const focus = activeFoes.find((e) => e.isBloodied) || activeFoes[0];
+      moves.push(`Focus fire on ${focus.name}${focus.isBloodied ? " (Bloodied)" : ""} or check its save weaknesses`);
+      if (utilSpells.length > 0) {
+        moves.push(`Prepare ${utilSpells[0].name} for your next turn (watch Reaction/Concentration)`);
+      }
+      moves.push("Ask the DM for visible cover, lighting, or exits before committing your Bonus Action");
+      return moves;
+    }
+
+    if (puzzleActive || sceneMode === "Puzzle") {
+      moves.push("Cast Detect Magic (as a Ritual) or inspect the mechanism from 30 ft before touching");
+      moves.push(`Ask the DM for an ${topSkill} or Arcana check on inscriptions and wear marks`);
+      moves.push("Pin any key phrases in the Puzzle tab to cross-reference past sessions");
+      return moves;
+    }
+
+    if (sceneMode === "Social") {
+      const targetNpc = npcs?.[0] || "the NPC";
+      moves.push(`Ask the DM for an Insight check on ${targetNpc}'s motives or reactions`);
+      moves.push(`Leverage ${topSkill} to press for details, bargains, or hidden leads`);
+      moves.push("Check Live Ideas for past-session ties before making promises");
+      return moves;
+    }
+
+    moves.push(`Ask the DM for a ${topSkill} or Perception sweep of exits, tracks, or hidden compartments`);
+    if (utilSpells.length > 0) {
+      moves.push(`Consider casting ${utilSpells[0].name}${utilSpells[0].ritual ? " (Ritual, 0 slots)" : ""} to scout safely`);
+    } else {
+      moves.push("Clarify marching order, light sources, and short-rest readiness with the party");
+    }
+    moves.push("Note key NPCs/locations discovered so Live Ideas tracks campaign callbacks");
+    return moves.slice(0, 3);
+  }
+
+  async function analyzeTableSituation(store, options = {}) {
+    const st = store.state;
+    const overrideLines = Array.isArray(options?.overrideLines) ? options.overrideLines : null;
+    const forceRecordBeat = Boolean(options?.forceRecordBeat);
+    const recentLines = (overrideLines && overrideLines.length > 0)
+      ? overrideLines.slice(-30)
+      : st.transcript.slice(-25);
+    const fullText = recentLines.map((t) => t.text).join(" ");
+
+    const newSheetLines = overrideLines
+      ? overrideLines
+      : store.getUnprocessedTranscriptLinesForSheets
+      ? store.getUnprocessedTranscriptLinesForSheets(18)
+      : [];
+    const newestId = overrideLines
+      ? st.transcript.length
+        ? st.transcript[st.transcript.length - 1].id
+        : null
+      : newSheetLines.length
+      ? newSheetLines[newSheetLines.length - 1].id
+      : null;
+
+    // Try Chrome on-device Gemini Nano first if present ($0 local)
+    const nanoRes = overrideLines
+      ? null
+      : await tryChromeBuiltInPrompt(
+          "Respond ONLY with valid JSON: {\"sceneMode\":\"Exploration|Social|Puzzle|Combat\",\"location\":\"string\",\"headline\":\"string\",\"summaryBullets\":[\"string\"],\"activeObjectives\":[\"string\"],\"suggestedNextMoves\":[\"string\"]}",
+          `Summarize this D&D table transcript:\n${recentLines.map((t) => `${t.speaker}: ${t.text}`).join("\n")}`
+        );
+
     if (nanoRes?.headline) {
+      const npcsNano = extractProperNouns(recentLines.map((l) => l.text));
+      const myCharNano =
+        st.party.find((p) => String(p.id) === String(st.myCharacterId)) || st.party[0] || null;
+      const combatInfo = extractSpokenCombatFromLines(newSheetLines, st.party);
+      store.ingestSpokenCombatState?.(combatInfo);
       st.situation = {
         sceneMode: nanoRes.sceneMode || "Exploration",
+        location: nanoRes.location || extractLocationFromLines(recentLines),
         headline: nanoRes.headline,
         summaryBullets: Array.isArray(nanoRes.summaryBullets) ? nanoRes.summaryBullets.slice(0, 4) : [],
         activeObjectives: Array.isArray(nanoRes.activeObjectives) ? nanoRes.activeObjectives.slice(0, 3) : [],
-        notableNpcs: extractProperNouns(recentLines.map((l) => l.text)),
+        suggestedNextMoves:
+          Array.isArray(nanoRes.suggestedNextMoves) && nanoRes.suggestedNextMoves.length > 0
+            ? nanoRes.suggestedNextMoves.slice(0, 4)
+            : buildLocalSuggestedMoves(
+                nanoRes.sceneMode || "Exploration",
+                myCharNano,
+                st.combat.enemies,
+                npcsNano,
+                st.puzzle.isActive
+              ),
+        notableNpcs: npcsNano,
         lastUpdatedAt: Date.now()
       };
-      store.recordSessionBeat?.(st.situation);
-      const newSheetLines = store.getUnprocessedTranscriptLinesForSheets
-        ? store.getUnprocessedTranscriptLinesForSheets(18)
-        : [];
-      const newestId = newSheetLines.length ? newSheetLines[newSheetLines.length - 1].id : null;
+      store.recordSessionBeat?.(st.situation, forceRecordBeat);
       const updates = extractPartySheetUpdatesFromLines(newSheetLines, st.party, st.myCharacterId);
       const sheetRes = store.applyLivePartyUpdates
         ? store.applyLivePartyUpdates(updates, newestId)
@@ -514,8 +689,9 @@
     }
 
     // Deterministic Local Digest Engine ($0, instant, works in every Chrome version)
+    const spokenCombat = extractSpokenCombatFromLines(newSheetLines, st.party);
     let sceneMode = "Exploration";
-    if (st.combat.inCombat || COMBAT_WORDS.test(fullText)) {
+    if (st.combat.inCombat || spokenCombat.inCombat || COMBAT_WORDS.test(fullText)) {
       sceneMode = "Combat";
     } else if (PUZZLE_WORDS.test(fullText) || st.puzzle.isActive) {
       sceneMode = "Puzzle";
@@ -523,9 +699,17 @@
       sceneMode = "Social";
     }
 
+    if (spokenCombat.detectedEnemies.length > 0 || spokenCombat.combatEvents.length > 0) {
+      store.ingestSpokenCombatState?.({
+        inCombat: sceneMode === "Combat" && spokenCombat.inCombat,
+        detectedEnemies: spokenCombat.detectedEnemies,
+        combatEvents: spokenCombat.combatEvents
+      });
+    }
+
     // Auto-extract spoken puzzle clues & inscriptions
     for (const entry of recentLines) {
-      if (PUZZLE_WORDS.test(entry.text)) {
+      if (PUZZLE_WORDS.test(entry.text) && !BANTER_LINE_RE.test(entry.text)) {
         st.puzzle.isActive = true;
         const quoted = entry.text.match(/['"]([^'"]{15,240})['"]/);
         if (quoted && !st.puzzle.promptOrInscription) {
@@ -552,12 +736,13 @@
 
     const bullets = [];
     if (recentLines.length === 0) {
-      bullets.push("No spoken lines captured yet—play your recording or start the microphone.");
+      bullets.push("No spoken lines captured yet—play your recording, Fast Play an episode, or start the mic.");
     } else {
       const meaningful = recentLines
-        .filter((l) => l.text.split(/\s+/).length >= 5)
+        .filter((l) => l.text.split(/\s+/).length >= 5 && !BANTER_LINE_RE.test(l.text))
         .slice(-4);
-      for (const item of meaningful) {
+      const sourceList = meaningful.length > 0 ? meaningful : recentLines.slice(-3);
+      for (const item of sourceList) {
         bullets.push(`${item.speaker}: "${item.text.slice(0, 150)}${item.text.length > 150 ? "..." : ""}"`);
       }
     }
@@ -584,7 +769,8 @@
       objectives.push(`Solve active puzzle (${st.puzzle.clues.length} clue(s) collected)`);
     }
 
-    const latestLine = recentLines[recentLines.length - 1]?.text || "";
+    const cleanTail = recentLines.filter((l) => !BANTER_LINE_RE.test(l.text));
+    const latestLine = (cleanTail[cleanTail.length - 1] || recentLines[recentLines.length - 1])?.text || "";
     const headline =
       recentLines.length > 0
         ? `${sceneMode} Scene — ${latestLine.slice(0, 115)}${latestLine.length > 115 ? "..." : ""}`
@@ -592,21 +778,29 @@
 
     const partyNames = new Set(st.party.map((p) => p.name));
     const npcs = extractProperNouns(recentLines.map((l) => l.text)).filter((n) => !partyNames.has(n));
+    const location = extractLocationFromLines(recentLines) || st.situation?.location || "";
+    const myChar =
+      st.party.find((p) => String(p.id) === String(st.myCharacterId)) || st.party[0] || null;
+    const suggestedNextMoves = buildLocalSuggestedMoves(
+      sceneMode,
+      myChar,
+      st.combat.enemies,
+      npcs,
+      st.puzzle.isActive
+    );
 
     st.situation = {
       sceneMode,
+      location,
       headline,
       summaryBullets: bullets.slice(0, 4),
       activeObjectives: objectives,
+      suggestedNextMoves,
       notableNpcs: npcs,
       lastUpdatedAt: Date.now()
     };
 
-    store.recordSessionBeat?.(st.situation);
-    const newSheetLines = store.getUnprocessedTranscriptLinesForSheets
-      ? store.getUnprocessedTranscriptLinesForSheets(18)
-      : [];
-    const newestId = newSheetLines.length ? newSheetLines[newSheetLines.length - 1].id : null;
+    store.recordSessionBeat?.(st.situation, forceRecordBeat);
     const updates = extractPartySheetUpdatesFromLines(newSheetLines, st.party, st.myCharacterId);
     const sheetRes = store.applyLivePartyUpdates
       ? store.applyLivePartyUpdates(updates, newestId)
@@ -671,14 +865,17 @@
     return store.setSessionSummary({ headline, bullets });
   }
 
-  async function solvePuzzle(store, extraUserNote = "") {
+  async function solvePuzzle(store, extraUserNote = "", extraPastContext = "") {
     const st = store.state;
     const allPuzzleText = [
       st.puzzle.promptOrInscription || "",
       ...(st.puzzle.clues || []),
       extraUserNote,
+      extraPastContext,
       ...st.transcript.slice(-20).map((t) => t.text)
-    ].join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
 
     const matchedHints = RIDDLE_CONCEPT_HINTS.filter((h) => h.pattern.test(allPuzzleText));
     const hypotheses = [];
@@ -1074,7 +1271,7 @@
       }`,
       concentrationWarning: isConcentrating
         ? `⚠️ ${myChar.name} is concentrating on ${myChar.concentratingOn}—avoid casting another Concentration spell unless upgrading.`
-        : `Concentration is FREE on ${myChar.name}.`,
+        : "",
       pastSessionConnection,
       recommendations: top3,
       customAnswer: customQuestion

@@ -14,6 +14,11 @@
   let isUpdatingIdeas = false;
   let lastCustomAdvisorQuestionAt = 0;
   let driveArchiveStatus = null;
+  let driveMysteriesData = null;
+  let mysteryFilter = "all";
+  let fastPlayCancelled = false;
+  let isFastPlaying = false;
+  let liveIdeasDebounceTimer = null;
 
   function el(id) {
     return document.getElementById(id);
@@ -168,9 +173,9 @@
     }
   });
 
-  async function refreshLiveIdeasSilently() {
+  async function refreshLiveIdeasSilently(force = false) {
     if (isUpdatingIdeas || store.settings?.autoUpdateIdeas === false) return;
-    if (Date.now() - lastCustomAdvisorQuestionAt < 15000) return;
+    if (!force && Date.now() - lastCustomAdvisorQuestionAt < 15000) return;
     isUpdatingIdeas = true;
     try {
       await gemini.adviseTacticsAndSpells(store, "");
@@ -182,6 +187,28 @@
     } finally {
       isUpdatingIdeas = false;
     }
+  }
+
+  function scheduleLiveIdeasRefresh() {
+    if (liveIdeasDebounceTimer) clearTimeout(liveIdeasDebounceTimer);
+    liveIdeasDebounceTimer = setTimeout(() => {
+      liveIdeasDebounceTimer = null;
+      refreshLiveIdeasSilently(true);
+    }, 350);
+  }
+
+  function reconcileSlotInfoWithSheet(slotInfo, myChar) {
+    const str = String(slotInfo || "");
+    if (!myChar?.spellSlots?.length) return str;
+    return str.replace(/\b(Pact\s+)?L(\d+)\s+slot\s*\(\d+\/\d+\s+left\)/gi, (full, pactPfx, lvlStr) => {
+      const lvl = Number(lvlStr);
+      const wantsPact = Boolean(pactPfx);
+      const slot =
+        myChar.spellSlots.find((s) => Number(s.level) === lvl && Boolean(s.isPact) === wantsPact) ||
+        myChar.spellSlots.find((s) => Number(s.level) === lvl);
+      if (!slot) return full;
+      return `${slot.isPact ? "Pact " : ""}L${slot.level} slot (${slot.remaining}/${slot.max} left)`;
+    });
   }
 
   /* ---------------- RENDERING ---------------- */
@@ -205,16 +232,28 @@
   }
 
   function renderWhatsGoingOn(state) {
-    el("sceneModeBadge").textContent = state.situation.sceneMode || "Exploration";
-    el("situationHeadline").textContent =
-      state.situation.headline || "Ready to listen to your game.";
+    const sit = state.situation || {};
+    el("sceneModeBadge").textContent = sit.sceneMode || "Exploration";
 
-    const bullets = state.situation.summaryBullets || [];
+    const locEl = el("situationLocation");
+    if (locEl) {
+      if (sit.location) {
+        locEl.textContent = `📍 ${sit.location}`;
+        locEl.classList.remove("hidden");
+      } else {
+        locEl.classList.add("hidden");
+      }
+    }
+
+    el("situationHeadline").textContent =
+      sit.headline || "Ready to listen to your game.";
+
+    const bullets = sit.summaryBullets || [];
     el("situationBullets").innerHTML = bullets
       .map((b) => `<li>${escapeHtml(b)}</li>`)
       .join("");
 
-    const objs = state.situation.activeObjectives || [];
+    const objs = sit.activeObjectives || [];
     const objBox = el("situationObjectives");
     if (objs.length > 0) {
       objBox.classList.remove("hidden");
@@ -223,6 +262,66 @@
         .join("")}`;
     } else {
       objBox.classList.add("hidden");
+    }
+
+    const moves = sit.suggestedNextMoves || [];
+    const movesBox = el("situationNextMoves");
+    if (movesBox) {
+      if (moves.length > 0) {
+        movesBox.classList.remove("hidden");
+        movesBox.innerHTML = `<strong>⚡ What You Can Do Right Now</strong>${moves
+          .map(
+            (m) =>
+              `<button type="button" class="next-move-btn" data-try-move="${escapeHtml(m)}">→ ${escapeHtml(
+                m
+              )}</button>`
+          )
+          .join("")}`;
+      } else {
+        movesBox.classList.add("hidden");
+      }
+    }
+
+    const npcs = sit.notableNpcs || [];
+    const npcBox = el("situationNpcs");
+    if (npcBox) {
+      if (npcs.length > 0) {
+        npcBox.classList.remove("hidden");
+        npcBox.innerHTML = `<span style="font-size:13px;color:var(--text-muted);font-weight:600;">NPCs / Names:</span>${npcs
+          .map(
+            (n) =>
+              `<button type="button" class="npc-chip" data-search-npc="${escapeHtml(
+                n
+              )}" title="Search past Drive transcripts for ${escapeHtml(n)}">🔍 ${escapeHtml(n)}</button>`
+          )
+          .join("")}`;
+      } else {
+        npcBox.classList.add("hidden");
+      }
+    }
+
+    const beats = state.sessionBeats || [];
+    const tlDrawer = el("sessionTimelineDrawer");
+    const tlList = el("sessionTimelineList");
+    const beatCount = el("beatCount");
+    if (tlDrawer && tlList && beatCount) {
+      beatCount.textContent = String(beats.length);
+      if (beats.length > 0) {
+        tlDrawer.classList.remove("hidden");
+        tlList.innerHTML = beats
+          .map(
+            (b, i) => `
+            <div class="timeline-beat">
+              <strong>Act ${i + 1} (${escapeHtml(b.sceneMode || "Scene")}${
+              b.location ? ` · ${escapeHtml(b.location)}` : ""
+            }):</strong> ${escapeHtml(b.headline)}
+            </div>
+          `
+          )
+          .join("");
+      } else {
+        tlDrawer.classList.add("hidden");
+      }
     }
 
     // Minimized Transcript Drawer
@@ -288,11 +387,11 @@
     }
 
     const concAlert = el("concentrationAlert");
-    const concText =
-      state.advisor.concentrationWarning ||
-      (myChar?.concentratingOn
-        ? `Concentrating on ${myChar.concentratingOn} — another Concentration spell will drop it.`
-        : "");
+    const rawWarn = String(state.advisor?.concentrationWarning || "").trim();
+    const cleanWarn = /concentration\s+is\s+free/i.test(rawWarn) ? "" : rawWarn;
+    const concText = myChar?.concentratingOn
+      ? cleanWarn || `⚠️ Concentrating on ${myChar.concentratingOn} — another Concentration spell will drop it.`
+      : cleanWarn;
     if (concText) {
       concAlert.textContent = concText;
       concAlert.classList.remove("hidden");
@@ -328,7 +427,7 @@
         <div class="big-card">
           <div class="big-card-top">
             <span class="big-card-title">${escapeHtml(r.rank)}. ${escapeHtml(r.spellOrAction)}</span>
-            <span class="big-card-meta">${escapeHtml(r.slotInfo)}</span>
+            <span class="big-card-meta">${escapeHtml(reconcileSlotInfoWithSheet(r.slotInfo, myChar))}</span>
           </div>
           <p class="big-card-desc">${escapeHtml(r.whyBest)}</p>
         </div>
@@ -375,11 +474,50 @@
             .join("")}</ul>`
         : "";
 
+    renderDriveMysteries();
+
     // 3. Combat & Rolls
     const cmb = state.combat;
     el("combatRoundLabel").textContent = cmb.inCombat
-      ? `Round ${cmb.round || 1} (Player-Fair Damage Tracked)`
+      ? `Round ${cmb.round || 1} (Player-Fair Combat View)`
       : "Out of Combat";
+
+    const myStatsEl = el("myCombatStatsBar");
+    if (myStatsEl) {
+      if (myChar) {
+        const slotBits = (myChar.spellSlots || [])
+          .map((s) => `${s.isPact ? "P" : "L"}${s.level}:${s.remaining}/${s.max}`)
+          .join(" ");
+        myStatsEl.classList.remove("hidden");
+        myStatsEl.textContent = `★ ${myChar.name} · AC ${myChar.ac}${
+          myChar.spellSaveDc ? ` · DC ${myChar.spellSaveDc}` : ""
+        }${myChar.spellAttackBonus != null ? ` · Atk +${myChar.spellAttackBonus}` : ""}${
+          myChar.concentratingOn ? ` · 🔮 ${myChar.concentratingOn}` : ""
+        }${slotBits ? ` · [${slotBits}]` : ""}`;
+      } else {
+        myStatsEl.classList.add("hidden");
+      }
+    }
+
+    const triageEl = el("combatPartyTriage");
+    if (triageEl) {
+      const triageItems = (state.party || [])
+        .map((p) => {
+          const tags = [];
+          if (p.hp.current <= Math.floor(p.hp.max * 0.7)) tags.push(`${p.hp.current}/${p.hp.max} HP`);
+          if (p.concentratingOn) tags.push(`Conc: ${p.concentratingOn}`);
+          if (p.conditions?.length) tags.push(p.conditions.join(", "));
+          if (p.inspiration) tags.push("✨ Inspired");
+          return tags.length > 0 ? `${p.name} (${tags.join(" · ")})` : "";
+        })
+        .filter(Boolean);
+      if (triageItems.length > 0) {
+        triageEl.classList.remove("hidden");
+        triageEl.innerHTML = `<strong>Party Status:</strong> ${escapeHtml(triageItems.join("  |  "))}`;
+      } else {
+        triageEl.classList.add("hidden");
+      }
+    }
 
     const initStrip = el("initiativeStrip");
     if (cmb.initiativeOrder && cmb.initiativeOrder.length > 0) {
@@ -399,7 +537,7 @@
 
     const enemyEl = el("enemyList");
     if (!cmb.enemies || cmb.enemies.length === 0) {
-      enemyEl.innerHTML = `<p class="muted-p">No enemies tracked yet.</p>`;
+      enemyEl.innerHTML = `<p class="muted-p">No enemies tracked yet — spoken foes auto-appear here, or click <strong>+ Add</strong> above.</p>`;
     } else {
       enemyEl.innerHTML = cmb.enemies
         .map((e) => {
@@ -434,6 +572,8 @@
                 <button class="btn btn-quiet" data-enemy-dmg="${escapeHtml(e.tokenId)}" data-amt="5">+5</button>
                 <button class="btn btn-quiet" data-enemy-dmg="${escapeHtml(e.tokenId)}" data-amt="10">+10</button>
                 <button class="btn btn-quiet" data-enemy-custom-dmg="${escapeHtml(e.tokenId)}">+ Custom</button>
+                <button class="btn btn-quiet" data-enemy-miss="${escapeHtml(e.tokenId)}" title="Log an attack roll that missed to narrow AC">Miss AC</button>
+                <button class="btn btn-quiet" data-enemy-hit="${escapeHtml(e.tokenId)}" title="Log an attack roll that hit to narrow AC">Hit AC</button>
                 <button class="btn btn-quiet" data-enemy-toggle="${escapeHtml(e.tokenId)}" data-field="isBloodied">Bloodied</button>
                 <button class="btn btn-quiet" data-enemy-toggle="${escapeHtml(e.tokenId)}" data-field="isDefeated">${
             e.isDefeated ? "Revive" : "Down"
@@ -445,12 +585,36 @@
         .join("");
     }
 
+    const cevEl = el("combatEventsList");
+    const cEvents = cmb.combatEvents || [];
+    if (cevEl) {
+      if (cEvents.length === 0) {
+        cevEl.innerHTML = `<p class="muted-p">No combat beats captured yet — updates automatically from live table speech or Fast Play.</p>`;
+      } else {
+        cevEl.innerHTML = cEvents
+          .slice(-14)
+          .reverse()
+          .map(
+            (ev) => `
+            <div class="combat-event-row ${ev.kind === "damage" ? "is-damage" : ""}">
+              <span class="combat-event-badge">R${escapeHtml(ev.round || 1)}</span>
+              <strong>${escapeHtml(ev.actor || "Table")}</strong>${
+              ev.action ? ` · ${escapeHtml(ev.action)}` : ""
+            }${ev.target ? ` → ${escapeHtml(ev.target)}` : ""}
+              <div style="color:var(--text-soft);margin-top:2px;">${escapeHtml(ev.detail || "")}</div>
+            </div>
+          `
+          )
+          .join("");
+      }
+    }
+
     const activeEnemy =
       cmb.enemies.find((e) => e.tokenId === cmb.activeTargetTokenId) || cmb.enemies[0] || null;
 
     const rollsEl = el("gameLogList");
     if (state.gameLog.length === 0) {
-      rollsEl.innerHTML = `<p class="muted-p">No AboveVTT rolls yet.</p>`;
+      rollsEl.innerHTML = `<p class="muted-p">No AboveVTT rolls yet (or click ↻ Sync VTT).</p>`;
     } else {
       rollsEl.innerHTML = state.gameLog
         .slice(-12)
@@ -729,6 +893,10 @@
       return null;
     }
     try {
+      const prevTranscriptCount = Number(driveArchiveStatus?.cachedTranscriptCount || 0);
+      const prevSummaryCount = Number(driveArchiveStatus?.cachedSummaryCount || 0);
+      const hadPrev = driveArchiveStatus !== null;
+
       const resp = await fetch(`/api/gdrive/status?_t=${Date.now()}`, { cache: "no-store" });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       driveArchiveStatus = await resp.json();
@@ -736,11 +904,177 @@
       if (!el("savedModal")?.classList.contains("hidden")) {
         renderDriveArchiveSection();
       }
+      if (
+        hadPrev &&
+        (Number(driveArchiveStatus.cachedTranscriptCount || 0) > prevTranscriptCount ||
+          Number(driveArchiveStatus.cachedSummaryCount || 0) > prevSummaryCount)
+      ) {
+        loadDriveMysteries();
+        showToast("☁️ New episode(s) auto-synced from Google Drive!");
+      }
       return driveArchiveStatus;
     } catch (err) {
       if (!silent) showToast(`Drive status check failed: ${err.message || err}`, true);
       return null;
     }
+  }
+
+  async function loadDriveMysteries() {
+    if (!bridge.isLocalServerContext()) {
+      driveMysteriesData = null;
+      renderDriveMysteries();
+      return null;
+    }
+    try {
+      const resp = await fetch(`/api/campaign-memory/mysteries?_t=${Date.now()}`, {
+        cache: "no-store"
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      driveMysteriesData = await resp.json();
+      renderDriveMysteries();
+      return driveMysteriesData;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function renderDriveMysteries() {
+    const listEl = el("driveMysteriesList");
+    const countEl = el("mysteryCount");
+    if (!listEl || !countEl) return;
+
+    document.querySelectorAll("[data-mystery-filter]").forEach((b) => {
+      b.classList.toggle("active", b.getAttribute("data-mystery-filter") === mysteryFilter);
+    });
+
+    if (!bridge.isLocalServerContext()) {
+      countEl.textContent = "0";
+      listEl.innerHTML = `<p class="muted-p">Launch via start-windows.bat / start-mac.command to load Open Mysteries &amp; Past Puzzles from Google Drive.</p>`;
+      return;
+    }
+
+    const openList = Array.isArray(driveMysteriesData?.openMysteries)
+      ? driveMysteriesData.openMysteries
+      : [];
+    const pastList = Array.isArray(driveMysteriesData?.pastPuzzles)
+      ? driveMysteriesData.pastPuzzles
+      : [];
+    const combined =
+      mysteryFilter === "mystery"
+        ? openList
+        : mysteryFilter === "puzzle"
+        ? pastList
+        : [...openList, ...pastList];
+
+    countEl.textContent = String(openList.length + pastList.length);
+    if (combined.length === 0) {
+      listEl.innerHTML = `<p class="muted-p">No synced campaign mysteries found yet — sync Google Drive in 💾 Saved.</p>`;
+      return;
+    }
+
+    listEl.innerHTML = combined
+      .slice(0, 18)
+      .map((item) => {
+        const badge = item.category === "mystery" ? "🕵️ Open Mystery" : "🧩 Past Puzzle";
+        const pinPayload = `[${item.title}] ${item.excerpt}`;
+        return `
+          <div class="mystery-card">
+            <div class="big-card-top">
+              <span class="big-card-title" style="font-size:15.5px;">${badge} · ${escapeHtml(
+          item.title
+        )}</span>
+              <button type="button" class="btn btn-quiet" style="padding:3px 9px;font-size:12.5px;" data-pin-mystery="${escapeHtml(
+                pinPayload
+              )}">+ Pin to Solver</button>
+            </div>
+            <div>${escapeHtml(item.excerpt)}</div>
+          </div>
+        `;
+      })
+      .join("");
+  }
+
+  function initColumnResizers() {
+    const COL_KEY = "dnd_copilot_col_widths_v1";
+    const DEFAULTS = [34, 37, 29];
+    const grid = el("mainGrid");
+    const sp1 = el("colSplitter1");
+    const sp2 = el("colSplitter2");
+    if (!grid || !sp1 || !sp2) return;
+
+    let widths = [...DEFAULTS];
+    try {
+      const saved = JSON.parse(localStorage.getItem(COL_KEY) || "null");
+      if (
+        Array.isArray(saved) &&
+        saved.length === 3 &&
+        saved.every((n) => Number.isFinite(Number(n)) && Number(n) >= 16)
+      ) {
+        widths = saved.map(Number);
+      }
+    } catch (_) {}
+
+    const applyWidths = (arr, persist = false) => {
+      widths = arr;
+      grid.style.setProperty("--col1-fr", `${arr[0].toFixed(2)}fr`);
+      grid.style.setProperty("--col2-fr", `${arr[1].toFixed(2)}fr`);
+      grid.style.setProperty("--col3-fr", `${arr[2].toFixed(2)}fr`);
+      if (persist) {
+        try {
+          localStorage.setItem(COL_KEY, JSON.stringify(arr.map((n) => Number(n.toFixed(2)))));
+        } catch (_) {}
+      }
+    };
+
+    applyWidths(widths, false);
+
+    const attachSplitter = (splitter, leftIdx, rightIdx) => {
+      splitter.addEventListener("pointerdown", (e) => {
+        if (window.innerWidth <= 1100) return;
+        e.preventDefault();
+        const rect = grid.getBoundingClientRect();
+        const totalAvail = Math.max(300, rect.width - 52);
+        const startX = e.clientX;
+        const startLeft = widths[leftIdx];
+        const startRight = widths[rightIdx];
+        const sumPair = startLeft + startRight;
+
+        document.body.classList.add("is-resizing-cols");
+        splitter.classList.add("dragging");
+        splitter.setPointerCapture?.(e.pointerId);
+
+        const onMove = (mv) => {
+          const deltaPct = ((mv.clientX - startX) / totalAvail) * 100;
+          const nextLeft = Math.max(18, Math.min(Math.min(64, sumPair - 18), startLeft + deltaPct));
+          const nextRight = sumPair - nextLeft;
+          const next = [...widths];
+          next[leftIdx] = nextLeft;
+          next[rightIdx] = nextRight;
+          applyWidths(next, false);
+        };
+
+        const onUp = () => {
+          document.body.classList.remove("is-resizing-cols");
+          splitter.classList.remove("dragging");
+          window.removeEventListener("pointermove", onMove);
+          window.removeEventListener("pointerup", onUp);
+          window.removeEventListener("pointercancel", onUp);
+          applyWidths(widths, true);
+        };
+
+        window.addEventListener("pointermove", onMove);
+        window.addEventListener("pointerup", onUp);
+        window.addEventListener("pointercancel", onUp);
+      });
+
+      splitter.addEventListener("dblclick", () => {
+        applyWidths([...DEFAULTS], true);
+        showToast("Reset column widths to default.");
+      });
+    };
+
+    attachSplitter(sp1, 0, 1);
+    attachSplitter(sp2, 1, 2);
   }
 
   function renderDriveArchiveSection() {
@@ -775,13 +1109,16 @@
     } session summaries${st.hasBackstories ? " · Backstories" : ""}`;
     const syncPart = st.lastSyncedAt ? ` · Last synced ${formatTime(st.lastSyncedAt)}` : "";
 
+    const autoNote =
+      st.autoSyncEnabled && (st.connected || st.cliAvailable) ? " · Auto-syncs every 10 min" : "";
+
     if (st.connected) {
-      statusEl.textContent = `✅ Google Drive connected — ${countPart}${syncPart}`;
+      statusEl.textContent = `✅ Google Drive connected — ${countPart}${syncPart}${autoNote}`;
       btnConn?.classList.add("hidden");
       btnDisc?.classList.remove("hidden");
     } else if (st.cachedTranscriptCount > 0 || st.cachedSummaryCount > 0) {
       const cliNote = st.cliAvailable ? "Ready to sync" : "Connect Google Drive for auto-refresh";
-      statusEl.textContent = `📁 Local Drive Cache active (${countPart}${syncPart}) — ${cliNote}.`;
+      statusEl.textContent = `📁 Local Drive Cache active (${countPart}${syncPart}${autoNote}) — ${cliNote}.`;
       btnConn?.classList.remove("hidden");
       btnDisc?.classList.add("hidden");
     } else if (st.cliAvailable) {
@@ -1548,8 +1885,59 @@
     document.querySelectorAll(".focus-tab").forEach((tabBtn) => {
       tabBtn.addEventListener("click", () => {
         activeTab = tabBtn.getAttribute("data-tab");
+        if (activeTab === "puzzle" && !driveMysteriesData && bridge.isLocalServerContext()) {
+          loadDriveMysteries();
+        }
         renderCenterFocus(store.state);
       });
+    });
+
+    // Clickable What's Going On Moves & NPCs
+    el("situationNextMoves")?.addEventListener("click", (e) => {
+      const moveBtn = e.target.closest("[data-try-move]");
+      if (!moveBtn) return;
+      const moveText = moveBtn.getAttribute("data-try-move") || "";
+      if (!moveText) return;
+      activeTab = "advisor";
+      renderCenterFocus(store.state);
+      el("advisorQuestionInput").value = moveText;
+      runAdvisor(moveText);
+    });
+
+    el("situationNpcs")?.addEventListener("click", async (e) => {
+      const chip = e.target.closest("[data-search-npc]");
+      if (!chip) return;
+      const term = chip.getAttribute("data-search-npc") || "";
+      if (!term) return;
+      await openSavedModal();
+      const inp = el("driveArchiveSearchInput");
+      if (inp) {
+        inp.value = term;
+        el("driveArchiveSearchForm")?.dispatchEvent(new Event("submit", { cancelable: true }));
+      }
+    });
+
+    el("driveMysteriesSection")?.addEventListener("click", (e) => {
+      const fBtn = e.target.closest("[data-mystery-filter]");
+      if (fBtn) {
+        mysteryFilter = fBtn.getAttribute("data-mystery-filter") || "all";
+        renderDriveMysteries();
+        return;
+      }
+      if (e.target.closest("#btnRefreshMysteries")) {
+        loadDriveMysteries();
+        showToast("Refreshed mysteries & puzzles from Drive cache!");
+        return;
+      }
+      const pinBtn = e.target.closest("[data-pin-mystery]");
+      if (pinBtn) {
+        const clueText = pinBtn.getAttribute("data-pin-mystery") || "";
+        if (clueText) {
+          store.addPuzzleClue(clueText);
+          el("viewPuzzle")?.scrollTo({ top: 0, behavior: "smooth" });
+          showToast("Pinned to Puzzle clues!");
+        }
+      }
     });
 
     // Live Ideas Advisor
@@ -1649,6 +2037,22 @@
         }
         return;
       }
+      const missBtn = e.target.closest("[data-enemy-miss]");
+      if (missBtn) {
+        const v = window.prompt("Attack roll total that MISSED this enemy:", "14");
+        if (v !== null && Number.isFinite(Number(v))) {
+          store.recordEnemyAttackOutcome(missBtn.getAttribute("data-enemy-miss"), Number(v), false);
+        }
+        return;
+      }
+      const hitBtn = e.target.closest("[data-enemy-hit]");
+      if (hitBtn) {
+        const v = window.prompt("Attack roll total that HIT this enemy:", "18");
+        if (v !== null && Number.isFinite(Number(v))) {
+          store.recordEnemyAttackOutcome(hitBtn.getAttribute("data-enemy-hit"), Number(v), true);
+        }
+        return;
+      }
       const tog = e.target.closest("[data-enemy-toggle]");
       if (tog) {
         store.toggleEnemyFlag(
@@ -1676,6 +2080,7 @@
       btn.textContent = "...";
       try {
         await bridge.refreshAllPartySheets(false, true);
+        scheduleLiveIdeasRefresh();
       } finally {
         btn.disabled = false;
         btn.textContent = "↻";
@@ -1686,6 +2091,7 @@
       if (e.target.closest("#btnUndoAutoSheets")) {
         if (store.undoLastAutoSheetBatch()) {
           showToast("Undid last automatic character sheet update.");
+          scheduleLiveIdeasRefresh();
         }
         return;
       }
@@ -1703,6 +2109,7 @@
       const clearConcBtn = e.target.closest("[data-clear-conc]");
       if (clearConcBtn) {
         store.setCharacterConcentration(clearConcBtn.getAttribute("data-clear-conc"), "");
+        scheduleLiveIdeasRefresh();
         return;
       }
       const rmCondBtn = e.target.closest("[data-remove-cond]");
@@ -1752,11 +2159,16 @@
       }
       const slot = e.target.closest("[data-slot-char]");
       if (slot) {
+        const slotCharId = slot.getAttribute("data-slot-char");
         store.toggleSpellSlot(
-          slot.getAttribute("data-slot-char"),
+          slotCharId,
           Number(slot.getAttribute("data-slot-idx")),
           e.shiftKey ? -1 : 1
         );
+        const curMyId = String(store.state.myCharacterId || store.state.party[0]?.id || "");
+        if (String(slotCharId) === curMyId) {
+          scheduleLiveIdeasRefresh();
+        }
       }
     });
 
@@ -1978,6 +2390,7 @@
         driveArchiveStatus = data.status || driveArchiveStatus;
         renderDriveArchiveSection();
         renderCenterFocus(store.state);
+        loadDriveMysteries();
         refreshLiveIdeasSilently();
         showToast(
           `Synced ${driveArchiveStatus?.cachedTranscriptCount || 0} Drive transcript(s) & ${
@@ -2091,10 +2504,157 @@
         box.innerHTML = `<p class="muted-p">Search failed: ${escapeHtml(err.message || err)}</p>`;
       }
     });
+
+    // Fast Play Modal Controls
+    async function openFastPlayModal() {
+      el("fastPlayModal")?.classList.remove("hidden");
+      const sel = el("fastPlayDriveSelect");
+      const btnDrive = el("btnFastPlayDrive");
+      if (!sel) return;
+      if (!bridge.isLocalServerContext()) {
+        sel.innerHTML = `<option value="">Launch start-windows / start-mac to replay Drive episodes</option>`;
+        if (btnDrive) btnDrive.disabled = true;
+        return;
+      }
+      if (btnDrive) btnDrive.disabled = false;
+      sel.innerHTML = `<option value="">Loading synced Drive transcripts...</option>`;
+      try {
+        const resp = await fetch(`/api/campaign-memory/transcripts?_t=${Date.now()}`, {
+          cache: "no-store"
+        });
+        const data = await resp.json();
+        const list = Array.isArray(data?.transcripts) ? data.transcripts : [];
+        if (list.length === 0) {
+          sel.innerHTML = `<option value="">No Drive transcripts synced yet (sync in 💾 Saved)</option>`;
+          if (btnDrive) btnDrive.disabled = true;
+        } else {
+          sel.innerHTML = list
+            .map((t) => {
+              const kb = Math.max(1, Math.round((t.charCount || 0) / 1024));
+              return `<option value="${escapeHtml(t.id)}">${escapeHtml(t.name)} (~${kb} KB)</option>`;
+            })
+            .join("");
+        }
+      } catch (err) {
+        sel.innerHTML = `<option value="">Could not load Drive transcripts (${escapeHtml(
+          err.message || err
+        )})</option>`;
+      }
+    }
+
+    async function runFastPlay(title, rawText) {
+      if (isFastPlaying) return;
+      isFastPlaying = true;
+      fastPlayCancelled = false;
+
+      const progBox = el("fastPlayProgressBox");
+      const progTxt = el("fastPlayProgressText");
+      const progFill = el("fastPlayProgressFill");
+      const btnDrive = el("btnFastPlayDrive");
+      const btnPaste = el("btnFastPlayPaste");
+      const btnUpload = el("btnUploadFastPlayFile");
+      if (progBox) progBox.classList.remove("hidden");
+      if (progFill) progFill.style.width = "6%";
+      if (progTxt) progTxt.textContent = `Fast playing ${title}...`;
+      if (btnDrive) btnDrive.disabled = true;
+      if (btnPaste) btnPaste.disabled = true;
+      if (btnUpload) btnUpload.disabled = true;
+
+      try {
+        const result = await gemini.fastPlayTranscript(store, rawText, {
+          title,
+          acts: 5,
+          resetFirst: true,
+          shouldCancel: () => fastPlayCancelled,
+          onProgress: (p) => {
+            const total = Math.max(1, Number(p.totalActs) || 5);
+            let pct = Math.min(82, Math.round((Number(p.act || 0) / total) * 80));
+            if (p.phase === "advisor") pct = 88;
+            if (p.phase === "puzzle") pct = 93;
+            if (p.phase === "summary") pct = 97;
+            if (progFill) progFill.style.width = `${Math.max(8, pct)}%`;
+            if (progTxt) {
+              progTxt.textContent =
+                p.phase === "act"
+                  ? `Playing Act ${p.act}/${total}: ${String(p.headline || "").slice(0, 70)}`
+                  : String(p.headline || "Finalizing dashboard...");
+            }
+          }
+        });
+        if (fastPlayCancelled) {
+          showToast("Fast Play canceled.");
+        } else {
+          if (progFill) progFill.style.width = "100%";
+          el("fastPlayModal")?.classList.add("hidden");
+          loadDriveMysteries();
+          showToast(
+            `Fast played ${result.title} (${result.totalLines} lines across ${result.actsProcessed} acts)!`
+          );
+        }
+      } catch (err) {
+        showToast(`Fast Play failed: ${err.message || err}`, true);
+      } finally {
+        isFastPlaying = false;
+        if (btnDrive) btnDrive.disabled = false;
+        if (btnPaste) btnPaste.disabled = false;
+        if (btnUpload) btnUpload.disabled = false;
+      }
+    }
+
+    el("btnOpenFastPlay")?.addEventListener("click", openFastPlayModal);
+    el("btnCancelFastPlay")?.addEventListener("click", () => {
+      fastPlayCancelled = true;
+    });
+
+    el("btnFastPlayDrive")?.addEventListener("click", async () => {
+      const selId = el("fastPlayDriveSelect")?.value;
+      if (!selId) {
+        showToast("Choose a Drive transcript first.", true);
+        return;
+      }
+      try {
+        const resp = await fetch(
+          `/api/campaign-memory/transcript/${encodeURIComponent(selId)}?_t=${Date.now()}`,
+          { cache: "no-store" }
+        );
+        const data = await resp.json();
+        if (!resp.ok || !data?.text) {
+          throw new Error(data?.error || `HTTP ${resp.status}`);
+        }
+        await runFastPlay(data.name || "Drive Episode", data.text);
+      } catch (err) {
+        showToast(err.message || String(err), true);
+      }
+    });
+
+    const fpInput = el("fastPlayFileInput");
+    el("btnUploadFastPlayFile")?.addEventListener("click", () => fpInput?.click());
+    fpInput?.addEventListener("change", async () => {
+      const f = fpInput.files?.[0];
+      fpInput.value = "";
+      if (!f) return;
+      const text = await f.text();
+      await runFastPlay(f.name, text);
+    });
+
+    el("btnFastPlayPaste")?.addEventListener("click", async () => {
+      const raw = (el("fastPlayPasteInput")?.value || "").trim();
+      if (!raw) {
+        showToast("Paste a transcript first.", true);
+        return;
+      }
+      await runFastPlay("Pasted Transcript", raw);
+    });
+
+    initColumnResizers();
+    if (bridge.isLocalServerContext()) {
+      setInterval(() => refreshDriveArchiveStatus(true), 5 * 60 * 1000);
+    }
   }
 
   store.subscribe(renderAll);
   wireEvents();
   renderAll(store.state, store.settings);
   refreshDriveArchiveStatus(true);
+  loadDriveMysteries();
 })(window);
