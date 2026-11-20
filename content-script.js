@@ -19,12 +19,11 @@
   let hasBaselineGameLog = false;
   let lastSnapshotHash = "";
   let rollContext = { myChar: null, party: [] };
-  let coachCategory = "spells";
-  let coachSelectedId = "";
-  const coachToggleMap = new Map();
-  let coachLastResult = null;
+  let coachFilterQuery = "";
   let coachDrawerOpen = false;
   let coachToastTimer = null;
+  let suppressClickCoachUntil = 0;
+  let activeCoachState = null;
 
   function isElementVisible(el) {
     if (!el) return false;
@@ -375,7 +374,112 @@
     };
   }
 
-  function showRollCoachToast(title, bullets = [], sayScript = "") {
+  function normalizeRollLookupName(raw) {
+    return String(raw || "")
+      .replace(/['’`]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  function findVisibleNativeDdbRollButton(rollSpec, part = "tohit") {
+    if (!rollSpec || !document.body) return null;
+
+    if (rollSpec.kind === "save" && rollSpec.ability) {
+      const row = document.querySelector(`.ddbc-saving-throws-summary__ability--${rollSpec.ability}`);
+      const btn = row?.querySelector("button.integrated-dice__container");
+      if (btn && isElementVisible(btn)) return btn;
+    }
+
+    if (rollSpec.kind === "initiative") {
+      const initLbl = document.querySelector("[data-testid='combat-initiative-label']");
+      const box = initLbl?.closest("[class*='box']") || initLbl?.parentElement;
+      const btn = box?.querySelector("button.integrated-dice__container");
+      if (btn && isElementVisible(btn)) return btn;
+    }
+
+    if (rollSpec.kind === "skill") {
+      const targetNorm = normalizeRollLookupName(rollSpec.name);
+      const rows = document.querySelectorAll(".ct-skills__item");
+      for (const row of rows) {
+        if (!isElementVisible(row)) continue;
+        const skillName = normalizeRollLookupName(
+          row.querySelector(".ct-skills__col--skill")?.textContent
+        );
+        if (skillName === targetNorm) {
+          const btn = row.querySelector(".ct-skills__col--modifier button.integrated-dice__container");
+          if (btn && isElementVisible(btn)) return btn;
+        }
+      }
+    }
+
+    if (rollSpec.isSpell || rollSpec.kind === "weapon_attack" || rollSpec.kind === "spell_attack" || rollSpec.kind === "spell_save" || rollSpec.kind === "spell_check") {
+      const targetNorm = normalizeRollLookupName(rollSpec.name);
+      const attackRows = document.querySelectorAll(".ddbc-combat-attack");
+      for (const row of attackRows) {
+        if (!isElementVisible(row)) continue;
+        const rowName = normalizeRollLookupName(
+          row.querySelector(".styles_spellName__wX3ll, .ddbc-combat-attack__label, .ddbc-combat-attack__name")?.textContent
+        );
+        if (rowName && (rowName === targetNorm || rowName.includes(targetNorm) || targetNorm.includes(rowName))) {
+          const dmgBtn = row.querySelector(".ddbc-combat-attack__damage button.integrated-dice__container");
+          const hitBtn = row.querySelector(".ddbc-combat-attack__tohit button.integrated-dice__container");
+          const picked = part === "damage" ? dmgBtn || hitBtn : hitBtn || dmgBtn;
+          if (picked && isElementVisible(picked)) return picked;
+        }
+      }
+
+      const spellRows = document.querySelectorAll(".ct-spells-spell");
+      for (const row of spellRows) {
+        if (!isElementVisible(row)) continue;
+        const rowName = normalizeRollLookupName(
+          row.querySelector(".styles_spellName__wX3ll, .ct-spells-spell__label, .ct-spells-spell__name")?.textContent
+        );
+        if (rowName && (rowName === targetNorm || rowName.includes(targetNorm) || targetNorm.includes(rowName))) {
+          const dmgBtn = row.querySelector(".ct-spells-spell__damage button.integrated-dice__container");
+          const hitBtn = row.querySelector(".ct-spells-spell__tohit button.integrated-dice__container");
+          const picked = part === "damage" ? dmgBtn || hitBtn : hitBtn || dmgBtn;
+          if (picked && isElementVisible(picked)) return picked;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  async function triggerNativeDdbRoll(rollSpec, part = "tohit") {
+    let btn = findVisibleNativeDdbRollButton(rollSpec, part);
+    if (!btn && (rollSpec.isSpell || rollSpec.kind === "weapon_attack" || rollSpec.kind === "spell_attack" || rollSpec.kind === "spell_save")) {
+      const desiredTestId = rollSpec.isSpell ? "SPELLS" : "ACTIONS";
+      let tabBtn = document.querySelector(`button[data-testid='${desiredTestId}']`);
+      if (tabBtn && tabBtn.getAttribute("aria-checked") !== "true") {
+        tabBtn.click();
+        await new Promise((r) => setTimeout(r, 170));
+        btn = findVisibleNativeDdbRollButton(rollSpec, part);
+      }
+      if (!btn && rollSpec.isSpell) {
+        tabBtn = document.querySelector("button[data-testid='ACTIONS']");
+        if (tabBtn && tabBtn.getAttribute("aria-checked") !== "true") {
+          tabBtn.click();
+          await new Promise((r) => setTimeout(r, 170));
+          btn = findVisibleNativeDdbRollButton(rollSpec, part);
+        }
+      }
+    }
+
+    if (!btn) return { triggered: false };
+    suppressClickCoachUntil = Date.now() + 300;
+    btn.click();
+    return { triggered: true, part };
+  }
+
+  function renderRollCoachToast() {
+    const st = activeCoachState;
+    if (!st) {
+      document.getElementById("dnd-copilot-roll-toast")?.remove();
+      return;
+    }
+
     let card = document.getElementById("dnd-copilot-roll-toast");
     if (!card) {
       card = document.createElement("div");
@@ -385,7 +489,7 @@
         bottom: "64px",
         right: "16px",
         zIndex: "2147483646",
-        width: "375px",
+        width: "390px",
         maxWidth: "calc(100vw - 32px)",
         background: "#171d2b",
         border: "1.5px solid #f0c46c",
@@ -395,7 +499,7 @@
         fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
         fontSize: "13.5px",
         lineHeight: "1.45",
-        boxShadow: "0 14px 36px rgba(0,0,0,0.72)"
+        boxShadow: "0 14px 36px rgba(0,0,0,0.75)"
       });
       document.body.appendChild(card);
     }
@@ -412,12 +516,18 @@
     const titleEl = document.createElement("strong");
     titleEl.style.color = "#f0c46c";
     titleEl.style.flex = "1";
-    titleEl.textContent = `🎲 ${title || "Full Potential Coach"}`;
+    const totalSuffix =
+      st.rolledTotal != null
+        ? st.appliedAddonBonus
+          ? ` (${st.rolledTotal} → ${st.rolledTotal + st.appliedAddonBonus})`
+          : ` (Rolled ${st.rolledTotal})`
+        : "";
+    titleEl.textContent = `🎲 ${st.title}${totalSuffix}`;
 
     const actionBtns = document.createElement("div");
     Object.assign(actionBtns.style, { display: "flex", alignItems: "center", gap: "4px" });
 
-    if (sayScript) {
+    if (st.sayScript) {
       const copyBtn = document.createElement("button");
       copyBtn.type = "button";
       copyBtn.textContent = "📋";
@@ -432,7 +542,7 @@
         padding: "2px 6px"
       });
       copyBtn.addEventListener("click", () => {
-        navigator.clipboard?.writeText(sayScript).catch(() => {});
+        navigator.clipboard?.writeText(st.sayScript).catch(() => {});
         copyBtn.textContent = "✓";
         setTimeout(() => {
           copyBtn.textContent = "📋";
@@ -444,7 +554,7 @@
     const openDrawerBtn = document.createElement("button");
     openDrawerBtn.type = "button";
     openDrawerBtn.textContent = "🎲";
-    openDrawerBtn.title = "Open Roll Coach drawer";
+    openDrawerBtn.title = "Open 1-Click Quick Roll bar";
     Object.assign(openDrawerBtn.style, {
       background: "#1f273a",
       border: "1px solid #2c3752",
@@ -469,12 +579,15 @@
       cursor: "pointer",
       fontSize: "15px"
     });
-    closeBtn.addEventListener("click", () => card.remove());
+    closeBtn.addEventListener("click", () => {
+      activeCoachState = null;
+      card.remove();
+    });
     actionBtns.append(openDrawerBtn, closeBtn);
     header.append(titleEl, actionBtns);
     card.appendChild(header);
 
-    if (sayScript) {
+    if (st.sayScript) {
       const sayBox = document.createElement("div");
       Object.assign(sayBox.style, {
         padding: "7px 10px",
@@ -482,16 +595,16 @@
         borderRadius: "0 8px 8px 0",
         background: "rgba(240, 196, 108, 0.13)",
         color: "#fef3c7",
-        marginBottom: bullets.length ? "6px" : "0"
+        marginBottom: "6px"
       });
-      sayBox.textContent = `🗣️ Say: “${sayScript}”`;
+      sayBox.textContent = `🗣️ Say: “${st.sayScript}”`;
       card.appendChild(sayBox);
     }
 
-    if (bullets.length > 0) {
+    if (st.bullets && st.bullets.length > 0) {
       const ul = document.createElement("ul");
-      Object.assign(ul.style, { margin: "4px 0 0 16px", padding: "0", color: "#cbd5e8" });
-      for (const b of bullets.slice(0, 4)) {
+      Object.assign(ul.style, { margin: "4px 0 6px 16px", padding: "0", color: "#cbd5e8" });
+      for (const b of st.bullets.slice(0, 4)) {
         const li = document.createElement("li");
         li.textContent = b;
         ul.appendChild(li);
@@ -499,10 +612,160 @@
       card.appendChild(ul);
     }
 
+    // 1-click VTT follow-ups & situational bonus math right inside the popup
+    const followRow = document.createElement("div");
+    Object.assign(followRow.style, {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: "6px",
+      marginTop: "4px"
+    });
+
+    const rm = window.DnDCopilot?.RollMaximizer;
+    if (st.matchedSpec && st.part !== "damage" && (st.matchedSpec.damageFormula || st.matchedSpec.kind === "spell_attack" || st.matchedSpec.kind === "weapon_attack")) {
+      const dmgFollowBtn = document.createElement("button");
+      dmgFollowBtn.type = "button";
+      dmgFollowBtn.textContent = `💥 Roll ${st.matchedSpec.damageFormula || "Damage"} → VTT`;
+      Object.assign(dmgFollowBtn.style, {
+        padding: "4px 9px",
+        borderRadius: "6px",
+        border: "1px solid #3ecf8e",
+        background: "rgba(62, 207, 142, 0.16)",
+        color: "#6ee7b7",
+        fontSize: "12px",
+        fontWeight: "700",
+        cursor: "pointer"
+      });
+      dmgFollowBtn.addEventListener("click", async () => {
+        const res = await triggerNativeDdbRoll(st.matchedSpec, "damage");
+        if (res.triggered) {
+          showAnalyzedRollCoach(st.matchedSpec, "damage", null);
+        }
+      });
+      followRow.appendChild(dmgFollowBtn);
+    }
+
+    if (st.matchedSpec && st.part !== "damage" && st.matchedSpec.kind !== "spell_save" && st.matchedSpec.kind !== "item_save") {
+      const advBtn = document.createElement("button");
+      advBtn.type = "button";
+      advBtn.textContent = st.hasAdvantageFeature ? "⚡ Roll 2nd d20 (Adv) → VTT" : "⚡ 2nd d20 → VTT";
+      Object.assign(advBtn.style, {
+        padding: "4px 9px",
+        borderRadius: "6px",
+        border: "1px solid #5b8af5",
+        background: "rgba(91, 138, 245, 0.18)",
+        color: "#bfdbfe",
+        fontSize: "12px",
+        fontWeight: "700",
+        cursor: "pointer"
+      });
+      advBtn.addEventListener("click", async () => {
+        await triggerNativeDdbRoll(st.matchedSpec, "tohit");
+      });
+      followRow.appendChild(advBtn);
+    }
+
+    for (const addon of st.addons || []) {
+      const applied = st.appliedAddonIds?.has(addon.id);
+      const aBtn = document.createElement("button");
+      aBtn.type = "button";
+      aBtn.textContent = applied ? `✓ ${addon.shortLabel}` : `+ ${addon.shortLabel}`;
+      Object.assign(aBtn.style, {
+        padding: "4px 8px",
+        borderRadius: "6px",
+        border: applied ? "1px solid #f0c46c" : "1px solid #2c3752",
+        background: applied ? "rgba(240, 196, 108, 0.22)" : "#1f273a",
+        color: applied ? "#fde68a" : "#cbd5e8",
+        fontSize: "12px",
+        fontWeight: "600",
+        cursor: "pointer"
+      });
+      aBtn.addEventListener("click", () => {
+        if (!st.appliedAddonIds) st.appliedAddonIds = new Set();
+        if (st.appliedAddonIds.has(addon.id)) {
+          st.appliedAddonIds.delete(addon.id);
+        } else {
+          let val = Number(addon.flatBonus || 0);
+          if (addon.diceBonus && rm?.rollDiceExpression) {
+            val += rm.rollDiceExpression(addon.diceBonus).total;
+          }
+          addon.rolledValue = val;
+          st.appliedAddonIds.add(addon.id);
+        }
+        st.appliedAddonBonus = (st.addons || [])
+          .filter((a) => st.appliedAddonIds.has(a.id))
+          .reduce((sum, a) => sum + Number(a.rolledValue || 0), 0);
+        renderRollCoachToast();
+      });
+      followRow.appendChild(aBtn);
+    }
+
+    if (followRow.children.length > 0) {
+      card.appendChild(followRow);
+    }
+
     if (coachToastTimer) clearTimeout(coachToastTimer);
     coachToastTimer = setTimeout(() => {
+      activeCoachState = null;
       document.getElementById("dnd-copilot-roll-toast")?.remove();
-    }, 18000);
+    }, 20000);
+  }
+
+  function showAnalyzedRollCoach(matchedSpec, part = "tohit", rolledTotal = null, rawActionLabel = "") {
+    const rm = window.DnDCopilot?.RollMaximizer;
+    const myChar = rollContext?.myChar;
+    if (!rm || !myChar || !matchedSpec) return;
+
+    const analysis = rm.analyzeRollPotential(matchedSpec, myChar, rollContext.party || []);
+    const activeMods = (analysis.modifiers || []).filter((m) => m.sayThis || m.flatBonus || m.diceBonus || m.grantsAdvantage || m.minDieValue);
+    const sayLines = activeMods
+      .filter((m) => m.defaultOn || m.flatBonus || m.diceBonus || m.id === "gnome_cunning")
+      .map((m) => m.sayThis)
+      .filter(Boolean)
+      .slice(0, 3);
+    const bullets = activeMods.slice(0, 4).map((m) => {
+      const note = m.flatBonus && rolledTotal != null ? `${rolledTotal} → ${rolledTotal + m.flatBonus} (${m.badge})` : m.badge;
+      return `${m.title}${note ? ` — ${note}` : ""}`;
+    });
+
+    const addons = activeMods
+      .filter((m) => m.flatBonus || m.diceBonus)
+      .map((m) => ({
+        id: m.id,
+        shortLabel: m.badge || m.title.slice(0, 18),
+        flatBonus: m.flatBonus || 0,
+        diceBonus: m.diceBonus || ""
+      }));
+
+    activeCoachState = {
+      matchedSpec,
+      part,
+      rolledTotal,
+      title: `${myChar.name} · ${matchedSpec.name || rawActionLabel || "Roll"}${part === "damage" ? " Damage" : ""}`,
+      sayScript: sayLines.join(" "),
+      bullets,
+      hasAdvantageFeature: activeMods.some((m) => m.grantsAdvantage),
+      addons,
+      appliedAddonIds: new Set(),
+      appliedAddonBonus: 0
+    };
+    renderRollCoachToast();
+  }
+
+  function showRollCoachToast(title, bullets = [], sayScript = "") {
+    activeCoachState = {
+      matchedSpec: null,
+      part: "tohit",
+      rolledTotal: null,
+      title: title || "Full Potential Coach",
+      sayScript,
+      bullets,
+      hasAdvantageFeature: false,
+      addons: [],
+      appliedAddonIds: new Set(),
+      appliedAddonBonus: 0
+    };
+    renderRollCoachToast();
   }
 
   function coachNewAboveVttRolls(newRolls) {
@@ -519,14 +782,25 @@
         continue;
       }
       const res = rm.analyzeAboveVttRoll(roll, myChar, rollContext.party || []);
-      if (!res || res.reminders.length === 0) continue;
-      const sayLines = res.reminders.map((r) => r.sayThis).filter(Boolean).slice(0, 3);
-      const bullets = res.reminders.slice(0, 4).map((r) => `${r.title}${r.extraNote ? ` (${r.extraNote})` : ""}`);
-      showRollCoachToast(
-        `${myChar.name} · ${roll.action}${roll.total != null ? ` (${roll.total})` : ""}`,
-        bullets,
-        sayLines.join(" ")
-      );
+      if (!res) continue;
+
+      const part = roll.kind === "damage" ? "damage" : "tohit";
+      if (
+        activeCoachState &&
+        activeCoachState.matchedSpec?.id === res.matchedSpec?.id &&
+        Date.now() - (activeCoachState.updatedAt || 0) < 4000 &&
+        roll.total != null
+      ) {
+        activeCoachState.rolledTotal = roll.total;
+        activeCoachState.updatedAt = Date.now();
+        renderRollCoachToast();
+        continue;
+      }
+
+      if (res.matchedSpec) {
+        showAnalyzedRollCoach(res.matchedSpec, part, roll.total, roll.action);
+        if (activeCoachState) activeCoachState.updatedAt = Date.now();
+      }
     }
   }
 
@@ -543,12 +817,40 @@
         )
       );
     }
-    // Inside AboveVTT character-sheet iframe
     return (
       /\/characters\/\d+/i.test(window.location.pathname) ||
       /abovevtt=true/i.test(window.location.search) ||
       Boolean(document.querySelector(".ct-character-sheet"))
     );
+  }
+
+  function makeQuickChipBtn(label, sub, isAccent = false) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    Object.assign(btn.style, {
+      padding: "5px 8px",
+      borderRadius: "7px",
+      border: isAccent ? "1px solid #3ecf8e" : "1px solid #2c3752",
+      background: isAccent ? "rgba(62, 207, 142, 0.14)" : "#1f273a",
+      color: isAccent ? "#6ee7b7" : "#f3f6fc",
+      fontSize: "12.5px",
+      fontWeight: "600",
+      cursor: "pointer",
+      display: "inline-flex",
+      alignItems: "center",
+      gap: "4px",
+      textAlign: "left"
+    });
+    const t = document.createElement("span");
+    t.textContent = label;
+    btn.appendChild(t);
+    if (sub) {
+      const s = document.createElement("span");
+      s.style.cssText = "color:#f0c46c;font-weight:700;font-size:12px;";
+      s.textContent = sub;
+      btn.appendChild(s);
+    }
+    return btn;
   }
 
   function renderFloatingRollDrawer() {
@@ -558,7 +860,7 @@
       pill = document.createElement("button");
       pill.id = "dnd-copilot-roll-pill";
       pill.type = "button";
-      pill.textContent = "🎲 Roll Coach";
+      pill.textContent = "🎲 Quick Roll";
       Object.assign(pill.style, {
         position: "fixed",
         bottom: "16px",
@@ -596,19 +898,19 @@
         bottom: "62px",
         right: "16px",
         zIndex: "2147483647",
-        width: "380px",
+        width: "400px",
         maxWidth: "calc(100vw - 32px)",
-        maxHeight: "75vh",
+        maxHeight: "74vh",
         overflowY: "auto",
         background: "#131824",
-        border: "1.5px solid #2c3752",
+        border: "1.5px solid #f0c46c",
         borderRadius: "12px",
-        padding: "12px 14px",
+        padding: "11px 13px",
         color: "#f3f6fc",
         fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
-        fontSize: "13.5px",
-        lineHeight: "1.45",
-        boxShadow: "0 16px 42px rgba(0,0,0,0.78)"
+        fontSize: "13px",
+        lineHeight: "1.4",
+        boxShadow: "0 16px 42px rgba(0,0,0,0.8)"
       });
       document.body.appendChild(drawer);
     }
@@ -625,11 +927,12 @@
       display: "flex",
       alignItems: "center",
       justifyContent: "space-between",
+      gap: "8px",
       marginBottom: "8px"
     });
     const hTitle = document.createElement("strong");
     hTitle.style.color = "#f0c46c";
-    hTitle.textContent = myChar ? `🎲 ${myChar.name} (${myChar.classSummary})` : "🎲 Roll Coach";
+    hTitle.textContent = myChar ? `🎲 1-Click Roll → VTT (${myChar.name})` : "🎲 1-Click Roll";
     const hClose = document.createElement("button");
     hClose.type = "button";
     hClose.textContent = "✕";
@@ -650,203 +953,149 @@
     if (!rm || !myChar) {
       const msg = document.createElement("div");
       msg.style.color = "#cbd5e8";
-      msg.textContent = "Open D&D Copilot dashboard once to sync your party character sheet into AboveVTT.";
+      msg.textContent = "Open your character sheet or http://localhost:8765 once to sync your sheet.";
       drawer.appendChild(msg);
       return;
     }
 
-    const tabs = document.createElement("div");
-    Object.assign(tabs.style, { display: "flex", gap: "6px", marginBottom: "8px" });
-    for (const [key, lbl] of [["spells", "✨ Spells/Atk"], ["saves", "🛡️ Saves"], ["skills", "🔎 Skills"]]) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.textContent = lbl;
-      Object.assign(b.style, {
-        flex: "1",
-        padding: "5px 6px",
-        borderRadius: "7px",
-        border: "1px solid #2c3752",
-        background: coachCategory === key ? "#5b8af5" : "#1f273a",
-        color: "#ffffff",
-        fontSize: "12.5px",
-        fontWeight: "600",
-        cursor: "pointer"
-      });
-      b.addEventListener("click", () => {
-        coachCategory = key;
-        coachSelectedId = "";
-        coachLastResult = null;
-        renderFloatingRollDrawer();
-      });
-      tabs.appendChild(b);
-    }
-    drawer.appendChild(tabs);
-
-    const catalog = rm.getRollCatalog(myChar, party);
-    const items =
-      coachCategory === "saves"
-        ? catalog.saves
-        : coachCategory === "skills"
-        ? catalog.skills
-        : catalog.spellsAndAttacks;
-
-    if (!items.some((i) => i.id === coachSelectedId)) {
-      coachSelectedId = items[0]?.id || "";
-    }
-
-    const sel = document.createElement("select");
-    Object.assign(sel.style, {
+    const searchInp = document.createElement("input");
+    searchInp.type = "text";
+    searchInp.placeholder = "Filter any spell, save, or skill (1 click rolls to VTT)...";
+    searchInp.value = coachFilterQuery;
+    Object.assign(searchInp.style, {
       width: "100%",
-      padding: "7px 9px",
+      boxSizing: "border-box",
+      padding: "6px 9px",
       borderRadius: "7px",
       border: "1px solid #2c3752",
-      background: "#1f273a",
+      background: "#1b2232",
       color: "#f3f6fc",
       marginBottom: "8px",
-      fontSize: "13px"
+      fontSize: "12.5px"
     });
-    for (const it of items) {
-      const opt = document.createElement("option");
-      opt.value = it.id;
-      opt.textContent = `${it.name} (${it.subLabel || ""})`;
-      opt.selected = it.id === coachSelectedId;
-      sel.appendChild(opt);
-    }
-    sel.addEventListener("change", () => {
-      coachSelectedId = sel.value;
-      coachLastResult = null;
+    searchInp.addEventListener("input", () => {
+      coachFilterQuery = searchInp.value;
       renderFloatingRollDrawer();
+      const reopenedInp = document.querySelector("#dnd-copilot-roll-drawer input[type='text']");
+      reopenedInp?.focus();
     });
-    drawer.appendChild(sel);
+    drawer.appendChild(searchInp);
 
-    const picked = items.find((i) => i.id === coachSelectedId);
-    if (!picked) return;
+    const catalog = rm.getRollCatalog(myChar, party);
+    const q = coachFilterQuery.trim().toLowerCase();
 
-    const analysis = rm.analyzeRollPotential(picked, myChar, party);
-    if (!coachToggleMap.has(picked.id)) {
-      coachToggleMap.set(
-        picked.id,
-        new Set(analysis.modifiers.filter((m) => m.defaultOn).map((m) => m.id))
-      );
-    }
-    const activeSet = coachToggleMap.get(picked.id);
-
-    const listWrap = document.createElement("div");
-    Object.assign(listWrap.style, { display: "flex", flexDirection: "column", gap: "5px", marginBottom: "9px" });
-    for (const mod of analysis.modifiers) {
-      const row = document.createElement("label");
-      Object.assign(row.style, {
-        display: "flex",
-        gap: "7px",
-        alignItems: "flex-start",
-        padding: "6px 8px",
-        borderRadius: "7px",
-        background: "#1f273a",
-        border: "1px solid #2c3752",
-        cursor: "pointer"
-      });
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.checked = activeSet.has(mod.id);
-      cb.style.marginTop = "3px";
-      cb.addEventListener("change", () => {
-        if (cb.checked) activeSet.add(mod.id);
-        else activeSet.delete(mod.id);
-      });
-      const txtWrap = document.createElement("div");
-      const topLine = document.createElement("div");
-      topLine.style.fontWeight = "600";
-      topLine.textContent = `${mod.title}${mod.badge ? ` [${mod.badge}]` : ""}`;
-      txtWrap.appendChild(topLine);
-      if (mod.sayThis) {
-        const sub = document.createElement("div");
-        sub.style.cssText = "font-size:12px;color:#cbd5e8;";
-        sub.textContent = `💬 ${mod.sayThis}`;
-        txtWrap.appendChild(sub);
+    const triggerQuickItem = async (spec, part = "tohit") => {
+      coachDrawerOpen = false;
+      renderFloatingRollDrawer();
+      const vttRes = await triggerNativeDdbRoll(spec, part);
+      if (vttRes.triggered) {
+        showAnalyzedRollCoach(spec, part, null);
+        if (activeCoachState) activeCoachState.updatedAt = Date.now();
+        return;
       }
-      row.append(cb, txtWrap);
-      listWrap.appendChild(row);
-    }
-    drawer.appendChild(listWrap);
-
-    const actRow = document.createElement("div");
-    Object.assign(actRow.style, { display: "flex", gap: "7px", marginBottom: "8px" });
-    const runDrawerRoll = (forceAdv) => {
-      const res = rm.executeRoll(picked, myChar, party, { activeToggleIds: activeSet, forceAdvantage: forceAdv });
-      coachLastResult = res;
-      const primaryTotal = res.d20Result ? res.d20Result.total : res.damageResult ? res.damageResult.total : null;
+      // Fallback for items with no native DDB button (e.g. Necklace of Fireballs)
+      const fallbackRoll = rm.executeRoll(spec, myChar, party);
+      const rolledNum = fallbackRoll.d20Result
+        ? fallbackRoll.d20Result.total
+        : fallbackRoll.damageResult
+        ? fallbackRoll.damageResult.total
+        : null;
+      showRollCoachToast(
+        `${myChar.name} · ${spec.name}${rolledNum != null ? ` (${rolledNum})` : ""}`,
+        fallbackRoll.activeMods.slice(0, 3).map((m) => `${m.title}${m.badge ? ` — ${m.badge}` : ""}`),
+        fallbackRoll.sayAloudScript
+      );
       chrome.runtime
         .sendMessage({
           type: "GAMELOG_ROLLS",
           rolls: [
             {
-              fingerprint: `avtt-coach-${Date.now()}-${picked.id}`,
+              fingerprint: `avtt-quick-${Date.now()}-${spec.id}`,
               timestamp: Date.now(),
               actor: myChar.name,
-              action: picked.name,
-              kind: picked.kind === "save" ? "save" : picked.kind === "initiative" ? "initiative" : "attack",
-              total: primaryTotal,
-              formula: picked.damageFormula || "",
-              isCrit: Boolean(res.d20Result?.isCrit),
-              isFumble: Boolean(res.d20Result?.isFumble),
-              rawText: res.sayAloudScript
+              action: spec.name,
+              kind: spec.kind === "save" ? "save" : "attack",
+              total: rolledNum,
+              formula: spec.damageFormula || "",
+              rawText: fallbackRoll.sayAloudScript
             }
           ]
         })
         .catch(() => {});
-      renderFloatingRollDrawer();
     };
 
-    const btnRoll = document.createElement("button");
-    btnRoll.type = "button";
-    btnRoll.textContent = "🎲 Roll Now";
-    Object.assign(btnRoll.style, {
-      flex: "1",
-      padding: "7px 10px",
-      borderRadius: "7px",
-      border: "none",
-      background: "#f0c46c",
-      color: "#111622",
-      fontWeight: "700",
-      cursor: "pointer"
-    });
-    btnRoll.addEventListener("click", () => runDrawerRoll(false));
+    const addSectionLabel = (txt) => {
+      const lbl = document.createElement("div");
+      lbl.textContent = txt;
+      lbl.style.cssText = "font-size:11.5px;font-weight:700;color:#8b9bb8;text-transform:uppercase;letter-spacing:0.04em;margin:6px 0 4px;";
+      drawer.appendChild(lbl);
+    };
 
-    const btnAdv = document.createElement("button");
-    btnAdv.type = "button";
-    btnAdv.textContent = "⚡ Advantage";
-    Object.assign(btnAdv.style, {
-      padding: "7px 10px",
-      borderRadius: "7px",
-      border: "1px solid #2c3752",
-      background: "#1f273a",
-      color: "#f3f6fc",
-      fontWeight: "600",
-      cursor: "pointer"
-    });
-    btnAdv.addEventListener("click", () => runDrawerRoll(true));
-    actRow.append(btnRoll, btnAdv);
-    drawer.appendChild(actRow);
+    // 1. Spells & Attacks (1-click direct + optional damage pill right beside it!)
+    const combatItems = (catalog.spellsAndAttacks || []).filter((s) =>
+      !q || `${s.name} ${s.subLabel}`.toLowerCase().includes(q)
+    );
+    if (combatItems.length > 0) {
+      addSectionLabel("✨ Spells & Attacks (Rolls into VTT Log)");
+      const grid = document.createElement("div");
+      Object.assign(grid.style, { display: "flex", flexWrap: "wrap", gap: "5px" });
+      for (const sp of (q ? combatItems : combatItems.slice(0, 8))) {
+        const wrap = document.createElement("div");
+        Object.assign(wrap.style, { display: "inline-flex", gap: "2px" });
+        const mainSub =
+          sp.kind === "spell_attack" || sp.kind === "weapon_attack" || sp.kind === "spell_check"
+            ? `+${Number(sp.attackBonus || 0)}`
+            : sp.damageFormula || (sp.saveDc ? `DC ${sp.saveDc}` : "");
+        const mainPart = sp.kind === "spell_save" ? "damage" : "tohit";
+        const bMain = makeQuickChipBtn(sp.name, mainSub);
+        bMain.addEventListener("click", () => triggerQuickItem(sp, mainPart));
+        wrap.appendChild(bMain);
 
-    if (coachLastResult && coachLastResult.rollSpec?.id === picked.id) {
-      const box = document.createElement("div");
-      Object.assign(box.style, {
-        padding: "9px 10px",
-        borderRadius: "8px",
-        background: "rgba(62, 207, 142, 0.12)",
-        border: "1px solid rgba(62, 207, 142, 0.5)"
-      });
-      const resBits = [];
-      if (coachLastResult.d20Result) resBits.push(`Roll: ${coachLastResult.d20Result.total}`);
-      if (coachLastResult.damageResult) resBits.push(`Dmg: ${coachLastResult.damageResult.total}`);
-      const headRes = document.createElement("strong");
-      headRes.style.color = "#f0c46c";
-      headRes.textContent = resBits.join(" · ") || picked.name;
-      const sayEl = document.createElement("div");
-      sayEl.style.cssText = "margin-top:5px;color:#fef3c7;";
-      sayEl.textContent = `🗣️ Say: “${coachLastResult.sayAloudScript}”`;
-      box.append(headRes, sayEl);
-      drawer.appendChild(box);
+        if ((sp.kind === "spell_attack" || sp.kind === "weapon_attack") && sp.damageFormula) {
+          const bDmg = makeQuickChipBtn("", sp.damageFormula, true);
+          bDmg.title = `Roll ${sp.name} damage straight into VTT`;
+          bDmg.addEventListener("click", () => triggerQuickItem(sp, "damage"));
+          wrap.appendChild(bDmg);
+        }
+        grid.appendChild(wrap);
+      }
+      drawer.appendChild(grid);
+    }
+
+    // 2. Saving Throws (1 tight single row)
+    const saveItems = (catalog.saves || []).filter((s) =>
+      s.id !== "save:death" && (!q || `${s.name} ${s.ability}`.toLowerCase().includes(q))
+    );
+    if (saveItems.length > 0) {
+      addSectionLabel("🛡️ Saving Throws");
+      const row = document.createElement("div");
+      Object.assign(row.style, { display: "flex", flexWrap: "wrap", gap: "5px" });
+      for (const sv of saveItems) {
+        const shortNm = sv.isConcentration ? "Conc" : (sv.ability || sv.name).toUpperCase();
+        const b = makeQuickChipBtn(shortNm, sv.subLabel);
+        b.addEventListener("click", () => triggerQuickItem(sv, "tohit"));
+        row.appendChild(b);
+      }
+      drawer.appendChild(row);
+    }
+
+    // 3. Initiative & Skills
+    const allSkills = (catalog.skills || []).filter((sk) =>
+      !q
+        ? sk.kind === "initiative" || sk.tier === "proficiency" || sk.tier === "expertise"
+        : `${sk.name} ${sk.ability}`.toLowerCase().includes(q)
+    );
+    if (allSkills.length > 0) {
+      addSectionLabel("🔎 Init & Skills");
+      const skRow = document.createElement("div");
+      Object.assign(skRow.style, { display: "flex", flexWrap: "wrap", gap: "5px" });
+      for (const sk of (q ? allSkills : allSkills.slice(0, 10))) {
+        const shortMod = sk.subLabel.split("·")[0].trim();
+        const b = makeQuickChipBtn(sk.name === "Initiative" ? "Init" : sk.name, shortMod);
+        b.addEventListener("click", () => triggerQuickItem(sk, "tohit"));
+        skRow.appendChild(b);
+      }
+      drawer.appendChild(skRow);
     }
   }
 
@@ -1027,6 +1276,73 @@
     return false;
   });
 
+  function extractClickedDdbRollInfo(clickable) {
+    const rm = window.DnDCopilot?.RollMaximizer;
+    const myChar = rollContext?.myChar;
+    if (!rm || !myChar || !clickable) return null;
+    const catalog = rm.getRollCatalog(myChar, rollContext.party || []);
+
+    // 1. Saving Throw (.ddbc-saving-throws-summary__ability--wis)
+    const saveRow = clickable.closest(".ddbc-saving-throws-summary__ability");
+    if (saveRow) {
+      const clsMatch = String(saveRow.getAttribute("class") || "").match(/--([a-z]{3})\b/);
+      const abil = clsMatch
+        ? clsMatch[1]
+        : String(saveRow.querySelector("abbr")?.textContent || "").trim().toLowerCase();
+      const matchedSpec = (catalog.saves || []).find((s) => s.id === `save:${abil}`);
+      if (matchedSpec) return { matchedSpec, part: "tohit" };
+    }
+
+    // 2. Skill (.ct-skills__item)
+    const skillRow = clickable.closest(".ct-skills__item");
+    if (skillRow) {
+      const skName = normalizeRollLookupName(
+        skillRow.querySelector(".ct-skills__col--skill")?.textContent
+      );
+      const matchedSpec = (catalog.skills || []).find(
+        (sk) => normalizeRollLookupName(sk.name) === skName
+      );
+      if (matchedSpec) return { matchedSpec, part: "tohit" };
+    }
+
+    // 3. Initiative ([data-testid="combat-initiative-label"])
+    const initBox = clickable.closest("[class*='box']") || clickable.parentElement?.parentElement;
+    if (initBox?.querySelector("[data-testid='combat-initiative-label']")) {
+      const matchedSpec = (catalog.skills || []).find((sk) => sk.id === "skill:initiative");
+      if (matchedSpec) return { matchedSpec, part: "tohit" };
+    }
+
+    // 4. Actions Tab Attack / Spell (.ddbc-combat-attack)
+    const atkRow = clickable.closest(".ddbc-combat-attack");
+    if (atkRow) {
+      const atkName = normalizeRollLookupName(
+        atkRow.querySelector(".styles_spellName__wX3ll, .ddbc-combat-attack__label, .ddbc-combat-attack__name")?.textContent
+      );
+      const part = clickable.closest(".ddbc-combat-attack__damage") ? "damage" : "tohit";
+      const matchedSpec = (catalog.spellsAndAttacks || []).find((sp) => {
+        const spNorm = normalizeRollLookupName(sp.name);
+        return spNorm && (atkName === spNorm || atkName.includes(spNorm) || spNorm.includes(atkName));
+      });
+      if (matchedSpec) return { matchedSpec, part };
+    }
+
+    // 5. Spells Tab Spell (.ct-spells-spell)
+    const spellRow = clickable.closest(".ct-spells-spell");
+    if (spellRow) {
+      const spName = normalizeRollLookupName(
+        spellRow.querySelector(".styles_spellName__wX3ll, .ct-spells-spell__label, .ct-spells-spell__name")?.textContent
+      );
+      const part = clickable.closest(".ct-spells-spell__damage") ? "damage" : "tohit";
+      const matchedSpec = (catalog.spellsAndAttacks || []).find((sp) => {
+        const spNorm = normalizeRollLookupName(sp.name);
+        return spNorm && (spName === spNorm || spName.includes(spNorm) || spNorm.includes(spName));
+      });
+      if (matchedSpec) return { matchedSpec, part };
+    }
+
+    return null;
+  }
+
   function initSheetRollClickListener() {
     if (window.__dndCopilotClickListenerBound) return;
     window.__dndCopilotClickListenerBound = true;
@@ -1034,6 +1350,7 @@
       "click",
       (ev) => {
         try {
+          if (Date.now() < suppressClickCoachUntil) return;
           const target = ev.target;
           if (!target || typeof target.closest !== "function") return;
           if (target.closest("#dnd-copilot-roll-pill, #dnd-copilot-roll-drawer, #dnd-copilot-roll-toast")) return;
@@ -1042,9 +1359,16 @@
           if (!rm || !myChar) return;
 
           const clickable = target.closest(
-            ".integrated-dice__container, [class*='integrated-dice'], [class*='rollable'], [class*='dice-button'], [data-dice-notation], button, [role='button']"
+            "button.integrated-dice__container, .integrated-dice__container, [class*='integrated-dice'], [class*='rollable'], [class*='dice-button'], [data-dice-notation], button, [role='button']"
           );
           if (!clickable) return;
+
+          const exactMatch = extractClickedDdbRollInfo(clickable);
+          if (exactMatch?.matchedSpec) {
+            showAnalyzedRollCoach(exactMatch.matchedSpec, exactMatch.part, null);
+            if (activeCoachState) activeCoachState.updatedAt = Date.now();
+            return;
+          }
 
           const btnText = (clickable.innerText || clickable.textContent || "").replace(/\s+/g, " ").trim();
           const clsAttr = String(clickable.getAttribute("class") || "");
@@ -1054,7 +1378,7 @@
 
           const contextEl =
             clickable.closest(
-              ".ct-spells-spell, [class*='spell'], [class*='attack'], [class*='skill'], [class*='saving-throw'], [class*='initiative'], tr, [role='row'], li"
+              ".ct-spells-spell, .ddbc-combat-attack, .ct-skills__item, .ddbc-saving-throws-summary__ability, [class*='spell'], [class*='attack'], [class*='skill'], [class*='saving-throw'], [class*='initiative'], tr, [role='row'], li"
             ) || clickable.parentElement;
           const ctxText = ((contextEl?.innerText || contextEl?.textContent || btnText) || "")
             .replace(/\s+/g, " ")
@@ -1074,15 +1398,14 @@
             myChar,
             rollContext.party || []
           );
-          if (!analyzed || analyzed.reminders.length === 0) return;
-          const sayLines = analyzed.reminders.map((r) => r.sayThis).filter(Boolean).slice(0, 3);
-          const bullets = analyzed.reminders.slice(0, 4).map((r) => `${r.title}${r.extraNote ? ` (${r.extraNote})` : ""}`);
-          if (sayLines.length > 0 || bullets.length > 0) {
-            showRollCoachToast(
-              `${myChar.name} · ${analyzed.matchedSpec?.name || "Roll"}`,
-              bullets,
-              sayLines.join(" ")
+          if (analyzed?.matchedSpec) {
+            showAnalyzedRollCoach(
+              analyzed.matchedSpec,
+              clickKind === "damage" ? "damage" : "tohit",
+              null,
+              ctxText.slice(0, 48)
             );
+            if (activeCoachState) activeCoachState.updatedAt = Date.now();
           }
         } catch (_) {
           // Never interfere with host DDB click handlers

@@ -87,9 +87,12 @@
     const all = [];
     for (const sourceKey of Object.keys(modGroups)) {
       const arr = modGroups[sourceKey];
+      // D&D Beyond marks Tasha's chosen racial ASI bonuses (race modifiers) as isGranted: false;
+      // only skip ungranted modifiers inside item (unattuned/unequipped items).
+      const allowUngranted = sourceKey !== "item";
       if (Array.isArray(arr)) {
         for (const m of arr) {
-          if (m && m.isGranted !== false) {
+          if (m && (allowUngranted || m.isGranted !== false)) {
             all.push(m);
           }
         }

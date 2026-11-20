@@ -2148,7 +2148,7 @@ test("DDBParser extracts item spell bonuses/saves/traits and RollMaximizer maxim
         { id: 1, value: 8 },
         { id: 2, value: 10 },
         { id: 3, value: 14 },
-        { id: 4, value: 16 },
+        { id: 4, value: 15 },
         { id: 5, value: 15 },
         { id: 6, value: 8 }
       ],
@@ -2167,6 +2167,8 @@ test("DDBParser extracts item spell bonuses/saves/traits and RollMaximizer maxim
       feats: [{ definition: { name: "Elemental Adept (Cold)", snippet: "1s count as 2s and ignore cold resistance." } }],
       modifiers: {
         race: [
+          { type: "bonus", subType: "intelligence-score", value: 2, fixedValue: 2, isGranted: false },
+          { type: "bonus", subType: "wisdom-score", value: 1, fixedValue: 1, isGranted: false },
           { type: "advantage", subType: "intelligence-saving-throws" },
           { type: "advantage", subType: "wisdom-saving-throws" },
           { type: "advantage", subType: "charisma-saving-throws" }
@@ -2176,7 +2178,10 @@ test("DDBParser extracts item spell bonuses/saves/traits and RollMaximizer maxim
           { type: "proficiency", subType: "intelligence-saving-throws" },
           { type: "proficiency", subType: "history" }
         ],
-        item: [{ type: "bonus", subType: "spell-attacks", fixedValue: 3 }]
+        item: [
+          { type: "bonus", subType: "spell-attacks", fixedValue: 3 },
+          { type: "bonus", subType: "spell-attacks", fixedValue: 9, isGranted: false }
+        ]
       },
       inventory: [
         { equipped: true, isAttuned: true, definition: { name: "Wand of the War Mage, +3", magic: true, snippet: "+3 spell attack, ignores half cover" } },
@@ -2231,9 +2236,12 @@ test("DDBParser extracts item spell bonuses/saves/traits and RollMaximizer maxim
   };
 
   const raine = parser.parseCharacterJson(rainePayload);
-  assert.equal(raine.spellAttackBonus, 9); // prof(3) + INT(3) + Wand(+3)
+  assert.equal(raine.abilities.int.score, 17);
+  assert.equal(raine.abilities.wis.score, 16);
+  assert.equal(raine.spellSaveDc, 14);
+  assert.equal(raine.spellAttackBonus, 9); // prof(3) + INT(3) + Wand(+3) — ungranted item +9 ignored
   assert.deepEqual([...raine.saveAdvantages], ["int", "wis", "cha"]);
-  assert.equal(raine.savingThrows.wis, 5); // WIS(+2) + prof(3)
+  assert.equal(raine.savingThrows.wis, 6); // WIS(+3) + prof(3)
   assert.equal(raine.skills.history.bonus, 6); // INT(+3) + prof(3)
   const raySpell = raine.spells.find((s) => s.name === "Ray of Frost");
   assert.equal(raySpell.damageFormula, "2d8"); // scaled to level 6
