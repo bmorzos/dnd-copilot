@@ -37,6 +37,12 @@
       lastAutoUpdateNote: String(pc.lastAutoUpdateNote || ""),
       notableItems: Array.isArray(pc.notableItems) ? pc.notableItems : [],
       notableFeatures: Array.isArray(pc.notableFeatures) ? pc.notableFeatures : [],
+      featureDetails: Array.isArray(pc.featureDetails) ? pc.featureDetails : [],
+      racialTraits: Array.isArray(pc.racialTraits) ? pc.racialTraits : [],
+      weapons: Array.isArray(pc.weapons) ? pc.weapons : [],
+      savingThrows: pc.savingThrows && typeof pc.savingThrows === "object" ? pc.savingThrows : {},
+      saveAdvantages: Array.isArray(pc.saveAdvantages) ? pc.saveAdvantages : [],
+      skills: pc.skills && typeof pc.skills === "object" ? pc.skills : {},
       proficientSkills: Array.isArray(pc.proficientSkills) ? pc.proficientSkills : []
     };
   }
@@ -2498,24 +2504,26 @@
     }
 
     ingestGameLogRolls(rolls, shouldSave = true) {
-      if (!Array.isArray(rolls) || rolls.length === 0) return;
+      if (!Array.isArray(rolls) || rolls.length === 0) return [];
       const existingFps = new Set(this.state.gameLog.map((r) => r.fingerprint));
-      let added = false;
+      const newlyAdded = [];
 
       for (const r of rolls) {
         if (!r || !r.fingerprint || existingFps.has(r.fingerprint)) continue;
         existingFps.add(r.fingerprint);
-        this.state.gameLog.push({ ...r, attributedTo: "" });
-        added = true;
+        const rec = { ...r, attributedTo: "" };
+        this.state.gameLog.push(rec);
+        newlyAdded.push(rec);
       }
 
       if (this.state.gameLog.length > 80) {
         this.state.gameLog = this.state.gameLog.slice(-80);
       }
 
-      if (added && shouldSave) {
+      if (newlyAdded.length > 0 && shouldSave) {
         this.save();
       }
+      return newlyAdded;
     }
 
     attributeRollDamageToEnemy(fingerprint, tokenId, multiplier = 1) {

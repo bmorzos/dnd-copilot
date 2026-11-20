@@ -56,6 +56,7 @@ function createBrowserSandbox() {
     "js/ddb-parser.js",
     "js/audio-utils.js",
     "js/state.js",
+    "js/roll-maximizer.js",
     "js/local-brain.js",
     "js/gemini-client.js",
     "js/session-recorder.js",
@@ -2119,4 +2120,163 @@ test("Scene-jump Fast Play locates puzzle/social/keyword/range slices and delive
   assert.equal(store.state.advisor.recommendations[0].category, "Say / Roleplay");
   assert.match(store.state.advisor.recommendations[0].sayThis, /Silence/i);
   assert.match(store.state.puzzle.hypotheses[0].solution, /Hammer|Silence/i);
+});
+
+test("DDBParser extracts item spell bonuses/saves/traits and RollMaximizer maximizes rolls & AboveVTT logs", () => {
+  const sb = createBrowserSandbox();
+  const parser = sb.DnDCopilot.DDBParser;
+  const rm = sb.DnDCopilot.RollMaximizer;
+
+  const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8"));
+  assert.ok(manifest.content_scripts[0].js.includes("js/roll-maximizer.js"));
+
+  const rainePayload = {
+    data: {
+      id: 141442264,
+      name: "Raine",
+      inspiration: true,
+      race: {
+        fullName: "Rock Gnome",
+        racialTraits: [
+          { definition: { name: "Gnome Cunning", snippet: "Advantage on INT/WIS/CHA saves vs magic." } },
+          { definition: { name: "Artificer’s Lore", snippet: "2x prof on magic/tech History." } }
+        ]
+      },
+      stats: [
+        { id: 1, value: 8 },
+        { id: 2, value: 10 },
+        { id: 3, value: 14 },
+        { id: 4, value: 16 },
+        { id: 5, value: 15 },
+        { id: 6, value: 8 }
+      ],
+      classes: [
+        {
+          id: 101,
+          level: 6,
+          definition: { name: "Wizard", canCastSpells: true, spellCastingAbilityId: 4 },
+          subclassDefinition: { name: "School of Evocation" },
+          classFeatures: [
+            { definition: { name: "Sculpt Spells", requiredLevel: 2, snippet: "Protect allies in Evocation AoEs." } },
+            { definition: { name: "Potent Cantrip", requiredLevel: 6, snippet: "Half damage on successful cantrip save." } }
+          ]
+        }
+      ],
+      feats: [{ definition: { name: "Elemental Adept (Cold)", snippet: "1s count as 2s and ignore cold resistance." } }],
+      modifiers: {
+        race: [
+          { type: "advantage", subType: "intelligence-saving-throws" },
+          { type: "advantage", subType: "wisdom-saving-throws" },
+          { type: "advantage", subType: "charisma-saving-throws" }
+        ],
+        class: [
+          { type: "proficiency", subType: "wisdom-saving-throws" },
+          { type: "proficiency", subType: "intelligence-saving-throws" },
+          { type: "proficiency", subType: "history" }
+        ],
+        item: [{ type: "bonus", subType: "spell-attacks", fixedValue: 3 }]
+      },
+      inventory: [
+        { equipped: true, isAttuned: true, definition: { name: "Wand of the War Mage, +3", magic: true, snippet: "+3 spell attack, ignores half cover" } },
+        { equipped: true, isAttuned: false, definition: { name: "Clockwork Amulet", magic: true, snippet: "Take flat 10 on an attack roll once per dawn" } }
+      ],
+      classSpells: [
+        {
+          characterClassId: 101,
+          spells: [
+            {
+              prepared: true,
+              definition: {
+                id: 2226,
+                level: 0,
+                name: "Ray of Frost",
+                school: "Evocation",
+                requiresAttackRoll: true,
+                requiresSavingThrow: false,
+                range: { rangeValue: 60 },
+                modifiers: [
+                  {
+                    type: "damage",
+                    subType: "cold",
+                    die: { diceString: "1d8" },
+                    atHigherLevels: {
+                      higherLevelDefinitions: [{ level: 5, dice: { diceString: "2d8" } }]
+                    }
+                  }
+                ],
+                snippet: "Reduce speed by 10 ft."
+              }
+            },
+            {
+              prepared: true,
+              definition: {
+                id: 2102,
+                level: 3,
+                name: "Fireball",
+                school: "Evocation",
+                requiresAttackRoll: false,
+                requiresSavingThrow: true,
+                saveDcAbilityId: 2,
+                range: { rangeValue: 150 },
+                modifiers: [{ type: "damage", subType: "fire", die: { diceString: "8d6" } }],
+                snippet: "20-ft sphere fire blast."
+              }
+            }
+          ]
+        }
+      ]
+    }
+  };
+
+  const raine = parser.parseCharacterJson(rainePayload);
+  assert.equal(raine.spellAttackBonus, 9); // prof(3) + INT(3) + Wand(+3)
+  assert.deepEqual([...raine.saveAdvantages], ["int", "wis", "cha"]);
+  assert.equal(raine.savingThrows.wis, 5); // WIS(+2) + prof(3)
+  assert.equal(raine.skills.history.bonus, 6); // INT(+3) + prof(3)
+  const raySpell = raine.spells.find((s) => s.name === "Ray of Frost");
+  assert.equal(raySpell.damageFormula, "2d8"); // scaled to level 6
+
+  const lusomorris = {
+    id: "141442256",
+    name: "Lusomorris",
+    classSummary: "Paladin (Oath of Vengeance) 6",
+    level: 6,
+    abilities: { cha: { score: 16, mod: 3 } },
+    notableFeatures: ["Aura of Protection"]
+  };
+  const party = [raine, lusomorris];
+
+  const catalog = rm.getRollCatalog(raine, party);
+  const raySpec = catalog.spellsAndAttacks.find((r) => r.name === "Ray of Frost");
+  assert.ok(raySpec);
+
+  // rng returns 0 -> d20=1 (or 10 with Clockwork Amulet), damage dice roll 1 -> upgraded to 2 via Elemental Adept (Cold)!
+  const zeroRng = () => 0;
+  const rolledRay = rm.executeRoll(raySpec, raine, party, {
+    activeToggleIds: ["wand_half_cover", "elemental_adept_cold", "rider_ray_of_frost", "clockwork_amulet"],
+    rng: zeroRng
+  });
+  assert.equal(rolledRay.d20Result.chosenD20, 10);
+  assert.equal(rolledRay.d20Result.total, 19); // 10 + 9
+  assert.equal(rolledRay.damageResult.total, 4); // 2d8 both rolled 1 -> upgraded to 2+2 = 4!
+  assert.equal(rolledRay.damageResult.upgradedCount, 2);
+  assert.match(rolledRay.sayAloudScript, /Elemental Adept \(Cold\)/i);
+  assert.match(rolledRay.sayAloudScript, /ignores half cover/i);
+
+  const fbSpec = catalog.spellsAndAttacks.find((r) => r.name === "Fireball");
+  const fbAnalysis = rm.analyzeRollPotential(fbSpec, raine, party);
+  assert.ok(fbAnalysis.modifiers.some((m) => m.id === "sculpt_spells"));
+
+  const wisSpec = catalog.saves.find((s) => s.id === "save:wis");
+  const wisAnalysis = rm.analyzeRollPotential(wisSpec, raine, party);
+  assert.ok(wisAnalysis.modifiers.some((m) => m.id === "gnome_cunning" && m.grantsAdvantage));
+  assert.ok(wisAnalysis.modifiers.some((m) => m.id === "paladin_aura" && m.flatBonus === 3));
+
+  const avttCoach = rm.analyzeAboveVttRoll(
+    { actor: "Raine", action: "Wisdom Saving Throw", kind: "save", total: 14, rawText: "Raine: Wisdom Save = 14" },
+    raine,
+    party
+  );
+  assert.ok(avttCoach.reminders.some((r) => /14 → 17/.test(r.extraNote)));
+  assert.ok(avttCoach.reminders.some((r) => /Gnome Cunning/i.test(r.title)));
 });

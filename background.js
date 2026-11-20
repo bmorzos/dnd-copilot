@@ -164,6 +164,50 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  if (message.type === "SYNC_ROLL_CONTEXT") {
+    const payload = {
+      myChar: message.myChar || null,
+      party: Array.isArray(message.party) ? message.party : [],
+      updatedAt: Date.now()
+    };
+    chrome.storage?.local?.set({ dnd_copilot_roll_context: payload }).catch(() => {});
+    findDndBeyondTabs().then((tabs) => {
+      for (const tab of tabs) {
+        chrome.tabs.sendMessage(tab.id, { type: "ROLL_CONTEXT_UPDATE", ...payload }).catch(() => {});
+      }
+    });
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message.type === "SHOW_ROLL_COACH_ON_TABS") {
+    findDndBeyondTabs().then((tabs) => {
+      for (const tab of tabs) {
+        chrome.tabs
+          .sendMessage(tab.id, {
+            type: "SHOW_ROLL_COACH",
+            title: message.title || "",
+            sayScript: message.sayScript || ""
+          })
+          .catch(() => {});
+      }
+    });
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message.type === "GET_ROLL_CONTEXT") {
+    (async () => {
+      try {
+        const stored = await chrome.storage?.local?.get("dnd_copilot_roll_context");
+        sendResponse({ ok: true, ...(stored?.dnd_copilot_roll_context || {}) });
+      } catch (_) {
+        sendResponse({ ok: true, myChar: null, party: [] });
+      }
+    })();
+    return true;
+  }
+
   if (message.type === "DASHBOARD_READY" || message.type === "REQUEST_ABOVEVTT_SYNC") {
     (async () => {
       const tabs = await findDndBeyondTabs();

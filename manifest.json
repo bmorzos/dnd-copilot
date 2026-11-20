@@ -36,6 +36,7 @@
         "https://www.dndbeyond.com/*"
       ],
       "js": [
+        "js/roll-maximizer.js",
         "content-script.js"
       ],
       "run_at": "document_idle"

@@ -37,6 +37,10 @@
         ⏩ Fast Play
       </button>
 
+      <button id="btnOpenRollModal" class="btn btn-action" title="Roll with all D&amp;D Beyond sheet bonuses, feats, items &amp; party auras">
+        🎲 Roll
+      </button>
+
       <!-- 1-CLICK CHROME <-> GROQ <-> DEEPGRAM SWITCH -->
       <div class="engine-switch" role="group" aria-label="Speech Engine">
         <button id="btnEngineChrome" class="engine-opt active" type="button">Chrome</button>
@@ -222,6 +226,7 @@
 
         <div id="myCombatStatsBar" class="combat-stats-strip hidden"></div>
         <div id="combatPartyTriage" class="combat-triage-box hidden"></div>
+        <div id="liveRollCoachBanner" class="live-roll-coach-banner hidden"></div>
         <div id="initiativeStrip" class="init-strip hidden"></div>
 
         <form id="addEnemyForm" class="simple-row">
@@ -655,9 +660,60 @@
     </div>
   </div>
 
+  <!-- MODAL 5: ROLL MAXIMIZER & FULL POTENTIAL COACH -->
+  <div id="rollMaximizerModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card roll-modal-card">
+      <div class="modal-header">
+        <div class="simple-row" style="gap:10px;">
+          <h2>🎲 Roll &amp; Full Potential Coach</h2>
+          <span id="rollModalHeroLabel" class="roll-hero-badge"></span>
+        </div>
+        <button class="btn-close" data-close-modal="rollMaximizerModal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="roll-controls-row">
+          <div class="roll-cat-tabs" role="tablist">
+            <button type="button" class="btn btn-quiet active" data-roll-cat="spells">✨ Spells &amp; Attacks</button>
+            <button type="button" class="btn btn-quiet" data-roll-cat="saves">🛡️ Saving Throws</button>
+            <button type="button" class="btn btn-quiet" data-roll-cat="skills">🔎 Skills &amp; Init</button>
+          </div>
+          <input id="rollSearchInput" type="text" class="input" placeholder="Filter rolls (e.g. Ray of Frost, WIS, History)..." style="max-width:260px;" />
+        </div>
+
+        <div id="rollPickerList" class="roll-picker-grid"></div>
+
+        <div id="rollDetailPane" class="roll-detail-pane hidden">
+          <div class="roll-detail-header">
+            <div>
+              <div id="rollSelectedTitle" class="roll-selected-title"></div>
+              <div id="rollBaseSummary" class="roll-base-summary"></div>
+            </div>
+            <div id="rollAlreadyIncluded" class="roll-included-chips"></div>
+          </div>
+
+          <div class="roll-checklist-section">
+            <div class="muted-label" style="font-size:13.5px;margin-bottom:6px;">
+              ⚡ Full Potential Checklist (from your sheet &amp; party — toggle what applies):
+            </div>
+            <div id="rollModifiersList" class="roll-mod-list"></div>
+          </div>
+
+          <div class="simple-row" style="flex-wrap:wrap;gap:8px;margin-top:6px;">
+            <button id="btnExecuteRoll" type="button" class="btn btn-primary">🎲 Roll Now</button>
+            <button id="btnExecuteRollAdv" type="button" class="btn btn-action">⚡ Roll w/ Advantage</button>
+            <button id="btnCopyRollScript" type="button" class="btn btn-quiet hidden">📋 Copy Say-Aloud</button>
+          </div>
+
+          <div id="rollResultBox" class="roll-result-box hidden"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script defer src="js/ddb-parser.js"></script>
   <script defer src="js/audio-utils.js"></script>
   <script defer src="js/state.js"></script>
+  <script defer src="js/roll-maximizer.js"></script>
   <script defer src="js/local-brain.js"></script>
   <script defer src="js/gemini-client.js"></script>
   <script defer src="js/session-recorder.js"></script>

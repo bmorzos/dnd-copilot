@@ -19,6 +19,11 @@
   let fastPlayCancelled = false;
   let isFastPlaying = false;
   let liveIdeasDebounceTimer = null;
+  let rollModalCategory = "spells";
+  let rollModalSelectedId = "";
+  let rollModalToggleState = new Map();
+  let lastRollResult = null;
+  let lastLiveRollCoach = null;
 
   function el(id) {
     return document.getElementById(id);
@@ -49,8 +54,83 @@
   }
 
   const bridge = new global.DnDCopilot.AboveVttBridgeHost(store, {
-    onToast: (m) => showToast(m, false)
+    onToast: (m) => showToast(m, false),
+    onNewAboveVttRolls: (newRolls) => handleIncomingAboveVttRolls(newRolls)
   });
+
+  function getActiveHeroForRolls() {
+    const st = store.state;
+    return (
+      st.party.find((p) => String(p.id) === String(st.myCharacterId)) ||
+      st.party[0] ||
+      null
+    );
+  }
+
+  function renderLiveRollCoachBanner() {
+    const box = el("liveRollCoachBanner");
+    if (!box) return;
+    if (!lastLiveRollCoach) {
+      box.classList.add("hidden");
+      box.innerHTML = "";
+      return;
+    }
+    const items = (lastLiveRollCoach.bullets || [])
+      .slice(0, 4)
+      .map((b) => `<li>${escapeHtml(b)}</li>`)
+      .join("");
+    box.classList.remove("hidden");
+    box.innerHTML = `
+      <div class="simple-row" style="justify-content:space-between;margin-bottom:4px;">
+        <strong>🎲 Full Potential Coach — ${escapeHtml(lastLiveRollCoach.title)}</strong>
+        <button type="button" id="btnDismissLiveRollCoach" class="btn btn-quiet" style="padding:2px 8px;font-size:12px;">✕</button>
+      </div>
+      ${
+        lastLiveRollCoach.sayScript
+          ? `<div style="margin:4px 0 6px;color:#fef3c7;">🗣️ <strong>Say:</strong> “${escapeHtml(
+              lastLiveRollCoach.sayScript
+            )}”</div>`
+          : ""
+      }
+      ${items ? `<ul style="margin:4px 0 0 18px;padding:0;">${items}</ul>` : ""}
+    `;
+    el("btnDismissLiveRollCoach")?.addEventListener("click", () => {
+      lastLiveRollCoach = null;
+      renderLiveRollCoachBanner();
+    });
+  }
+
+  function handleIncomingAboveVttRolls(newRolls) {
+    const rm = global.DnDCopilot?.RollMaximizer;
+    const myChar = getActiveHeroForRolls();
+    if (!rm || !myChar || !Array.isArray(newRolls) || newRolls.length === 0) return;
+
+    const myFirst = String(myChar.name || "").trim().split(/\s+/)[0].toLowerCase();
+    const matching = newRolls.filter((r) => {
+      if (!r || r.kind === "chat") return false;
+      const actorLow = String(r.actor || "").toLowerCase();
+      return (
+        actorLow === String(myChar.name || "").toLowerCase() ||
+        (myFirst.length >= 3 && actorLow.includes(myFirst))
+      );
+    });
+    const picked = matching[matching.length - 1];
+    if (!picked) return;
+
+    const analyzed = rm.analyzeAboveVttRoll(picked, myChar, store.state.party);
+    if (!analyzed) return;
+    const activeReminders = analyzed.reminders.slice(0, 4);
+    const sayLines = activeReminders.map((x) => x.sayThis).filter(Boolean).slice(0, 3);
+    lastLiveRollCoach = {
+      title: `${myChar.name} · ${picked.action}${picked.total != null ? ` (Rolled ${picked.total})` : ""}`,
+      sayScript: sayLines.join(" "),
+      bullets: activeReminders.map((r) => `${r.title}: ${r.extraNote || r.sayThis}`)
+    };
+    renderLiveRollCoachBanner();
+    if (sayLines[0]) {
+      showToast(`🎲 ${picked.action}: ${sayLines[0].slice(0, 120)}`);
+    }
+  }
 
   function playSoftAlertChime() {
     try {
@@ -858,6 +938,13 @@
               <div class="simple-row">
                 ${inspBtnHtml}
                 ${sheetBtnHtml}
+                ${
+                  isMe
+                    ? `<button type="button" class="btn btn-quiet" style="padding:5px 10px;font-size:14px;" data-open-roll-for="${escapeHtml(
+                        pc.id
+                      )}" title="Open Roll &amp; Full Potential Coach">🎲 Roll</button>`
+                    : ""
+                }
                 <button class="btn ${isMe ? "btn-action" : "btn-quiet"}" style="padding:5px 10px;font-size:14px;" data-set-me="${escapeHtml(
           pc.id
         )}">
@@ -893,14 +980,258 @@
       .join("");
   }
 
+  function getCatalogForCategory(catalog, cat) {
+    if (cat === "saves") return catalog.saves || [];
+    if (cat === "skills") return catalog.skills || [];
+    return catalog.spellsAndAttacks || [];
+  }
+
+  function renderRollModal() {
+    const rm = global.DnDCopilot?.RollMaximizer;
+    const myChar = getActiveHeroForRolls();
+    const heroBadge = el("rollModalHeroLabel");
+    const pickerEl = el("rollPickerList");
+    const detailEl = el("rollDetailPane");
+    if (!rm || !pickerEl || !detailEl) return;
+
+    if (!myChar) {
+      if (heroBadge) heroBadge.textContent = "No Hero Synced";
+      pickerEl.innerHTML = `<div class="muted-p">Sync or select your character (★ Me) in the Party column first.</div>`;
+      detailEl.classList.add("hidden");
+      return;
+    }
+
+    if (heroBadge) {
+      heroBadge.textContent = `★ ${myChar.name} (${myChar.classSummary})${myChar.inspiration ? " · ✨ Inspired" : ""}`;
+    }
+
+    document.querySelectorAll("[data-roll-cat]").forEach((btn) => {
+      btn.classList.toggle("active", btn.getAttribute("data-roll-cat") === rollModalCategory);
+    });
+
+    const catalog = rm.getRollCatalog(myChar, store.state.party);
+    const items = getCatalogForCategory(catalog, rollModalCategory);
+    const query = String(el("rollSearchInput")?.value || "").trim().toLowerCase();
+    const filtered = query
+      ? [
+          ...(catalog.spellsAndAttacks || []),
+          ...(catalog.saves || []),
+          ...(catalog.skills || [])
+        ].filter((r) => `${r.name} ${r.subLabel}`.toLowerCase().includes(query))
+      : items;
+
+    if (filtered.length === 0) {
+      pickerEl.innerHTML = `<div class="muted-p">No matching rolls found on ${escapeHtml(myChar.name)}.</div>`;
+      detailEl.classList.add("hidden");
+      return;
+    }
+
+    if (!filtered.some((r) => r.id === rollModalSelectedId)) {
+      rollModalSelectedId = filtered[0].id;
+      lastRollResult = null;
+    }
+
+    pickerEl.innerHTML = filtered
+      .map(
+        (r) => `
+        <button type="button" class="roll-pick-btn ${r.id === rollModalSelectedId ? "active" : ""}" data-pick-roll="${escapeHtml(r.id)}">
+          <span class="roll-pick-name">${escapeHtml(r.name)}</span>
+          <span class="roll-pick-sub">${escapeHtml(r.subLabel || "")}</span>
+        </button>
+      `
+      )
+      .join("");
+
+    const selected = filtered.find((r) => r.id === rollModalSelectedId) || filtered[0];
+    detailEl.classList.remove("hidden");
+
+    const analysis = rm.analyzeRollPotential(selected, myChar, store.state.party);
+    el("rollSelectedTitle").textContent = selected.name;
+    el("rollBaseSummary").textContent = analysis.baseSummary;
+    el("rollAlreadyIncluded").innerHTML = (analysis.alreadyIncluded || [])
+      .map((chip) => `<span class="roll-included-chip">✓ ${escapeHtml(chip)}</span>`)
+      .join("");
+
+    if (!rollModalToggleState.has(selected.id)) {
+      rollModalToggleState.set(
+        selected.id,
+        new Set(analysis.modifiers.filter((m) => m.defaultOn).map((m) => m.id))
+      );
+    }
+    const activeSet = rollModalToggleState.get(selected.id);
+
+    const modListEl = el("rollModifiersList");
+    if (analysis.modifiers.length === 0) {
+      modListEl.innerHTML = `<div class="muted-p">No extra situational features detected for this roll.</div>`;
+    } else {
+      modListEl.innerHTML = analysis.modifiers
+        .map((m) => {
+          const checked = activeSet.has(m.id);
+          return `
+            <label class="roll-mod-row">
+              <input type="checkbox" data-roll-mod="${escapeHtml(m.id)}" ${checked ? "checked" : ""} />
+              <div class="roll-mod-main">
+                <div class="roll-mod-top">
+                  <span class="roll-mod-title">${escapeHtml(m.title)}</span>
+                  <span class="roll-mod-badge">${escapeHtml(m.badge || m.source)}</span>
+                </div>
+                ${m.sayThis ? `<div class="roll-mod-say">💬 ${escapeHtml(m.sayThis)}</div>` : ""}
+              </div>
+            </label>
+          `;
+        })
+        .join("");
+    }
+
+    const resBox = el("rollResultBox");
+    const copyBtn = el("btnCopyRollScript");
+    if (lastRollResult && lastRollResult.rollSpec?.id === selected.id) {
+      resBox.classList.remove("hidden");
+      copyBtn?.classList.remove("hidden");
+
+      const totalPills = [];
+      if (lastRollResult.d20Result) {
+        const d20 = lastRollResult.d20Result;
+        const d20Desc =
+          d20.mode === "flat-10"
+            ? `Clockwork 10${d20.baseMod >= 0 ? `+${d20.baseMod}` : d20.baseMod}`
+            : `d20(${d20.rawD20s.join(",")}${d20.mode !== "normal" ? `→${d20.chosenD20}` : ""})${
+                d20.baseMod >= 0 ? `+${d20.baseMod}` : d20.baseMod
+              }${d20.flatExtra ? `+${d20.flatExtra}` : ""}${
+                d20.bonusDiceRolls.length
+                  ? `+${d20.bonusDiceRolls.map((b) => b.total).join("+")}`
+                  : ""
+              }`;
+        totalPills.push(`
+          <div class="roll-total-pill">
+            <span class="roll-total-num">${d20.total}${d20.isCrit ? " 🎯" : ""}</span>
+            <span class="roll-total-sub">${escapeHtml(d20Desc)}</span>
+          </div>
+        `);
+      } else if (selected.saveDc) {
+        totalPills.push(`
+          <div class="roll-total-pill">
+            <span class="roll-total-num">DC ${selected.saveDc}</span>
+            <span class="roll-total-sub">${escapeHtml(selected.saveAbility || "Saving Throw")}</span>
+          </div>
+        `);
+      }
+
+      if (lastRollResult.damageResult) {
+        const dmg = lastRollResult.damageResult;
+        const typeLabel = (dmg.damageTypes || []).join("/") || "damage";
+        const diceHtml = (dmg.dice || [])
+          .map((d) =>
+            d.upgraded
+              ? `<span class="die-chip die-upgraded" title="Elemental Adept upgraded 1 → 2">1→${d.final}</span>`
+              : `<span class="die-chip ${dmg.isCrit ? "die-crit" : ""}">${d.final}</span>`
+          )
+          .join("");
+        const extraDiceHtml = (dmg.extraDamageRolls || [])
+          .flatMap((er) =>
+            (er.dice || []).map(
+              (d) => `<span class="die-chip">+${d.final} ${escapeHtml(er.type)}</span>`
+            )
+          )
+          .join("");
+        totalPills.push(`
+          <div class="roll-total-pill">
+            <span class="roll-total-num">${dmg.total} ${escapeHtml(typeLabel)}</span>
+            <span class="roll-total-sub">${escapeHtml(dmg.formula)}${dmg.isCrit ? " (CRIT 2× Dice!)" : ""}</span>
+          </div>
+          <div class="roll-dice-row">${diceHtml}${extraDiceHtml}</div>
+        `);
+      }
+
+      resBox.innerHTML = `
+        <div class="roll-result-totals">${totalPills.join("")}</div>
+        <div id="rollSayAloudBox" class="roll-say-box">
+          🗣️ <strong>Say to the DM:</strong> “${escapeHtml(lastRollResult.sayAloudScript)}”
+        </div>
+      `;
+    } else {
+      resBox.classList.add("hidden");
+      resBox.innerHTML = "";
+      copyBtn?.classList.add("hidden");
+    }
+  }
+
+  function openRollModal(forCharId = null) {
+    if (forCharId) {
+      store.setMyCharacter(forCharId);
+    }
+    el("rollMaximizerModal")?.classList.remove("hidden");
+    renderRollModal();
+  }
+
+  function executeSelectedRoll(forceAdvantage = false) {
+    const rm = global.DnDCopilot?.RollMaximizer;
+    const myChar = getActiveHeroForRolls();
+    if (!rm || !myChar) return;
+    const catalog = rm.getRollCatalog(myChar, store.state.party);
+    const allSpecs = [
+      ...(catalog.spellsAndAttacks || []),
+      ...(catalog.saves || []),
+      ...(catalog.skills || [])
+    ];
+    const selected = allSpecs.find((r) => r.id === rollModalSelectedId);
+    if (!selected) return;
+
+    const activeSet = rollModalToggleState.get(selected.id) || null;
+    const res = rm.executeRoll(selected, myChar, store.state.party, {
+      activeToggleIds: activeSet,
+      forceAdvantage
+    });
+    lastRollResult = res;
+
+    const primaryTotal = res.d20Result ? res.d20Result.total : res.damageResult ? res.damageResult.total : null;
+    store.ingestGameLogRolls([
+      {
+        fingerprint: `copilot-roll-${Date.now()}-${selected.id}`,
+        timestamp: Date.now(),
+        actor: myChar.name,
+        action: selected.name,
+        kind:
+          selected.kind === "spell_attack" || selected.kind === "weapon_attack"
+            ? "attack"
+            : selected.kind === "spell_save" || selected.kind === "item_save"
+            ? "damage"
+            : selected.kind === "initiative"
+            ? "initiative"
+            : selected.kind === "save"
+            ? "save"
+            : "check",
+        total: primaryTotal,
+        formula: selected.damageFormula || "",
+        isCrit: Boolean(res.d20Result?.isCrit),
+        isFumble: Boolean(res.d20Result?.isFumble),
+        rawText: res.sayAloudScript
+      }
+    ]);
+
+    lastLiveRollCoach = {
+      title: `${myChar.name} · ${selected.name}${primaryTotal != null ? ` (${primaryTotal})` : ""}`,
+      sayScript: res.sayAloudScript,
+      bullets: res.activeMods.map((m) => `${m.title}${m.badge ? ` — ${m.badge}` : ""}`)
+    };
+    renderLiveRollCoachBanner();
+    bridge.broadcastRollCoachToast?.(`${myChar.name} · ${selected.name}`, res.sayAloudScript);
+    renderRollModal();
+  }
+
   function renderAll(state, settings) {
     renderTopBar(state, settings);
     renderWhatsGoingOn(state);
     renderCenterFocus(state);
+    renderLiveRollCoachBanner();
     renderParty(state);
     if (!el("savedModal")?.classList.contains("hidden")) {
       renderSavedModal();
     }
+    if (!el("rollMaximizerModal")?.classList.contains("hidden")) {
+      renderRollModal();
+    }
+    bridge.syncRollContextToAboveVtt?.();
   }
 
   function downloadTextFile(text, filename) {
@@ -2774,6 +3105,49 @@
         return;
       }
       await runFastPlay("Pasted Transcript", raw);
+    });
+
+    // Roll Maximizer & Full Potential Coach Modal
+    el("btnOpenRollModal")?.addEventListener("click", () => openRollModal());
+    el("partyList")?.addEventListener("click", (e) => {
+      const rollBtn = e.target.closest("[data-open-roll-for]");
+      if (rollBtn) {
+        openRollModal(rollBtn.getAttribute("data-open-roll-for"));
+      }
+    });
+    document.querySelectorAll("[data-roll-cat]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        rollModalCategory = btn.getAttribute("data-roll-cat") || "spells";
+        renderRollModal();
+      });
+    });
+    el("rollSearchInput")?.addEventListener("input", () => renderRollModal());
+    el("rollPickerList")?.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-pick-roll]");
+      if (!btn) return;
+      rollModalSelectedId = btn.getAttribute("data-pick-roll") || "";
+      lastRollResult = null;
+      renderRollModal();
+    });
+    el("rollModifiersList")?.addEventListener("change", (e) => {
+      const cb = e.target.closest("[data-roll-mod]");
+      if (!cb || !rollModalSelectedId) return;
+      const modId = cb.getAttribute("data-roll-mod");
+      const set = rollModalToggleState.get(rollModalSelectedId) || new Set();
+      if (cb.checked) set.add(modId);
+      else set.delete(modId);
+      rollModalToggleState.set(rollModalSelectedId, set);
+    });
+    el("btnExecuteRoll")?.addEventListener("click", () => executeSelectedRoll(false));
+    el("btnExecuteRollAdv")?.addEventListener("click", () => executeSelectedRoll(true));
+    el("btnCopyRollScript")?.addEventListener("click", async () => {
+      if (!lastRollResult?.sayAloudScript) return;
+      try {
+        await navigator.clipboard.writeText(lastRollResult.sayAloudScript);
+        showToast("Copied Say-Aloud roll callout!");
+      } catch (_) {
+        showToast(lastRollResult.sayAloudScript);
+      }
     });
 
     initColumnResizers();

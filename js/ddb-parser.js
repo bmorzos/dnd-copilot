@@ -378,26 +378,30 @@
     }
   }
 
-  const SKILL_SLUGS = {
-    acrobatics: "Acrobatics",
-    "animal-handling": "Animal Handling",
-    arcana: "Arcana",
-    athletics: "Athletics",
-    deception: "Deception",
-    history: "History",
-    insight: "Insight",
-    intimidation: "Intimidation",
-    investigation: "Investigation",
-    medicine: "Medicine",
-    nature: "Nature",
-    perception: "Perception",
-    performance: "Performance",
-    persuasion: "Persuasion",
-    religion: "Religion",
-    "sleight-of-hand": "Sleight of Hand",
-    stealth: "Stealth",
-    survival: "Survival"
+  const SKILL_DEFS = {
+    acrobatics: { label: "Acrobatics", ability: "dex" },
+    "animal-handling": { label: "Animal Handling", ability: "wis" },
+    arcana: { label: "Arcana", ability: "int" },
+    athletics: { label: "Athletics", ability: "str" },
+    deception: { label: "Deception", ability: "cha" },
+    history: { label: "History", ability: "int" },
+    insight: { label: "Insight", ability: "wis" },
+    intimidation: { label: "Intimidation", ability: "cha" },
+    investigation: { label: "Investigation", ability: "int" },
+    medicine: { label: "Medicine", ability: "wis" },
+    nature: { label: "Nature", ability: "int" },
+    perception: { label: "Perception", ability: "wis" },
+    performance: { label: "Performance", ability: "cha" },
+    persuasion: { label: "Persuasion", ability: "cha" },
+    religion: { label: "Religion", ability: "int" },
+    "sleight-of-hand": { label: "Sleight of Hand", ability: "dex" },
+    stealth: { label: "Stealth", ability: "dex" },
+    survival: { label: "Survival", ability: "wis" }
   };
+
+  const SKILL_SLUGS = Object.fromEntries(
+    Object.entries(SKILL_DEFS).map(([k, v]) => [k, v.label])
+  );
 
   function extractNotableItems(data) {
     const inv = Array.isArray(data.inventory) ? data.inventory : [];
@@ -420,7 +424,8 @@
         name,
         equipped: isEquipped,
         attuned: isAttuned,
-        snippet: stripHtml(def.snippet || def.description || "").slice(0, 120)
+        magic: isMagic,
+        snippet: stripHtml(def.snippet || def.description || "").slice(0, 140)
       };
       if (isMagic || isAttuned) {
         magicOrPriority.push(entry);
@@ -429,23 +434,120 @@
       }
     }
 
-    return [...magicOrPriority, ...fallbackEquipped].slice(0, 10);
+    return [...magicOrPriority, ...fallbackEquipped].slice(0, 12);
+  }
+
+  function extractWeaponsAndCombatItems(data, abilities, profBonus) {
+    const inv = Array.isArray(data.inventory) ? data.inventory : [];
+    const out = [];
+    const seen = new Set();
+
+    for (const item of inv) {
+      const def = item?.definition || {};
+      const name = String(def.name || "").trim();
+      if (!name) continue;
+      const isEquipped = Boolean(item?.equipped);
+      const isStaff = def.filterType === "Staff" || /\bstaff\b/i.test(name);
+      const isWeapon = def.filterType === "Weapon" || Boolean(def.damage?.diceString) || isStaff;
+      const isCombatWondrous =
+        /\b(necklace of fireballs|clockwork amulet|wand of|rod of|hat of wizardry|scroll)\b/i.test(name);
+
+      if (!isWeapon && !isCombatWondrous) continue;
+      if (isWeapon && !isEquipped && !item?.isAttuned && !isCombatWondrous) continue;
+
+      const low = name.toLowerCase();
+      if (seen.has(low)) continue;
+      seen.add(low);
+
+      const props = Array.isArray(def.properties) ? def.properties.map((p) => String(p?.name || "")) : [];
+      const isFinesse = props.some((p) => /finesse/i.test(p));
+      const isRanged = def.attackType === 2 || /bow|crossbow|sling|dart/i.test(name);
+      const gm = Array.isArray(def.grantedModifiers) ? def.grantedModifiers : [];
+      let magicBonus = 0;
+      const extraDamage = [];
+      for (const m of gm) {
+        if (m?.type === "bonus" && m?.subType === "magic") {
+          magicBonus += Number(m.fixedValue ?? m.value ?? 0);
+        }
+        if (m?.type === "damage" && (m.dice?.diceString || m.die?.diceString)) {
+          extraDamage.push({
+            formula: m.dice?.diceString || m.die?.diceString,
+            type: m.subType || ""
+          });
+        }
+      }
+
+      const abilityKey = isRanged
+        ? "dex"
+        : isFinesse
+        ? abilities.dex.mod >= abilities.str.mod
+          ? "dex"
+          : "str"
+        : "str";
+      const statMod = Number(abilities?.[abilityKey]?.mod || 0);
+      const baseFormula = def.damage?.diceString || (isStaff ? "1d6" : "");
+      const damageType = def.damageType || (isStaff ? "bludgeoning" : "");
+
+      out.push({
+        name,
+        kind: isWeapon ? "weapon" : "item",
+        equipped: isEquipped,
+        attuned: Boolean(item?.isAttuned),
+        isMagic: Boolean(def.magic),
+        magicBonus,
+        ability: abilityKey,
+        attackBonus: isWeapon ? statMod + profBonus + magicBonus : null,
+        damageFormula: baseFormula
+          ? `${baseFormula}${statMod + magicBonus >= 0 ? `+${statMod + magicBonus}` : statMod + magicBonus}`
+          : "",
+        damageType: String(damageType || "").toLowerCase(),
+        extraDamage,
+        isFinesse,
+        isRanged,
+        snippet: stripHtml(def.snippet || def.description || "").slice(0, 160)
+      });
+    }
+    return out.slice(0, 10);
+  }
+
+  function extractRacialTraits(data) {
+    const rawTraits = Array.isArray(data.race?.racialTraits) ? data.race.racialTraits : [];
+    const traits = [];
+    const seen = new Set();
+    for (const t of rawTraits) {
+      const def = t?.definition || {};
+      const name = String(def.name || "").trim();
+      if (!name || def.hideInSheet || seen.has(name.toLowerCase())) continue;
+      seen.add(name.toLowerCase());
+      traits.push({
+        name,
+        snippet: stripHtml(def.snippet || def.description || "").slice(0, 180)
+      });
+    }
+    return traits;
   }
 
   function extractNotableFeatures(data, classes) {
     const names = [];
+    const details = [];
     const seen = new Set();
-    const pushName = (raw) => {
+    const pushFeature = (raw, source, snippetHtml) => {
       const clean = String(raw || "").trim();
       if (!clean) return;
       const low = clean.toLowerCase();
       if (seen.has(low)) return;
       seen.add(low);
       names.push(clean);
+      details.push({
+        name: clean,
+        source,
+        snippet: stripHtml(snippetHtml || "").slice(0, 180)
+      });
     };
 
     for (const feat of Array.isArray(data.feats) ? data.feats : []) {
-      pushName(feat?.definition?.name || feat?.name);
+      const fDef = feat?.definition || feat || {};
+      pushFeature(fDef.name, "feat", fDef.snippet || fDef.description);
     }
     for (const cls of classes) {
       const lvl = Number(cls?.level || 0);
@@ -453,29 +555,95 @@
         const def = cf?.definition || {};
         if (def.hideInSheet) continue;
         if (def.requiredLevel != null && Number(def.requiredLevel) > lvl) continue;
-        pushName(def.name);
+        pushFeature(def.name, "class", def.snippet || def.description);
       }
     }
-    return names.slice(0, 12);
-  }
-
-  function extractProficientSkills(modifiers) {
-    const skillStates = new Map();
-    for (const mod of modifiers) {
-      const label = SKILL_SLUGS[mod?.subType];
-      if (!label) continue;
-      if (mod.type === "expertise") {
-        skillStates.set(label, "expertise");
-      } else if (mod.type === "proficiency" && skillStates.get(label) !== "expertise") {
-        skillStates.set(label, "proficiency");
-      }
+    for (const rt of extractRacialTraits(data)) {
+      pushFeature(rt.name, "race", rt.snippet);
     }
-    return Array.from(skillStates.entries())
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([label, tier]) => (tier === "expertise" ? `${label} (Exp)` : label));
+    return { names: names.slice(0, 16), details: details.slice(0, 24) };
   }
 
-  function extractPreparedSpells(data) {
+  function computeSavingThrows(abilities, modifiers, profBonus) {
+    const bonusAllSaves = modifiers
+      .filter((m) => m.type === "bonus" && m.subType === "saving-throws")
+      .reduce((acc, m) => acc + Number(m.fixedValue ?? m.value ?? 0), 0);
+
+    const savingThrows = {};
+    const saveAdvantages = [];
+
+    for (const k of ABILITY_KEYS) {
+      const fullSub =
+        k === "str"
+          ? "strength-saving-throws"
+          : k === "dex"
+          ? "dexterity-saving-throws"
+          : k === "con"
+          ? "constitution-saving-throws"
+          : k === "int"
+          ? "intelligence-saving-throws"
+          : k === "wis"
+          ? "wisdom-saving-throws"
+          : "charisma-saving-throws";
+
+      const isProf = modifiers.some((m) => m.type === "proficiency" && m.subType === fullSub);
+      const specificBonus = modifiers
+        .filter((m) => m.type === "bonus" && m.subType === fullSub)
+        .reduce((acc, m) => acc + Number(m.fixedValue ?? m.value ?? 0), 0);
+      const hasAdv = modifiers.some((m) => m.type === "advantage" && m.subType === fullSub);
+      if (hasAdv) saveAdvantages.push(k);
+
+      savingThrows[k] = Number(abilities?.[k]?.mod || 0) + (isProf ? profBonus : 0) + bonusAllSaves + specificBonus;
+    }
+    return { savingThrows, saveAdvantages, bonusAllSaves };
+  }
+
+  function computeFullSkills(abilities, modifiers, profBonus) {
+    const bonusAllChecks = modifiers
+      .filter((m) => m.type === "bonus" && m.subType === "ability-checks")
+      .reduce((acc, m) => acc + Number(m.fixedValue ?? m.value ?? 0), 0);
+    const halfProfAll = modifiers.some(
+      (m) => m.type === "half-proficiency" && m.subType === "ability-checks"
+    );
+
+    const skills = {};
+    const profSummary = [];
+    for (const [slug, meta] of Object.entries(SKILL_DEFS)) {
+      const hasExp = modifiers.some((m) => m.type === "expertise" && m.subType === slug);
+      const hasProf = modifiers.some((m) => m.type === "proficiency" && m.subType === slug);
+      const hasHalf = modifiers.some((m) => m.type === "half-proficiency" && m.subType === slug);
+      const specificBonus = modifiers
+        .filter((m) => m.type === "bonus" && m.subType === slug)
+        .reduce((acc, m) => acc + Number(m.fixedValue ?? m.value ?? 0), 0);
+
+      const tier = hasExp ? "expertise" : hasProf ? "proficiency" : hasHalf || halfProfAll ? "half" : "none";
+      const profAdd =
+        tier === "expertise"
+          ? profBonus * 2
+          : tier === "proficiency"
+          ? profBonus
+          : tier === "half"
+          ? Math.floor(profBonus / 2)
+          : 0;
+      const abilityModVal = Number(abilities?.[meta.ability]?.mod || 0);
+      skills[slug] = {
+        slug,
+        label: meta.label,
+        ability: meta.ability,
+        tier,
+        bonus: abilityModVal + profAdd + bonusAllChecks + specificBonus
+      };
+      if (tier === "expertise") profSummary.push(`${meta.label} (Exp)`);
+      else if (tier === "proficiency") profSummary.push(meta.label);
+    }
+
+    return {
+      skills,
+      proficientSkills: profSummary.sort((a, b) => a.localeCompare(b))
+    };
+  }
+
+  function extractPreparedSpells(data, totalLevel = 1) {
     const classes = Array.isArray(data.classes) ? data.classes : [];
     const classById = new Map();
     classes.forEach((c) => {
@@ -499,14 +667,34 @@
       if (!isPrepared) return;
 
       const damageTypes = new Set();
+      let damageFormula = "";
       let isHealing = false;
       if (Array.isArray(def.modifiers)) {
         for (const m of def.modifiers) {
           if (m.type === "damage" && m.subType) {
             damageTypes.add(m.subType);
+            if (!damageFormula) {
+              const baseDie = m.die?.diceString || m.dice?.diceString || "";
+              let chosen = baseDie;
+              if (isCantrip && Array.isArray(m.atHigherLevels?.higherLevelDefinitions)) {
+                const scaled = m.atHigherLevels.higherLevelDefinitions
+                  .filter((h) => Number(h?.level || 99) <= totalLevel && (h?.dice?.diceString || h?.die?.diceString))
+                  .sort((a, b) => Number(b.level) - Number(a.level));
+                if (scaled[0]) {
+                  chosen = scaled[0].dice?.diceString || scaled[0].die?.diceString || baseDie;
+                }
+              }
+              const fixed = Number(m.die?.fixedValue ?? m.fixedValue ?? 0);
+              if (chosen) {
+                damageFormula = fixed ? `${chosen}${fixed >= 0 ? `+${fixed}` : fixed}` : chosen;
+              }
+            }
           }
           if (m.type === "bonus" && (m.subType === "hit-points" || m.subType === "temporary-hit-points")) {
             isHealing = true;
+            if (!damageFormula && (m.die?.diceString || m.dice?.diceString)) {
+              damageFormula = m.die?.diceString || m.dice?.diceString;
+            }
           }
         }
       }
@@ -538,8 +726,10 @@
         ritual: Boolean(def.ritual),
         range: rangeText,
         requiresAttack: Boolean(def.requiresAttackRoll),
+        attackType: def.attackType === 1 ? "melee" : def.attackType === 2 ? "ranged" : "",
         requiresSave: Boolean(def.requiresSavingThrow),
         saveAbility,
+        damageFormula,
         damageTypes: Array.from(damageTypes),
         isHealing,
         tags: Array.isArray(def.tags) ? def.tags : [],
@@ -599,21 +789,26 @@
     const hp = computeHitPoints(data, abilities, modifiers, totalLevel);
     const ac = computeArmorClass(data, abilities, modifiers);
     const spellSlots = computeSpellSlots(data);
-    const spells = extractPreparedSpells(data);
+    const spells = extractPreparedSpells(data, totalLevel);
+
+    const bonusInitiative = modifiers
+      .filter((m) => m.type === "bonus" && m.subType === "initiative")
+      .reduce((acc, m) => acc + Number(m.fixedValue ?? m.value ?? 0), 0);
+    const spellAttackItemBonus = modifiers
+      .filter((m) => m.type === "bonus" && m.subType === "spell-attacks")
+      .reduce((acc, m) => acc + Number(m.fixedValue ?? m.value ?? 0), 0);
+    const spellDcItemBonus = modifiers
+      .filter((m) => m.type === "bonus" && m.subType === "spell-save-dc")
+      .reduce((acc, m) => acc + Number(m.fixedValue ?? m.value ?? 0), 0);
 
     // Passive Perception
-    let perceptionBonus = abilities.wis.mod;
-    const hasPerceptionExpertise = modifiers.some(
-      (m) => m.type === "expertise" && m.subType === "perception"
+    const { skills, proficientSkills } = computeFullSkills(abilities, modifiers, profBonus);
+    const perceptionBonus = skills.perception ? skills.perception.bonus : abilities.wis.mod;
+    const { savingThrows, saveAdvantages, bonusAllSaves } = computeSavingThrows(
+      abilities,
+      modifiers,
+      profBonus
     );
-    const hasPerceptionProf = modifiers.some(
-      (m) => m.type === "proficiency" && m.subType === "perception"
-    );
-    if (hasPerceptionExpertise) {
-      perceptionBonus += profBonus * 2;
-    } else if (hasPerceptionProf) {
-      perceptionBonus += profBonus;
-    }
 
     // Conditions
     const activeConditions = [];
@@ -647,8 +842,9 @@
       : "";
 
     const notableItems = extractNotableItems(data);
-    const notableFeatures = extractNotableFeatures(data, classes);
-    const proficientSkills = extractProficientSkills(modifiers);
+    const featRes = extractNotableFeatures(data, classes);
+    const racialTraits = extractRacialTraits(data);
+    const weapons = extractWeaponsAndCombatItems(data, abilities, profBonus);
 
     return {
       id: String(data.id || Date.now()),
@@ -668,19 +864,28 @@
         temp: hp.tempHp
       },
       ac,
-      initiativeMod: abilities.dex.mod,
+      initiativeMod: abilities.dex.mod + bonusInitiative,
       passivePerception: 10 + perceptionBonus,
       proficiencyBonus: profBonus,
-      spellSaveDc: 8 + profBonus + spellCastingMod,
-      spellAttackBonus: profBonus + spellCastingMod,
+      spellSaveDc: 8 + profBonus + spellCastingMod + spellDcItemBonus,
+      spellAttackBonus: profBonus + spellCastingMod + spellAttackItemBonus,
+      spellAttackItemBonus,
+      spellDcItemBonus,
+      bonusAllSaves,
       abilities,
+      savingThrows,
+      saveAdvantages,
+      skills,
       inspiration: Boolean(data.inspiration),
       conditions: activeConditions,
       concentratingOn: "",
       spellSlots,
       spells,
       notableItems,
-      notableFeatures,
+      notableFeatures: featRes.names,
+      featureDetails: featRes.details,
+      racialTraits,
+      weapons,
       proficientSkills,
       deathSaves: {
         successes: Number(data.deathSaves?.successCount || 0),

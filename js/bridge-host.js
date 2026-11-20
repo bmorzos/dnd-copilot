@@ -12,11 +12,13 @@
     constructor(store, callbacks = {}) {
       this.store = store;
       this.onToast = callbacks.onToast || (() => {});
+      this.onNewAboveVttRolls = callbacks.onNewAboveVttRolls || (() => {});
       this.remoteWindow = window.opener || null;
       this.pendingCharRequests = new Map();
       this.tabShareStream = null;
       this.tabShareTimer = null;
       this.syncedCharacterIds = new Set();
+      this.lastRollSyncHash = "";
 
       this.#initExtensionListeners();
       this.#initPostMessageListeners();
@@ -61,7 +63,10 @@
         if (msg?.type === "BRIDGE_ABOVEVTT_SNAPSHOT" && msg.payload) {
           this.#handleIncomingSnapshot(msg.payload, "extension");
         } else if (msg?.type === "BRIDGE_GAMELOG_ROLLS" && Array.isArray(msg.rolls)) {
-          this.store.ingestGameLogRolls(msg.rolls, true);
+          const added = this.store.ingestGameLogRolls(msg.rolls, true);
+          if (Array.isArray(added) && added.length > 0) {
+            this.onNewAboveVttRolls(added);
+          }
         }
       });
 
@@ -107,7 +112,14 @@
     }
 
     async #handleIncomingSnapshot(snapshot, modeLabel) {
+      const seenBefore = new Set((this.store.state.gameLog || []).map((r) => r.fingerprint));
       const discoveredParty = this.store.syncAboveVttSnapshot(snapshot, modeLabel);
+      const addedRolls = (snapshot?.recentLog || []).filter(
+        (r) => r?.fingerprint && !seenBefore.has(r.fingerprint)
+      );
+      if (addedRolls.length > 0) {
+        this.onNewAboveVttRolls(addedRolls);
+      }
       if (this.store.settings.autoSyncPartySheets && discoveredParty.length > 0) {
         for (const pc of discoveredParty) {
           if (this.store.isCharacterExcluded(pc.id, pc.name)) continue;
@@ -116,6 +128,51 @@
             this.syncCharacterById(pc.id, true, false).catch(() => {});
           }
         }
+      }
+    }
+
+    syncRollContextToAboveVtt() {
+      const st = this.store?.state;
+      if (!st) return;
+      const myChar =
+        st.party.find((p) => String(p.id) === String(st.myCharacterId)) || st.party[0] || null;
+      const hash = JSON.stringify({
+        myId: myChar?.id || "",
+        insp: myChar?.inspiration,
+        conds: myChar?.conditions,
+        partyIds: (st.party || []).map((p) => `${p.id}:${p.level}:${p.lastSyncedAt || 0}`)
+      });
+      if (hash === this.lastRollSyncHash) return;
+      this.lastRollSyncHash = hash;
+
+      if (this.isExtensionContext()) {
+        chrome.runtime
+          .sendMessage({ type: "SYNC_ROLL_CONTEXT", myChar, party: st.party })
+          .catch(() => {});
+      }
+      if (this.remoteWindow && !this.remoteWindow.closed) {
+        try {
+          this.remoteWindow.postMessage(
+            { source: "dnd-copilot-dashboard", type: "SYNC_ROLL_CONTEXT", myChar, party: st.party },
+            "*"
+          );
+        } catch (_) {}
+      }
+    }
+
+    broadcastRollCoachToast(title, sayScript) {
+      if (this.isExtensionContext()) {
+        chrome.runtime
+          .sendMessage({ type: "SHOW_ROLL_COACH_ON_TABS", title, sayScript })
+          .catch(() => {});
+      }
+      if (this.remoteWindow && !this.remoteWindow.closed) {
+        try {
+          this.remoteWindow.postMessage(
+            { source: "dnd-copilot-dashboard", type: "SHOW_ROLL_COACH", title, sayScript },
+            "*"
+          );
+        } catch (_) {}
       }
     }
 
@@ -474,6 +531,17 @@
             var d=ev.data;if(!d||d.source!=='dnd-copilot-dashboard')return;
             if(ev.source)win=ev.source;
             if(d.type==='DASHBOARD_READY'||d.type==='REQUEST_SNAPSHOT'){send('ABOVEVTT_SNAPSHOT',snap());}
+            if(d.type==='SHOW_ROLL_COACH'){
+              var card=document.getElementById('dnd-copilot-bm-coach');
+              if(!card){card=document.createElement('div');card.id='dnd-copilot-bm-coach';card.style.cssText='position:fixed;bottom:52px;right:14px;z-index:2147483647;max-width:380px;background:#171d2b;color:#f3f6fc;border:1.5px solid #f0c46c;border-radius:10px;padding:12px 14px;font:14px/1.45 system-ui,sans-serif;box-shadow:0 12px 32px rgba(0,0,0,.7);';document.body.appendChild(card);}
+              card.textContent='';
+              var hd=document.createElement('div');hd.style.cssText='font-weight:700;color:#f0c46c;margin-bottom:4px;display:flex;justify-content:space-between;gap:8px;';
+              var sp=document.createElement('span');sp.textContent='🎲 '+(d.title||'Full Potential');
+              var xb=document.createElement('button');xb.textContent='✕';xb.style.cssText='background:none;border:none;color:#cbd5e8;cursor:pointer;font-size:15px;';xb.onclick=function(){card.remove();};
+              hd.appendChild(sp);hd.appendChild(xb);
+              var bd=document.createElement('div');bd.textContent=d.sayScript||'';
+              card.appendChild(hd);card.appendChild(bd);
+            }
             if(d.type==='FETCH_CHARACTER'){
               try{
                 var tokRes=await fetch('https://auth-service.dndbeyond.com/v1/cobalt-token',{method:'POST',credentials:'include'}).catch(function(){return null;});
