@@ -1266,6 +1266,70 @@ body.has-audio-bar .main-grid {
   line-height: 1.45;
 }
 
+.idea-cat-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  margin-right: 7px;
+  vertical-align: middle;
+  border: 1px solid transparent;
+}
+
+.idea-cat-badge.cat-say {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(245, 158, 11, 0.45);
+  color: #fcd34d;
+}
+
+.idea-cat-badge.cat-check {
+  background: rgba(56, 189, 248, 0.15);
+  border-color: rgba(56, 189, 248, 0.4);
+  color: #7dd3fc;
+}
+
+.idea-cat-badge.cat-puzzle {
+  background: rgba(168, 85, 247, 0.16);
+  border-color: rgba(168, 85, 247, 0.45);
+  color: #d8b4fe;
+}
+
+.idea-cat-badge.cat-item {
+  background: rgba(62, 207, 142, 0.15);
+  border-color: rgba(62, 207, 142, 0.4);
+  color: #6ee7b7;
+}
+
+.idea-cat-badge.cat-spell {
+  background: rgba(91, 138, 245, 0.16);
+  border-color: rgba(91, 138, 245, 0.42);
+  color: #93c5fd;
+}
+
+.idea-say-quote {
+  margin: 6px 0 7px;
+  padding: 8px 11px;
+  border-left: 3px solid var(--amber);
+  border-radius: 0 8px 8px 0;
+  background: rgba(245, 158, 11, 0.08);
+  color: #fef3c7;
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+.fp-highlights-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.fp-highlight-chip {
+  font-size: 13px;
+  padding: 5px 10px;
+}
+
 .hidden {
   display: none !important;
 }

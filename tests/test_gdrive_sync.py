@@ -130,6 +130,18 @@ class GdriveSyncTests(unittest.TestCase):
                     gdrive_sync.OAUTH_CLIENT_FILE,
                 ) = orig_paths
 
+    def test_detect_transcript_highlights_finds_puzzle_social_combat(self):
+        lines = (
+            ["Harbin asks about a bargain and persuasion deal at the tavern?"] * 120
+            + ["Roll for initiative! Attack roll 18 deals 14 damage! Bloodied!"] * 120
+            + ["A dwarven riddle inscription etched into the hollow door runes!"] * 120
+        )
+        hi = gdrive_sync.detect_transcript_highlights("\n".join(lines))
+        self.assertGreater(hi["puzzle"]["score"], 0)
+        self.assertGreater(hi["puzzle"]["startPct"], hi["combat"]["startPct"])
+        self.assertLess(hi["social"]["startPct"], hi["combat"]["startPct"])
+        self.assertIn("riddle", hi["puzzle"]["snippet"].lower())
+
 
 if __name__ == "__main__":
     unittest.main()

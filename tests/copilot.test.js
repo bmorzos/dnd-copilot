@@ -1938,3 +1938,185 @@ test("Groq model fallback retries on 404, Gemini retries fastModel, and LocalBra
   assert.ok(!actors.includes("You guys"), `Should ignore You guys, got ${JSON.stringify(actors)}`);
   assert.ok(actors.includes("Raine"), `Should capture Raine, got ${JSON.stringify(actors)}`);
 });
+
+test("Scene-jump Fast Play locates puzzle/social/keyword/range slices and delivers non-spell Live Ideas + Puzzle solutions", async () => {
+  const sb = createBrowserSandbox();
+  const store = sb.DnDCopilot.Store;
+  const gemini = sb.DnDCopilot.GeminiClient;
+  const localBrain = sb.DnDCopilot.LocalBrain;
+
+  // Build a multi-part transcript (~280 lines): Social intro, Combat middle, Puzzle/Riddle climax
+  const lines = [];
+  for (let i = 0; i < 95; i++) {
+    lines.push(`[Speaker 1]\nMayor Harbin asks politely about the bargain at Stonehill Inn (${i}). Persuasion check?`);
+  }
+  for (let i = 0; i < 95; i++) {
+    lines.push(`[Speaker 2]\nRoll initiative! Goblin takes 12 damage on a hit roll (${i}).`);
+  }
+  for (let i = 0; i < 95; i++) {
+    if (i === 40) {
+      lines.push(`[DM]\nYou see glowing runes and an engraving on the stone pillar: "I dinna nibble me nails, I crush them head first, mouthless."`);
+    } else if (i === 55) {
+      lines.push(`[DM]\nAnother riddle etching around the secret door says: "To name me is to speak of none, though what I block is hollow."`);
+    } else {
+      lines.push(`[Speaker 3]\nLet us check the riddle inscription and pillar glint (${i}).`);
+    }
+  }
+  const rawTranscript = lines.join("\n\n");
+  const parsed = gemini.parseTranscriptTextToLines(rawTranscript);
+
+  const puzWin = gemini.findSceneWindowInLines(parsed, { mode: "puzzle" });
+  assert.ok(puzWin.startPct >= 55, `Expected puzzle window near end, got ${puzWin.startPct}%`);
+  assert.ok(puzWin.score > 20);
+
+  const socWin = gemini.findSceneWindowInLines(parsed, { mode: "social" });
+  assert.ok(socWin.startPct <= 25, `Expected social window near start, got ${socWin.startPct}%`);
+
+  const kwWin = gemini.findSceneWindowInLines(parsed, { mode: "keyword", keyword: "mouthless" });
+  assert.ok(
+    parsed.slice(kwWin.startIndex, kwWin.endIndex).some((l) => /mouthless/i.test(l.text)),
+    "Keyword window should contain the keyword line"
+  );
+
+  const rangeWin = gemini.findSceneWindowInLines(parsed, { mode: "range", startPct: 70, endPct: 95 });
+  assert.ok(rangeWin.startPct >= 68 && rangeWin.endPct <= 100);
+
+  // LocalBrain delivers non-spell Say/Check/Puzzle ideas in Puzzle mode
+  store.resetSession();
+  store.upsertCharacter(
+    {
+      id: "141442264",
+      name: "Raine",
+      classSummary: "Wizard 6",
+      level: 6,
+      hp: { current: 48, max: 48, temp: 0 },
+      ac: 13,
+      passivePerception: 14,
+      proficientSkills: ["Arcana", "Investigation"],
+      notableItems: [{ name: "Sending Stone", attuned: false, snippet: "Send 25-word message" }],
+      spellSlots: [{ level: 3, max: 3, used: 0, remaining: 3, isPact: false }],
+      spells: [{ name: "Detect Magic", level: 1, ritual: true, castingTime: "Action", range: "Self", summary: "Sense magic" }]
+    },
+    { manualAdd: true }
+  );
+  store.updateSettings({ aiProvider: "local-free" });
+  store.state.situation.sceneMode = "Puzzle";
+  store.state.puzzle.isActive = true;
+  store.state.puzzle.promptOrInscription = "To name me is to speak of none";
+  const localAdv = await localBrain.adviseTacticsAndSpells(store, "");
+  assert.ok(localAdv.recommendations.some((r) => /say/i.test(r.category) && r.sayThis), "LocalBrain should include Say / Roleplay with sayThis quote");
+  assert.ok(localAdv.recommendations.some((r) => /puzzle|check/i.test(r.category)), "LocalBrain should include Puzzle or Check idea");
+
+  // GeminiClient fastPlayTranscript with mode: 'puzzle' runs solvePuzzle + passes puzzle context + stores category/sayThis
+  let callOrder = [];
+  let advisorSawPuzzleCtx = false;
+  store.updateSettings({ aiProvider: "groq", groqApiKey: "gsk_test_puzzle" });
+  sb.fetch = async (_url, opts) => {
+    const body = JSON.parse(opts.body || "{}");
+    const sys = body.messages?.[0]?.content || "";
+    const usr = body.messages?.[1]?.content || "";
+    if (sys.includes("partyUpdates")) {
+      callOrder.push("digest");
+      return {
+        ok: true,
+        json: async () => ({
+          choices: [{
+            message: {
+              content: JSON.stringify({
+                sceneMode: "Puzzle",
+                location: "Dwarven Foyer",
+                headline: "Party decodes pillar and doorway riddles",
+                summaryBullets: ["Found etching on hidden door", "Pillar glinted when saying Hammer"],
+                activeObjectives: ["Solve both riddles to open the door"],
+                suggestedNextMoves: ["Ask DM about glinting order"],
+                notableNpcs: ["Harbin"],
+                puzzleDetected: true,
+                puzzleTitle: "Hammer & Silence Riddles",
+                puzzleInscription: "I dinna nibble me nails... / To name me is to speak of none, though what I block is hollow.",
+                newPuzzleClues: ["Saying 'hammer' made words on the pillar glint"],
+                observedEnemyNotes: [],
+                partyUpdates: []
+              })
+            }
+          }]
+        })
+      };
+    }
+    if (sys.includes("hypotheses")) {
+      callOrder.push("solvePuzzle");
+      return {
+        ok: true,
+        json: async () => ({
+          choices: [{
+            message: {
+              content: JSON.stringify({
+                title: "Dwarven Pillar & Silence Door",
+                promptOrInscription: "I dinna nibble me nails... / To name me is to speak of none",
+                extractedClues: ["Saying hammer makes the pillar glint", "Doorway etching says to name me is to speak of none"],
+                hypotheses: [
+                  { solution: "Answer #1: Hammer | Answer #2: Silence / Nothing", confidence: "High", reasoning: "Crushes nails mouthless = hammer; speak of none = silence/nothing." }
+                ],
+                nextChecks: ["Speak 'Silence' or 'Nothing' toward the doorway frame"]
+              })
+            }
+          }]
+        })
+      };
+    }
+    if (sys.includes("category")) {
+      callOrder.push("advise");
+      if (usr.includes("ACTIVE PUZZLE")) advisorSawPuzzleCtx = true;
+      return {
+        ok: true,
+        json: async () => ({
+          choices: [{
+            message: {
+              content: JSON.stringify({
+                tacticalOverview: "You have both riddles isolated—test the spoken answers safely from 20 feet back.",
+                concentrationWarning: "",
+                pastSessionConnection: "",
+                recommendations: [
+                  {
+                    rank: 1,
+                    category: "Say / Roleplay",
+                    spellOrAction: "Speak 'Silence' & Test the Doorway Wordplay Aloud",
+                    slotInfo: "No Slot · Say Aloud / Puzzle",
+                    sayThis: "I step 20 feet behind the pillar and say clearly toward the door etching: 'Silence — nothing blocks a hollow doorway!'",
+                    whyBest: "'Speak of none' points directly to Silence or Nothing; testing aloud from range avoids any close-up trap."
+                  },
+                  {
+                    rank: 2,
+                    category: "Check / Investigate",
+                    spellOrAction: "Check Which Pillar Words Lit Up in Order",
+                    slotInfo: "Investigation Check · DM Question",
+                    sayThis: "DM, when everyone shouted 'hammer' earlier, did the pillar glint on specific etched letters in sequence?",
+                    whyBest: "Reveals whether the pillar expects a spoken trigger or striking specific runes with a hammer."
+                  }
+                ],
+                customAnswer: ""
+              })
+            }
+          }]
+        })
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: JSON.stringify({ headline: "Riddles in the Foyer", bullets: ["Decoded doorway clues"] }) } }]
+      })
+    };
+  };
+
+  const fpPuzzle = await gemini.fastPlayTranscript(store, rawTranscript, {
+    title: "BUGS 45 Puzzle Test",
+    mode: "puzzle",
+    acts: 2
+  });
+  assert.equal(fpPuzzle.window.mode, "puzzle");
+  assert.ok(advisorSawPuzzleCtx, "adviseTacticsAndSpells should receive active puzzle clues & theories");
+  assert.ok(callOrder.indexOf("solvePuzzle") !== -1 && callOrder.indexOf("solvePuzzle") < callOrder.indexOf("advise"));
+  assert.equal(store.state.advisor.recommendations[0].category, "Say / Roleplay");
+  assert.match(store.state.advisor.recommendations[0].sayThis, /Silence/i);
+  assert.match(store.state.puzzle.hypotheses[0].solution, /Hammer|Silence/i);
+});

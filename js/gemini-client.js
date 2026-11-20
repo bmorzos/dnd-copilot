@@ -989,7 +989,19 @@
     if (res.puzzleDetected || (Array.isArray(res.newPuzzleClues) && res.newPuzzleClues.length > 0)) {
       store.state.puzzle.isActive = true;
       if (res.puzzleTitle) store.state.puzzle.title = res.puzzleTitle;
-      if (res.puzzleInscription) store.state.puzzle.promptOrInscription = res.puzzleInscription;
+      if (res.puzzleInscription) {
+        const nextInsc = String(res.puzzleInscription).trim();
+        const prevInsc = String(store.state.puzzle.promptOrInscription || "").trim();
+        if (!prevInsc) {
+          store.state.puzzle.promptOrInscription = nextInsc;
+        } else if (
+          nextInsc &&
+          !prevInsc.toLowerCase().includes(nextInsc.slice(0, 28).toLowerCase()) &&
+          prevInsc.length < 480
+        ) {
+          store.state.puzzle.promptOrInscription = `${prevInsc}\n${nextInsc}`;
+        }
+      }
       for (const c of res.newPuzzleClues || []) {
         if (c && !store.state.puzzle.clues.includes(c)) {
           store.state.puzzle.clues.push(c);
@@ -1046,9 +1058,16 @@
     }
 
     const ctx = buildCompactSessionContext(store, drivePastCtx);
+    const extendedTranscript = (store.state.transcript || [])
+      .slice(-55)
+      .map((t) => `[${t.speaker}] ${t.text}`)
+      .join("\n");
     const prompt = [
-      "Help solve this D&D puzzle, riddle, or mechanism clearly and concisely.",
-      `Inscription / Riddle: ${store.state.puzzle.promptOrInscription || "(Check transcript)"}`,
+      "Help solve this D&D puzzle, riddle, or mechanism clearly and practically for the player.",
+      "Extract exact riddle/inscription wordings verbatim from the conversation if not already listed (if multiple linked riddles exist, include all of them clearly).",
+      "Break down any metaphors, wordplay, or physical clues into 2 to 4 concrete hypotheses ranked best-first, explaining WHAT TO SAY ALOUD or PHYSICALLY TEST.",
+      "For nextChecks, list 3 to 4 crisp non-obvious things the player can say to the DM/party, investigate, or safely test from range.",
+      `Inscription / Riddle: ${store.state.puzzle.promptOrInscription || "(Extract from transcript)"}`,
       `Clues:\n${store.state.puzzle.clues.map((c, i) => `${i + 1}. ${c}`).join("\n") || "None pinned yet"}`,
       extraUserNote ? `Extra Note: ${extraUserNote}` : "",
       "--- MY SPELLS ---",
@@ -1057,7 +1076,7 @@
         ? ["--- PAST SESSIONS / DRIVE ARCHIVE ---", ctx.pastSessionsText]
         : []),
       "--- RECENT CONVERSATION ---",
-      ctx.recentTranscript || "None"
+      extendedTranscript || ctx.recentTranscript || "None"
     ]
       .filter(Boolean)
       .join("\n");
@@ -1094,12 +1113,19 @@
       geminiSchema: schema,
       groqSchemaHint: JSON.stringify({
         title: "Puzzle Title",
-        promptOrInscription: "Riddle text if found",
-        extractedClues: ["Clue 1"],
+        promptOrInscription: "Exact riddle or inscription text found in transcript",
+        extractedClues: ["Physical or verbal clue 1", "Clue 2"],
         hypotheses: [
-          { solution: "Best Solution", confidence: "High", reasoning: "Short clear reason" }
+          {
+            solution: "Clear Solution / Answer + Action to Test",
+            confidence: "High | Medium",
+            reasoning: "Wordplay breakdown and how the table clues point to it"
+          }
         ],
-        nextChecks: ["Ask DM to check X"]
+        nextChecks: [
+          "Say/ask DM: '...' ",
+          "Physical/Investigation check to test safely"
+        ]
       })
     });
 
@@ -1130,24 +1156,54 @@
     }
 
     const ctx = buildCompactSessionContext(store, drivePastCtx);
-    const sceneMode = store.state.situation?.sceneMode || (store.state.combat.inCombat ? "Combat" : "Exploration");
+    const st = store.state;
+    const sceneMode = st.situation?.sceneMode || (st.combat.inCombat ? "Combat" : "Exploration");
+    const puzzleActive = Boolean(
+      sceneMode === "Puzzle" ||
+        st.puzzle?.isActive ||
+        st.puzzle?.promptOrInscription ||
+        (st.puzzle?.clues || []).length > 0 ||
+        (st.puzzle?.hypotheses || []).length > 0
+    );
+    const puzzleContextLines = puzzleActive
+      ? [
+          "--- ACTIVE PUZZLE / MYSTERY ---",
+          st.puzzle?.title ? `Title: ${st.puzzle.title}` : "",
+          st.puzzle?.promptOrInscription ? `Inscription / Riddle: ${st.puzzle.promptOrInscription}` : "",
+          (st.puzzle?.clues || []).length > 0
+            ? `Clues:\n${st.puzzle.clues.slice(-6).map((c) => `- ${c}`).join("\n")}`
+            : "",
+          (st.puzzle?.hypotheses || []).length > 0
+            ? `Current Solver Theories:\n${st.puzzle.hypotheses
+                .slice(0, 2)
+                .map((h) => `- ${h.solution} (${h.confidence}): ${h.reasoning}`)
+                .join("\n")}`
+            : ""
+        ].filter(Boolean)
+      : [];
+
+    const nonCombatFocus = sceneMode !== "Combat" || puzzleActive;
     const prompt = [
-      `Current Scene Mode: ${sceneMode}.`,
-      "Give 3 to 4 crisp, practical IDEAS of things I should DO, TRY, ASK THE DM, CHECK, or CAST right now.",
-      "Always adapt to the current moment: in Exploration/Social/Puzzle scenes, suggest clever questions to ask the DM, skill checks I'm strong at, magic item/utility spell uses, and past-session callbacks—NOT just combat attacks. In Combat, suggest best spells/actions using only prepared spells with remaining slots, and warn before breaking Concentration.",
+      `Current Scene Mode: ${sceneMode}${puzzleActive ? " (Active Puzzle/Mystery Present)" : ""}.`,
+      "Give 3 to 4 crisp, practical IDEAS of things I should SAY ALOUD, ASK THE DM, CHECK, TEST, or DO right now. Do NOT just recommend casting spells.",
+      nonCombatFocus
+        ? "NON-COMBAT / PUZZLE RULE: At least 3 of your 4 ideas MUST be NON-SPELL moves (Roleplay dialogue / clever questions to ask the DM or NPC, specific Skill Checks / Investigation tests, Puzzle hypotheses / physical experiments, or creative Item / Ally moves). Include AT MOST 1 utility spell/ritual, and only if genuinely helpful."
+        : "COMBAT MIX RULE: Even in Combat, include AT LEAST 1 non-spell idea (e.g., an in-character callout/parley/feint line, terrain/environment tactic, or crisp question to ask the DM about an enemy's weakness/condition) alongside your best spell/action picks.",
+      "Whenever an idea involves talking, roleplaying, bluffing, negotiating, or asking the DM/party a sharp question, put the exact natural spoken quote in `sayThis` so the player can literally read it at the table.",
       `--- PLAYING AS: ${ctx.myChar ? `${ctx.myChar.name} (${ctx.myChar.classSummary}, Save DC ${ctx.myChar.spellSaveDc})` : "Party Member"} ---`,
       ctx.myItemsAndSkills ? `--- MY SKILLS, FEATURES & MAGIC ITEMS ---\n${ctx.myItemsAndSkills}` : "",
       "Prepared Spells:",
       ctx.mySpellsText,
       "--- PARTY ---",
       ctx.partyText || "None synced",
-      `--- ENEMIES (Round ${store.state.combat.round || 1}) ---`,
+      `--- ENEMIES (Round ${st.combat.round || 1}) ---`,
       ctx.enemiesText || "No active enemies listed.",
+      ...puzzleContextLines,
       ...(ctx.pastSessionsText
         ? ["--- PAST SESSIONS / CAMPAIGN MEMORY ---", ctx.pastSessionsText]
         : []),
       "--- CURRENT SCENE & RECENT CONVERSATION ---",
-      store.state.situation?.headline ? `Scene Headline: ${store.state.situation.headline}` : "",
+      st.situation?.headline ? `Scene Headline: ${st.situation.headline}` : "",
       ctx.recentTranscript || "None",
       customQuestion ? `--- USER QUESTION: ${customQuestion} ---` : ""
     ]
@@ -1166,11 +1222,16 @@
             type: "object",
             properties: {
               rank: { type: "integer" },
+              category: {
+                type: "string",
+                enum: ["Say / Roleplay", "Check / Investigate", "Puzzle / Theory", "Item / Clever Move", "Spell"]
+              },
               spellOrAction: { type: "string" },
               slotInfo: { type: "string" },
+              sayThis: { type: "string" },
               whyBest: { type: "string" }
             },
-            required: ["rank", "spellOrAction", "slotInfo", "whyBest"]
+            required: ["rank", "category", "spellOrAction", "slotInfo", "whyBest"]
           }
         },
         customAnswer: { type: "string" }
@@ -1192,15 +1253,17 @@
       prompt,
       geminiSchema: schema,
       groqSchemaHint: JSON.stringify({
-        tacticalOverview: "1-sentence read on the moment and our best angle",
+        tacticalOverview: "1-sentence read on the scene, puzzle, or social tension and our best angle",
         concentrationWarning: "Leave EMPTY string unless PC is actively concentrating on a spell",
         pastSessionConnection: "1-2 sentence tie-in to a past session NPC/clue/quest if relevant right now, otherwise empty string",
         recommendations: [
           {
             rank: 1,
-            spellOrAction: "Action, Spell, Check, or Question to Try",
-            slotInfo: "Category / Slot Cost / Skill (e.g. L2 Slot (2/3 left) · Action OR Investigation Check OR Ask DM)",
-            whyBest: "1-2 clear sentences explaining why to try this now"
+            category: "Say / Roleplay | Check / Investigate | Puzzle / Theory | Item / Clever Move | Spell",
+            spellOrAction: "Short clear title of the thing to say, test, check, or cast",
+            slotInfo: "No Slot · Say / Roleplay  OR  Investigation Check  OR  Puzzle Theory  OR  L2 Slot (3/3 left)",
+            sayThis: "Optional exact sentence to say out loud to the DM, NPC, or party (empty string if pure silent action)",
+            whyBest: "1-2 clear sentences explaining why this helps right now"
           }
         ],
         customAnswer: ""
@@ -1212,16 +1275,27 @@
     const safeWarn =
       !isActivelyConcentrating || /concentration\s+is\s+free/i.test(rawWarn) ? "" : rawWarn;
 
+    const cleanRecs = Array.isArray(res.recommendations)
+      ? res.recommendations.slice(0, 4).map((r, idx) => ({
+          rank: Number(r.rank) || idx + 1,
+          category: String(r.category || "").trim(),
+          spellOrAction: String(r.spellOrAction || "").trim(),
+          slotInfo: String(r.slotInfo || "").trim(),
+          sayThis: String(r.sayThis || "").trim(),
+          whyBest: String(r.whyBest || "").trim()
+        }))
+      : [];
+
     store.state.advisor = {
       tacticalOverview: res.tacticalOverview || "",
       concentrationWarning: safeWarn,
       pastSessionConnection: res.pastSessionConnection || "",
-      recommendations: Array.isArray(res.recommendations) ? res.recommendations.slice(0, 4) : [],
+      recommendations: cleanRecs,
       customAnswer: customQuestion ? res.customAnswer || "" : "",
       lastAdvisedAt: Date.now()
     };
     store.save();
-    return res;
+    return { ...res, recommendations: cleanRecs };
   }
 
   function sampleLargeText(rawText, maxChars = 18000) {
@@ -1498,7 +1572,7 @@
     return result;
   }
 
-  function selectSalientActLines(actLines, maxChars = 5500) {
+  function selectSalientActLines(actLines, maxChars = 6500) {
     if (!Array.isArray(actLines) || actLines.length === 0) return [];
     const formatted = actLines.map((l, idx) => ({
       idx,
@@ -1506,16 +1580,22 @@
       score: 0
     }));
     const SALIENCE_RE =
-      /\b(cast(?:s|ing)?|fireball|hold\s+person|hunter'?s\s+mark|sneak\s+attack|smite|uncanny\s+dodge|damage|heal(?:s|ed)?|hp|hit\s+points?|inspiration|bloodied|unconscious|rage|raging|goblin|duergar|dragon|zorzula|phandalin|stonehill|well|stone|axe|clue|secret|riddle|puzzle|save|saving\s+throw|persuasion|investigation|perception|insight|intimidation|raine|munder|gonloar|bone\s*hawk|lusomorris|keel|patty|scrap|gwen)\b/i;
+      /\b(cast(?:s|ing)?|fireball|hold\s+person|hunter'?s\s+mark|sneak\s+attack|smite|uncanny\s+dodge|damage|heal(?:s|ed)?|hp|hit\s+points?|inspiration|bloodied|unconscious|rage|raging|goblin|duergar|dragon|zorzula|phandalin|stonehill|well|stone|axe|clue|secret|riddle|puzzle|cipher|inscription|engrav\w*|etch\w*|runes?|pillar|door|hollow|mouthless|glint|wall|hammer|statue|pedestal|pressure\s+plate|lever|symbol|mural|keystone|cornerstone|save|saving\s+throw|persuasion|investigation|perception|insight|intimidation|raine|munder|gonloar|bone\s*hawk|lusomorris|keel|patty|scrap|gwen)\b/i;
 
     for (let i = 0; i < formatted.length; i++) {
       const txt = String(formatted[i].line.text || "");
       let sc = txt.length >= 28 ? 1 : 0;
       const matches = txt.match(new RegExp(SALIENCE_RE.source, "gi"));
-      if (matches) sc += matches.length * 4;
+      if (matches) {
+        sc += matches.length * 4;
+        if (matches.length >= 1) {
+          if (i > 0) formatted[i - 1].score += 3;
+          if (i + 1 < formatted.length) formatted[i + 1].score += 3;
+        }
+      }
       if (/\d{1,3}/.test(txt)) sc += 2;
       if (i < 2 || i >= formatted.length - 6) sc += 3;
-      formatted[i].score = sc;
+      formatted[i].score += sc;
     }
 
     const pickedIdx = new Set();
@@ -1534,9 +1614,153 @@
       .map((i) => formatted[i].line);
   }
 
+  const PUZZLE_STRONG_RE =
+    /\b(riddle|puzzle|cipher|inscription|engrav\w*|etch\w*|pressure\s+plate|mouthless|hollow|secret\s+door)\b/i;
+  const PUZZLE_SUPPORT_RE =
+    /\b(runes?|keystone|cornerstone|pillar|statue|pedestal|lever|symbol|mural|glint|clues?|investigation|hammer|doorway)\b/i;
+  const SOCIAL_WINDOW_RE =
+    /\b(persuasion|insight|deception|intimidation|ask\s+him|ask\s+her|ask\s+them|mayor|harbin|tavern|innkeeper|deal|negotiate|bargain|question|interrogate|promise|secret|sending\s+stone|talk\s+to)\b/i;
+  const COMBAT_WINDOW_RE =
+    /\b(initiative|roll\s+to\s+hit|armor\s+class|damage|fireball|saving\s+throw|hit\s+points?|bloodied|unconscious|attack\s+roll|sneak\s+attack|critical)\b/i;
+
+  function scoreWindowLines(parsedLines, start, end, scorerFn) {
+    let total = 0;
+    let bestLineIdx = start;
+    let bestLineScore = -Infinity;
+    for (let i = start; i < end; i++) {
+      const txt = String(parsedLines[i]?.text || "");
+      const s = scorerFn(txt);
+      total += s;
+      if (s > bestLineScore && txt.length >= 16) {
+        bestLineScore = s;
+        bestLineIdx = i;
+      }
+    }
+    return { total, bestLineIdx };
+  }
+
+  function findSceneWindowInLines(parsedLines, options = {}) {
+    const total = Array.isArray(parsedLines) ? parsedLines.length : 0;
+    if (total === 0) {
+      return { startIndex: 0, endIndex: 0, startPct: 0, endPct: 100, mode: "full", label: "Empty", score: 0, snippet: "" };
+    }
+    const mode = String(options?.mode || "full").toLowerCase();
+    if (mode === "full") {
+      return { startIndex: 0, endIndex: total, startPct: 0, endPct: 100, mode: "full", label: "Full Episode", score: 0, snippet: "" };
+    }
+    if (mode === "range") {
+      const startPct = Math.max(0, Math.min(95, Number(options?.startPct ?? 0)));
+      const endPct = Math.max(startPct + 5, Math.min(100, Number(options?.endPct ?? 100)));
+      const startIndex = Math.max(0, Math.floor((startPct / 100) * total));
+      const endIndex = Math.min(total, Math.max(startIndex + 1, Math.ceil((endPct / 100) * total)));
+      return {
+        startIndex,
+        endIndex,
+        startPct: Math.round((startIndex / total) * 100),
+        endPct: Math.round((endIndex / total) * 100),
+        mode: "range",
+        label: `Custom Range (${Math.round(startPct)}%–${Math.round(endPct)}%)`,
+        score: endIndex - startIndex,
+        snippet: String(parsedLines[startIndex]?.text || "").slice(0, 110)
+      };
+    }
+
+    const winSize = Math.min(total, Math.min(200, Math.max(90, Math.round(total * 0.12))));
+    const step = Math.max(5, Math.floor(winSize / 10));
+
+    let scorerFn = null;
+    let label = "Scene Jump";
+    if (mode === "keyword") {
+      const kws = String(options?.keyword || "")
+        .split(/[,|]+/)
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => s.length >= 2);
+      if (kws.length === 0) {
+        return findSceneWindowInLines(parsedLines, { mode: "full" });
+      }
+      label = `Keyword: ${kws.join(", ")}`;
+      scorerFn = (txt) => {
+        const low = txt.toLowerCase();
+        let sc = 0;
+        for (const k of kws) {
+          if (low.includes(k)) sc += 5;
+        }
+        return sc;
+      };
+    } else if (mode === "puzzle") {
+      label = "Puzzle / Riddle Scene";
+      scorerFn = (txt) => {
+        const strong = txt.match(new RegExp(PUZZLE_STRONG_RE.source, "gi"))?.length || 0;
+        const sup = txt.match(new RegExp(PUZZLE_SUPPORT_RE.source, "gi"))?.length || 0;
+        const combatPenalty = /\b(initiative|roll\s+for\s+initiative)\b/i.test(txt) ? -1 : 0;
+        return strong * 5 + sup * 2 + combatPenalty;
+      };
+    } else if (mode === "social") {
+      label = "Social / Roleplay Scene";
+      scorerFn = (txt) => {
+        const soc = txt.match(new RegExp(SOCIAL_WINDOW_RE.source, "gi"))?.length || 0;
+        const cmb = txt.match(new RegExp(COMBAT_WINDOW_RE.source, "gi"))?.length || 0;
+        const qBonus = /\?/.test(txt) && txt.length >= 25 ? 1 : 0;
+        return soc * 3 + qBonus - cmb * 2;
+      };
+    } else if (mode === "combat") {
+      label = "Combat Encounter";
+      scorerFn = (txt) => (txt.match(new RegExp(COMBAT_WINDOW_RE.source, "gi"))?.length || 0) * 3;
+    } else {
+      return findSceneWindowInLines(parsedLines, { mode: "full" });
+    }
+
+    let bestStart = 0;
+    let bestScore = -Infinity;
+    let bestPeakIdx = 0;
+    for (let s = 0; s <= Math.max(0, total - winSize); s += step) {
+      const end = Math.min(total, s + winSize);
+      const { total: sc, bestLineIdx } = scoreWindowLines(parsedLines, s, end, scorerFn);
+      if (sc > bestScore) {
+        bestScore = sc;
+        bestStart = s;
+        bestPeakIdx = bestLineIdx;
+      }
+    }
+    if (total > winSize) {
+      const tailStart = total - winSize;
+      const { total: sc, bestLineIdx } = scoreWindowLines(parsedLines, tailStart, total, scorerFn);
+      if (sc > bestScore) {
+        bestScore = sc;
+        bestStart = tailStart;
+        bestPeakIdx = bestLineIdx;
+      }
+    }
+
+    const paddedStart = Math.max(0, bestStart - 10);
+    const paddedEnd = Math.min(total, bestStart + winSize + 15);
+    return {
+      startIndex: paddedStart,
+      endIndex: paddedEnd,
+      startPct: Math.round((paddedStart / total) * 100),
+      endPct: Math.max(Math.round((paddedStart / total) * 100) + 1, Math.round((paddedEnd / total) * 100)),
+      mode,
+      label,
+      score: Math.max(0, Math.round(bestScore)),
+      snippet: String(parsedLines[bestPeakIdx]?.text || "").slice(0, 120)
+    };
+  }
+
+  function detectTranscriptHighlights(rawText) {
+    const parsedLines = parseTranscriptTextToLines(rawText);
+    return {
+      lineCount: parsedLines.length,
+      puzzle: findSceneWindowInLines(parsedLines, { mode: "puzzle" }),
+      social: findSceneWindowInLines(parsedLines, { mode: "social" }),
+      combat: findSceneWindowInLines(parsedLines, { mode: "combat" })
+    };
+  }
+
   async function fastPlayTranscript(store, rawText, options = {}) {
     const title = String(options?.title || "Transcript Replay").trim();
-    const targetActs = Math.max(1, Math.min(8, Number(options?.acts) || 5));
+    const mode = String(options?.mode || "full").toLowerCase();
+    const defaultActs = mode !== "full" ? 3 : 5;
+    const targetActs = Math.max(1, Math.min(8, Number(options?.acts) || defaultActs));
     const resetFirst = options?.resetFirst !== false;
     const onProgress = typeof options?.onProgress === "function" ? options.onProgress : () => {};
     const shouldCancel = typeof options?.shouldCancel === "function" ? options.shouldCancel : () => false;
@@ -1546,18 +1770,25 @@
       throw new Error("No dialogue lines found in transcript to fast-play.");
     }
 
-    if (resetFirst) {
-      store.resetSession();
-      store.state.sessionTitle = title;
+    const win = findSceneWindowInLines(parsedLines, options);
+    const targetLines = parsedLines.slice(win.startIndex, win.endIndex);
+    if (targetLines.length === 0) {
+      throw new Error("Selected scene window is empty.");
     }
 
-    const numActs = Math.min(targetActs, Math.max(1, Math.ceil(parsedLines.length / 25)));
-    const chunkSize = Math.ceil(parsedLines.length / numActs);
+    if (resetFirst) {
+      store.resetSession();
+      store.state.sessionTitle =
+        win.mode === "full" ? title : `${title} · ${win.label}`;
+    }
+
+    const numActs = Math.min(targetActs, Math.max(1, Math.ceil(targetLines.length / 25)));
+    const chunkSize = Math.ceil(targetLines.length / numActs);
     let actsProcessed = 0;
 
     for (let a = 0; a < numActs; a++) {
       if (shouldCancel()) break;
-      const slice = parsedLines.slice(a * chunkSize, (a + 1) * chunkSize);
+      const slice = targetLines.slice(a * chunkSize, (a + 1) * chunkSize);
       if (slice.length === 0) continue;
 
       const actItems = slice.map((item, j) => ({
@@ -1573,8 +1804,11 @@
       }
       store.save();
 
-      const salient = selectSalientActLines(actItems, 5500);
-      const actLabel = `Act ${a + 1}/${numActs} (${title})`;
+      const salient = selectSalientActLines(actItems, 6500);
+      const actLabel =
+        win.mode === "puzzle"
+          ? `Puzzle / Riddle Focus Act ${a + 1}/${numActs} (${title}) — extract any verbatim riddles, inscriptions, etchings, physical clues, and set sceneMode to Puzzle`
+          : `Act ${a + 1}/${numActs} (${title}${win.mode !== "full" ? ` · ${win.label}` : ""})`;
       let res = null;
       try {
         res = await analyzeTableSituation(store, {
@@ -1604,21 +1838,28 @@
       }
     }
 
-    if (!shouldCancel()) {
-      onProgress({ phase: "advisor", act: actsProcessed, totalActs: numActs, headline: "Updating Live Ideas..." });
-      try {
-        await adviseTacticsAndSpells(store, "");
-      } catch (_) {
-        await global.DnDCopilot?.LocalBrain?.adviseTacticsAndSpells?.(store, "");
-      }
+    const playedText = targetLines.map((l) => l.text).join(" ");
+    const hasPuzzleSignal =
+      win.mode === "puzzle" ||
+      store.state.puzzle?.isActive ||
+      (store.state.puzzle?.clues || []).length > 0 ||
+      PUZZLE_STRONG_RE.test(playedText);
 
-      if (store.state.puzzle?.isActive || (store.state.puzzle?.clues || []).length > 0) {
-        onProgress({ phase: "puzzle", act: actsProcessed, totalActs: numActs, headline: "Analyzing Clues & Puzzles..." });
+    if (!shouldCancel()) {
+      if (hasPuzzleSignal) {
+        onProgress({ phase: "puzzle", act: actsProcessed, totalActs: numActs, headline: "Solving Clues & Riddles..." });
         try {
           await solvePuzzle(store, "");
         } catch (_) {
           await global.DnDCopilot?.LocalBrain?.solvePuzzle?.(store, "");
         }
+      }
+
+      onProgress({ phase: "advisor", act: actsProcessed, totalActs: numActs, headline: "Updating Live Ideas..." });
+      try {
+        await adviseTacticsAndSpells(store, "");
+      } catch (_) {
+        await global.DnDCopilot?.LocalBrain?.adviseTacticsAndSpells?.(store, "");
       }
 
       onProgress({ phase: "summary", act: actsProcessed, totalActs: numActs, headline: "Building Session Story..." });
@@ -1631,9 +1872,11 @@
 
     return {
       title,
-      totalLines: parsedLines.length,
+      totalLines: targetLines.length,
+      sourceTotalLines: parsedLines.length,
       actsProcessed,
-      headline: store.state.situation?.headline || ""
+      headline: store.state.situation?.headline || "",
+      window: win
     };
   }
 
@@ -1650,6 +1893,8 @@
     summarizeFullSession,
     parseTranscriptTextToLines,
     selectSalientActLines,
+    findSceneWindowInLines,
+    detectTranscriptHighlights,
     fastPlayTranscript
   };
 })(window);

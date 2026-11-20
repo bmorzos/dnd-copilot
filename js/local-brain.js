@@ -1034,6 +1034,7 @@
     if ((sceneMode !== "Combat" && enemyCount === 0) || isNonCombatQuestion) {
       const ideas = [];
       const topSkills = (myChar.proficientSkills || []).slice(0, 3);
+      const primaryNpc = (st.situation?.notableNpcs || [])[0] || "";
       const utilitySpells = (myChar.spells || []).filter((s) =>
         s.ritual ||
         s.level <= 2 &&
@@ -1045,41 +1046,80 @@
       if (sceneMode === "Social") {
         ideas.push({
           rank: ideas.length + 1,
-          spellOrAction: "Read Intentions or Press for Details (Insight / Persuasion)",
-          slotInfo: "Social Check · Ask the DM",
-          whyBest: `Ask the DM what their body language or motive looks like${
+          category: "Say / Roleplay",
+          spellOrAction: primaryNpc
+            ? `Press ${primaryNpc} for What's Left Unsaid (Insight / Persuasion)`
+            : "Read Intentions & Press for Leverage (Insight / Persuasion)",
+          slotInfo: "No Slot · Say Aloud / Insight",
+          sayThis: primaryNpc
+            ? `"${primaryNpc}, before we stick our necks out, tell us the part you haven't mentioned yet—who else has a stake in this?"`
+            : `"Look, we can help you clean this up, but only if you stop holding back—what are you actually afraid will happen?"`,
+          whyBest: `Nudge the conversation toward hidden motives and ask the DM for an Insight check${
             topSkills.length ? ` (your top skills: ${topSkills.join(", ")})` : ""
-          } before committing the party.`
+          } while they react.`
         });
-      } else if (sceneMode === "Puzzle" || st.puzzle.isActive) {
         ideas.push({
           rank: ideas.length + 1,
-          spellOrAction: "Inspect Wear Marks & Test Safely from 30 ft",
-          slotInfo: "Puzzle Investigation · No Resources",
+          category: "Check / Investigate",
+          spellOrAction:
+            topSkills.length > 0 ? `Ask for a ${topSkills[0]} / Persuasion Assist` : "Ask DM About Body Language & Exits",
+          slotInfo: `Skill Check · Passive Perception ${myChar.passivePerception || 10}`,
+          sayThis: `"DM, while our face talks to them, I'm watching their hands, coin purse, and who else in the room is listening closely."`,
+          whyBest: "Gathers tactical and roleplay intel at zero spell cost before the party makes a binding deal."
+        });
+      } else if (sceneMode === "Puzzle" || st.puzzle.isActive) {
+        const inscPreview = String(st.puzzle.promptOrInscription || "").trim().slice(0, 90);
+        const topHyp = (st.puzzle.hypotheses || [])[0];
+        ideas.push({
+          rank: ideas.length + 1,
+          category: "Say / Roleplay",
+          spellOrAction: "Compare the Clues Out Loud to the DM",
+          slotInfo: "No Slot · Ask DM / Party",
+          sayThis: inscPreview
+            ? `"DM, reading '${inscPreview}' alongside what already reacted in the room—do any specific words or carvings glow or shift when we say the answer aloud?"`
+            : `"DM, can we compare the exact wording we just found against where the light/dust reacted? Which spots on the wall or pillar look most worn?"`,
+          whyBest: "Forces a crisp DM clarification on verbal vs. physical triggers without blindly walking into a trap."
+        });
+        ideas.push({
+          rank: ideas.length + 1,
+          category: "Puzzle / Theory",
+          spellOrAction: topHyp?.solution || "Test Every Clue 1-to-1 Safely from 30 ft",
+          slotInfo: "Puzzle Hypothesis · Safe Probe",
+          sayThis: `"Everyone stand back 25 feet first—let's test calling or nudging the suspect piece from range before anyone touches it bare-handed."`,
           whyBest:
-            "Ask the DM for scorch marks, dust gaps, or magic auras on the mechanism, then probe from 30 ft back before touching directly."
+            topHyp?.reasoning ||
+            "Multi-part D&D riddles almost always pair each metaphor with a physical feature in the room (door, pillar, hammer, statue, or spoken key word)."
+        });
+        ideas.push({
+          rank: ideas.length + 1,
+          category: "Check / Investigate",
+          spellOrAction: topSkills.length > 0 ? `Roll ${topSkills[0]} on Tool/Dust Marks` : "Check Dust, Seams & Hinges",
+          slotInfo: `Skill Check · Passive Perception ${myChar.passivePerception || 10}`,
+          sayThis: `"DM, can I examine the seams around the wall/doorframe for hollow echoes, chisel marks, or fresh scratches?"`,
+          whyBest: "Follows up physical clues like falling dust, hollow stone, or metallic glints."
         });
       } else {
         ideas.push({
           rank: ideas.length + 1,
+          category: "Say / Roleplay",
+          spellOrAction: "Ask the DM for Sensory & Approach Details",
+          slotInfo: "No Slot · Ask the DM",
+          sayThis: `"DM, before we step further in—what do we hear or smell ahead, where are the shadows/cover, and do we notice any fresh tracks?"`,
+          whyBest: "Pulls critical ambush, trap, and social leverage cues from the DM before anyone triggers an encounter."
+        });
+        ideas.push({
+          rank: ideas.length + 1,
+          category: "Check / Investigate",
           spellOrAction:
             topSkills.length > 0
               ? `Lead with ${topSkills[0]} Check`
               : "Scout Ahead / Check Passive Perception",
           slotInfo: `Skill Check · Passive Perception ${myChar.passivePerception || 10}`,
+          sayThis: "",
           whyBest:
             topSkills.length > 0
               ? `Lean on ${myChar.name}'s strengths (${topSkills.join(", ")}) to check for traps, tracks, hidden compartments, or lore.`
-              : "Ask the DM what stands out in the room—lighting, exits, tracks, and anything out of place."
-        });
-      }
-
-      for (const sp of utilitySpells.slice(0, 2)) {
-        ideas.push({
-          rank: ideas.length + 1,
-          spellOrAction: `${sp.name}${sp.ritual ? " (Ritual)" : sp.level === 0 ? " (Cantrip)" : ` (L${sp.level})`}`,
-          slotInfo: sp.ritual ? "0 Slots (Ritual, 10 min)" : sp.level === 0 ? "Cantrip (Free)" : `Level ${sp.level} · ${sp.castingTime}`,
-          whyBest: sp.summary || "Practical utility spell for this scene."
+              : "Use your passive awareness to spot hidden doors, tripwires, or eavesdroppers."
         });
       }
 
@@ -1087,20 +1127,24 @@
         const it = myChar.notableItems[0];
         ideas.push({
           rank: ideas.length + 1,
-          spellOrAction: `Check Magic Gear: ${it.name}`,
-          slotInfo: it.attuned ? "Attuned Item" : "Equipped Gear",
+          category: "Item / Clever Move",
+          spellOrAction: `Check Magic Gear / Tool: ${it.name}`,
+          slotInfo: it.attuned ? "Attuned Item · No Spell Slot" : "Equipped Gear · Free",
+          sayThis: "",
           whyBest:
             it.snippet ||
-            "Keep your attuned/magic item charges and passive bonuses ready if the scene escalates."
+            "Leverage your equipped magic items, tools, or sending stones before spending leveled spell slots."
         });
       }
 
-      if (ideas.length < 3) {
+      for (const sp of utilitySpells.slice(0, 1)) {
         ideas.push({
           rank: ideas.length + 1,
-          spellOrAction: "Coordinate Help Action or Watch Rear",
-          slotInfo: "Team Play · Free",
-          whyBest: "Offer the Help action to give an ally Advantage on their next crucial skill check."
+          category: "Spell",
+          spellOrAction: `${sp.name}${sp.ritual ? " (Ritual)" : sp.level === 0 ? " (Cantrip)" : ` (L${sp.level})`}`,
+          slotInfo: sp.ritual ? "0 Slots (Ritual, 10 min)" : sp.level === 0 ? "Cantrip (Free)" : `Level ${sp.level} · ${sp.castingTime}`,
+          sayThis: "",
+          whyBest: sp.summary || "Practical low-cost utility spell for this scene."
         });
       }
 
@@ -1114,7 +1158,7 @@
         pastSessionConnection,
         recommendations: ideas.slice(0, 4).map((x, idx) => ({ ...x, rank: idx + 1 })),
         customAnswer: customQuestion
-          ? `Exploration/Social ideas for "${customQuestion}" using ${myChar.name}'s skills, utility spells, and gear ($0 local).`
+          ? `Non-combat / puzzle ideas for "${customQuestion}" using ${myChar.name}'s skills, roleplay angles, gear, and utility spells ($0 local).`
           : "",
         lastAdvisedAt: Date.now()
       };
@@ -1259,19 +1303,46 @@
 
     const top3 = scoredSpells.slice(0, 3).map((item, idx) => ({
       rank: idx + 1,
+      category: "Spell",
       spellOrAction: item.spellOrAction,
       slotInfo: item.slotInfo,
+      sayThis: "",
       whyBest: item.whyBest
     }));
 
-    if (top3.length === 0) {
-      top3.push({
+    // Always include at least 1 concrete non-spell move in combat too
+    const nonSpellCombatIdea = bloodiedEnemy
+      ? {
+          rank: top3.length + 1,
+          category: "Say / Roleplay",
+          spellOrAction: `Demand Surrender or Call Focus on ${bloodiedEnemy.name}`,
+          slotInfo: "No Slot · Free Speech / Tactics",
+          sayThis: `"Drop your weapons now! Tell us who sent you and you walk away alive—everyone else, finish ${bloodiedEnemy.name} if it flinches!"`,
+          whyBest: `${bloodiedEnemy.name} is already Bloodied—you may extract prisoners/intel for zero resources or break enemy morale.`
+        }
+      : {
+          rank: top3.length + 1,
+          category: "Check / Investigate",
+          spellOrAction: "Ask DM About Enemy State, Cover & Weaknesses",
+          slotInfo: "No Slot · Free Question / Positioning",
+          sayThis: `"DM, does any enemy look rattled, wearing metal armor, or shielding something behind them—and where is my nearest half-cover?"`,
+          whyBest: "Reveals positioning, metal-armor targets, or fragile concentrations before you spend a leveled spell slot."
+        };
+    top3.push(nonSpellCombatIdea);
+
+    if (top3.length === 1) {
+      top3.unshift({
         rank: 1,
+        category: "Item / Clever Move",
         spellOrAction: "Weapon Attack / Cantrip / Help / Dodge",
         slotInfo: "Action · No Spell Slots Remaining",
+        sayThis: "",
         whyBest: "All leveled spell slots are expended or no prepared spells are listed on this sheet."
       });
     }
+    top3.forEach((item, idx) => {
+      item.rank = idx + 1;
+    });
 
     st.advisor = {
       tacticalOverview: `Free Local 5e Tactical Engine for ${myChar.name} (${myChar.classSummary}): ${

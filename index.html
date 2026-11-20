@@ -183,12 +183,12 @@
           <button id="btnSolvePuzzle" class="btn btn-primary">🧠 Solve Puzzle</button>
         </div>
 
-        <input
+        <textarea
           id="puzzleInscriptionInput"
-          type="text"
-          class="input riddle-input"
+          class="textarea riddle-input"
+          rows="2"
           placeholder="Riddle or inscription text..."
-        />
+        ></textarea>
 
         <form id="addClueForm" class="simple-row">
           <input id="newClueInput" type="text" class="input" placeholder="Add a clue..." />
@@ -578,16 +578,46 @@
         <div class="info-block">
           <strong>☁️ Replay Episode from Google Drive</strong>
           <p class="muted-p">
-            Steps chronologically through the transcript in 5 acts, updating <strong>What's Going On</strong>, <strong>Party Sheets</strong> (damage, spell slots, conditions), <strong>Combat</strong>, <strong>Puzzle</strong>, and <strong>Live Ideas</strong>.
+            Play an entire episode in 5 acts or <strong>jump straight to a Puzzle, Social, or Combat scene</strong> across <strong>What's Going On</strong>, <strong>Party Sheets</strong>, <strong>Puzzle</strong>, and <strong>Live Ideas</strong>.
           </p>
           <div class="simple-row" style="margin-top:8px;flex-wrap:wrap;">
             <select id="fastPlayDriveSelect" class="select" style="flex:1;min-width:220px;">
               <option value="">Loading Drive transcripts...</option>
             </select>
             <button id="btnFastPlayDrive" type="button" class="btn btn-primary">
-              ⏩ Fast Play Selected Episode
+              ⏩ Fast Play
             </button>
           </div>
+
+          <div class="simple-row" style="margin-top:8px;flex-wrap:wrap;">
+            <label for="fastPlayFocusSelect" class="muted-label" style="font-size:13px;">Jump / Focus:</label>
+            <select id="fastPlayFocusSelect" class="select" style="flex:1;min-width:200px;">
+              <option value="full">Full Episode (Start → End)</option>
+              <option value="puzzle">🧩 Jump to Puzzle / Riddle Scene</option>
+              <option value="social">🗣️ Jump to Social / Roleplay Scene</option>
+              <option value="combat">⚔️ Jump to Combat Scene</option>
+              <option value="keyword">🎯 Jump to Keyword / Moment...</option>
+              <option value="range">🎚️ Custom % Range (Start → End)</option>
+            </select>
+          </div>
+
+          <div id="fastPlayKeywordRow" class="simple-row hidden" style="margin-top:8px;">
+            <input
+              id="fastPlayKeywordInput"
+              type="text"
+              class="input"
+              placeholder="Keywords to jump to (e.g. riddle, hammer, Harbin, keystone)..."
+            />
+          </div>
+
+          <div id="fastPlayRangeRow" class="simple-row hidden" style="margin-top:8px;">
+            <label class="muted-label" style="font-size:13px;">Start %</label>
+            <input id="fastPlayStartPct" type="number" class="input" min="0" max="95" value="80" style="max-width:84px;" />
+            <label class="muted-label" style="font-size:13px;">End %</label>
+            <input id="fastPlayEndPct" type="number" class="input" min="5" max="100" value="94" style="max-width:84px;" />
+          </div>
+
+          <div id="fastPlayHighlightsRow" class="fp-highlights-row hidden"></div>
         </div>
 
         <div class="info-block">

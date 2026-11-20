@@ -17,6 +17,7 @@ import gdrive_sync
 
 ROOT_DIR = Path(__file__).resolve().parent
 DDB_PROXY_RE = re.compile(r"^/api/ddb-character/(\d{4,12})(?:\?.*)?$")
+TRANSCRIPT_HIGHLIGHTS_RE = re.compile(r"^/api/campaign-memory/transcript/([a-zA-Z0-9_-]+)/highlights$")
 TRANSCRIPT_GET_RE = re.compile(r"^/api/campaign-memory/transcript/([a-zA-Z0-9_-]+)$")
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -79,6 +80,11 @@ class CopilotRequestHandler(SimpleHTTPRequestHandler):
         if path == "/api/campaign-memory/latest-transcript":
             tr = gdrive_sync.get_cached_transcript("latest")
             return self._send_json_obj(200 if tr else 404, tr or {"error": "No cached transcripts yet."})
+
+        hi_match = TRANSCRIPT_HIGHLIGHTS_RE.match(path)
+        if hi_match:
+            hi = gdrive_sync.get_transcript_highlights(hi_match.group(1))
+            return self._send_json_obj(200 if hi else 404, hi or {"error": "Transcript not found."})
 
         tr_match = TRANSCRIPT_GET_RE.match(path)
         if tr_match:

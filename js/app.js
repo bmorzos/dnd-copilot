@@ -197,6 +197,29 @@
     }, 350);
   }
 
+  function getIdeaCategoryBadge(rec) {
+    const rawCat = String(rec?.category || "").trim();
+    const meta = String(rec?.slotInfo || "");
+    const title = String(rec?.spellOrAction || "");
+    const combined = `${rawCat} ${meta} ${title}`;
+    if (/say|roleplay|ask\s+dm|dialogue|parley|speech/i.test(rawCat) || rec?.sayThis && !/spell|slot|cantrip/i.test(rawCat)) {
+      return { cls: "cat-say", label: rawCat || "💬 Say / Ask" };
+    }
+    if (/puzzle|theory|hypothesis/i.test(rawCat || meta)) {
+      return { cls: "cat-puzzle", label: rawCat || "🧩 Puzzle / Theory" };
+    }
+    if (/check|investigat|skill|perception|insight/i.test(rawCat || meta)) {
+      return { cls: "cat-check", label: rawCat || "🔎 Check / Info" };
+    }
+    if (/item|gear|clever|move|help|tactic/i.test(rawCat) || /item|equipped|attuned|bead|potion/i.test(meta)) {
+      return { cls: "cat-item", label: rawCat || "🎒 Item / Move" };
+    }
+    if (/spell|slot|cantrip|ritual/i.test(combined)) {
+      return { cls: "cat-spell", label: rawCat || "✨ Spell" };
+    }
+    return { cls: "cat-say", label: rawCat || "💡 Idea" };
+  }
+
   function reconcileSlotInfoWithSheet(slotInfo, myChar) {
     const str = String(slotInfo || "");
     if (!myChar?.spellSlots?.length) return str;
@@ -422,17 +445,27 @@
     }
 
     el("advisorRecommendations").innerHTML = (state.advisor.recommendations || [])
-      .map(
-        (r) => `
+      .map((r) => {
+        const cat = getIdeaCategoryBadge(r);
+        const sayQuoteHtml = r.sayThis
+          ? `<div class="idea-say-quote">💬 <strong>Try saying:</strong> “${escapeHtml(
+              String(r.sayThis).replace(/^["“]|["”]$/g, "")
+            )}”</div>`
+          : "";
+        return `
         <div class="big-card">
           <div class="big-card-top">
-            <span class="big-card-title">${escapeHtml(r.rank)}. ${escapeHtml(r.spellOrAction)}</span>
+            <span class="big-card-title">
+              <span class="idea-cat-badge ${cat.cls}">${escapeHtml(cat.label)}</span>
+              ${escapeHtml(r.rank)}. ${escapeHtml(r.spellOrAction)}
+            </span>
             <span class="big-card-meta">${escapeHtml(reconcileSlotInfoWithSheet(r.slotInfo, myChar))}</span>
           </div>
+          ${sayQuoteHtml}
           <p class="big-card-desc">${escapeHtml(r.whyBest)}</p>
         </div>
-      `
-      )
+      `;
+      })
       .join("");
 
     // 2. Puzzle
@@ -2506,14 +2539,66 @@
     });
 
     // Fast Play Modal Controls
+    function syncFastPlayFocusInputs() {
+      const mode = el("fastPlayFocusSelect")?.value || "full";
+      el("fastPlayKeywordRow")?.classList.toggle("hidden", mode !== "keyword");
+      el("fastPlayRangeRow")?.classList.toggle("hidden", mode !== "range");
+    }
+
+    async function loadFastPlayHighlights(fileId) {
+      const row = el("fastPlayHighlightsRow");
+      if (!row) return;
+      if (!bridge.isLocalServerContext() || !fileId) {
+        row.classList.add("hidden");
+        row.innerHTML = "";
+        return;
+      }
+      row.innerHTML = `<span class="muted-label" style="font-size:12.5px;">Scanning episode highlights...</span>`;
+      row.classList.remove("hidden");
+      try {
+        const resp = await fetch(
+          `/api/campaign-memory/transcript/${encodeURIComponent(fileId)}/highlights?_t=${Date.now()}`,
+          { cache: "no-store" }
+        );
+        if (!resp.ok) {
+          row.classList.add("hidden");
+          return;
+        }
+        const hi = await resp.json();
+        const pills = [
+          { mode: "puzzle", icon: "🧩 Puzzle", data: hi?.puzzle },
+          { mode: "social", icon: "🗣️ Social", data: hi?.social },
+          { mode: "combat", icon: "⚔️ Combat", data: hi?.combat }
+        ].filter((p) => p.data && Number(p.data.score || 0) > 0);
+        if (pills.length === 0) {
+          row.classList.add("hidden");
+          row.innerHTML = "";
+          return;
+        }
+        row.innerHTML = pills
+          .map(
+            (p) =>
+              `<button type="button" class="btn btn-quiet fp-highlight-chip" data-fp-jump="${p.mode}" title="${escapeHtml(
+                p.data.snippet || ""
+              )}">${p.icon} (~${p.data.startPct}%–${p.data.endPct}%)</button>`
+          )
+          .join("");
+        row.classList.remove("hidden");
+      } catch (_) {
+        row.classList.add("hidden");
+      }
+    }
+
     async function openFastPlayModal() {
       el("fastPlayModal")?.classList.remove("hidden");
+      syncFastPlayFocusInputs();
       const sel = el("fastPlayDriveSelect");
       const btnDrive = el("btnFastPlayDrive");
       if (!sel) return;
       if (!bridge.isLocalServerContext()) {
         sel.innerHTML = `<option value="">Launch start-windows / start-mac to replay Drive episodes</option>`;
         if (btnDrive) btnDrive.disabled = true;
+        loadFastPlayHighlights("");
         return;
       }
       if (btnDrive) btnDrive.disabled = false;
@@ -2534,6 +2619,7 @@
               return `<option value="${escapeHtml(t.id)}">${escapeHtml(t.name)} (~${kb} KB)</option>`;
             })
             .join("");
+          loadFastPlayHighlights(sel.value);
         }
       } catch (err) {
         sel.innerHTML = `<option value="">Could not load Drive transcripts (${escapeHtml(
@@ -2542,10 +2628,20 @@
       }
     }
 
-    async function runFastPlay(title, rawText) {
+    async function runFastPlay(title, rawText, fpOptions = {}) {
       if (isFastPlaying) return;
       isFastPlaying = true;
       fastPlayCancelled = false;
+
+      const selectedMode = fpOptions.mode || el("fastPlayFocusSelect")?.value || "full";
+      const keywordVal = fpOptions.keyword ?? (el("fastPlayKeywordInput")?.value || "").trim();
+      const startPctVal = fpOptions.startPct ?? Number(el("fastPlayStartPct")?.value ?? 80);
+      const endPctVal = fpOptions.endPct ?? Number(el("fastPlayEndPct")?.value ?? 94);
+      if (selectedMode === "keyword" && !keywordVal) {
+        isFastPlaying = false;
+        showToast("Enter a keyword to jump to (e.g. riddle, hammer, Harbin).", true);
+        return;
+      }
 
       const progBox = el("fastPlayProgressBox");
       const progTxt = el("fastPlayProgressText");
@@ -2563,14 +2659,18 @@
       try {
         const result = await gemini.fastPlayTranscript(store, rawText, {
           title,
-          acts: 5,
+          mode: selectedMode,
+          keyword: keywordVal,
+          startPct: startPctVal,
+          endPct: endPctVal,
+          acts: selectedMode === "full" ? 5 : 3,
           resetFirst: true,
           shouldCancel: () => fastPlayCancelled,
           onProgress: (p) => {
             const total = Math.max(1, Number(p.totalActs) || 5);
             let pct = Math.min(82, Math.round((Number(p.act || 0) / total) * 80));
-            if (p.phase === "advisor") pct = 88;
-            if (p.phase === "puzzle") pct = 93;
+            if (p.phase === "puzzle") pct = 86;
+            if (p.phase === "advisor") pct = 92;
             if (p.phase === "summary") pct = 97;
             if (progFill) progFill.style.width = `${Math.max(8, pct)}%`;
             if (progTxt) {
@@ -2587,8 +2687,11 @@
           if (progFill) progFill.style.width = "100%";
           el("fastPlayModal")?.classList.add("hidden");
           loadDriveMysteries();
+          const winLabel = result?.window?.mode && result.window.mode !== "full"
+            ? ` [${result.window.label} · ${result.window.startPct}%–${result.window.endPct}%]`
+            : "";
           showToast(
-            `Fast played ${result.title} (${result.totalLines} lines across ${result.actsProcessed} acts)!`
+            `Fast played ${result.title}${winLabel} (${result.totalLines} lines across ${result.actsProcessed} acts)!`
           );
         }
       } catch (err) {
@@ -2602,6 +2705,33 @@
     }
 
     el("btnOpenFastPlay")?.addEventListener("click", openFastPlayModal);
+    el("fastPlayFocusSelect")?.addEventListener("change", syncFastPlayFocusInputs);
+    el("fastPlayDriveSelect")?.addEventListener("change", (e) => {
+      loadFastPlayHighlights(e.target.value);
+    });
+    el("fastPlayHighlightsRow")?.addEventListener("click", async (e) => {
+      const btn = e.target.closest("[data-fp-jump]");
+      if (!btn) return;
+      const mode = btn.getAttribute("data-fp-jump") || "puzzle";
+      const selFocus = el("fastPlayFocusSelect");
+      if (selFocus) {
+        selFocus.value = mode;
+        syncFastPlayFocusInputs();
+      }
+      const selId = el("fastPlayDriveSelect")?.value;
+      if (!selId) return;
+      try {
+        const resp = await fetch(
+          `/api/campaign-memory/transcript/${encodeURIComponent(selId)}?_t=${Date.now()}`,
+          { cache: "no-store" }
+        );
+        const data = await resp.json();
+        if (!resp.ok || !data?.text) throw new Error(data?.error || `HTTP ${resp.status}`);
+        await runFastPlay(data.name || "Drive Episode", data.text, { mode });
+      } catch (err) {
+        showToast(err.message || String(err), true);
+      }
+    });
     el("btnCancelFastPlay")?.addEventListener("click", () => {
       fastPlayCancelled = true;
     });

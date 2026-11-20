@@ -904,6 +904,114 @@ def get_cached_transcript(file_id: str = "latest") -> dict | None:
     }
 
 
+_PUZZLE_HIGHLIGHT_STRONG_RE = re.compile(
+    r"\b(riddle|puzzle|cipher|inscription|engrav\w*|etch\w*|pressure\s+plate|mouthless|hollow|secret\s+door)\b",
+    re.I,
+)
+_PUZZLE_HIGHLIGHT_SUPPORT_RE = re.compile(
+    r"\b(runes?|keystone|cornerstone|pillar|statue|pedestal|lever|symbol|mural|glint|clues?|investigation|hammer|doorway)\b",
+    re.I,
+)
+_SOCIAL_HIGHLIGHT_RE = re.compile(
+    r"\b(persuasion|insight|deception|intimidation|ask\s+him|ask\s+her|ask\s+them|mayor|harbin|tavern|innkeeper|deal|negotiate|bargain|question|interrogate|promise|secret|sending\s+stone|talk\s+to)\b",
+    re.I,
+)
+_COMBAT_HIGHLIGHT_RE = re.compile(
+    r"\b(initiative|roll\s+to\s+hit|armor\s+class|damage|fireball|saving\s+throw|hit\s+points?|bloodied|unconscious|attack\s+roll|sneak\s+attack|critical)\b",
+    re.I,
+)
+
+
+def _best_window(lines: list[str], mode: str) -> dict:
+    total = len(lines)
+    if total == 0:
+        return {"startPct": 0, "endPct": 100, "score": 0, "snippet": ""}
+    win_size = min(total, min(200, max(90, round(total * 0.12))))
+    step = max(5, win_size // 10)
+
+    def line_score(txt: str) -> int:
+        if mode == "puzzle":
+            strong = len(_PUZZLE_HIGHLIGHT_STRONG_RE.findall(txt))
+            sup = len(_PUZZLE_HIGHLIGHT_SUPPORT_RE.findall(txt))
+            pen = -1 if re.search(r"\b(initiative|roll\s+for\s+initiative)\b", txt, re.I) else 0
+            return strong * 5 + sup * 2 + pen
+        if mode == "social":
+            soc = len(_SOCIAL_HIGHLIGHT_RE.findall(txt))
+            cmb = len(_COMBAT_HIGHLIGHT_RE.findall(txt))
+            q_bonus = 1 if ("?" in txt and len(txt) >= 25) else 0
+            return soc * 3 + q_bonus - cmb * 2
+        if mode == "combat":
+            return len(_COMBAT_HIGHLIGHT_RE.findall(txt)) * 3
+        return 0
+
+    line_scores = [line_score(t) for t in lines]
+    best_start = 0
+    best_score = -10**9
+    best_peak_idx = 0
+
+    starts = list(range(0, max(1, total - win_size + 1), step))
+    if total > win_size and (total - win_size) not in starts:
+        starts.append(total - win_size)
+
+    for s in starts:
+        end = min(total, s + win_size)
+        sc = sum(line_scores[s:end])
+        if sc > best_score:
+            best_score = sc
+            best_start = s
+            peak_sub = max(
+                range(s, end),
+                key=lambda i: (line_scores[i], len(lines[i]) >= 16),
+            )
+            best_peak_idx = peak_sub
+
+    pad_start = max(0, best_start - 10)
+    pad_end = min(total, best_start + win_size + 15)
+    start_pct = round((pad_start / total) * 100)
+    end_pct = max(start_pct + 1, round((pad_end / total) * 100))
+    return {
+        "startPct": int(start_pct),
+        "endPct": int(min(100, end_pct)),
+        "score": int(max(0, best_score)),
+        "snippet": lines[best_peak_idx][:120].strip(),
+    }
+
+
+def detect_transcript_highlights(text: str) -> dict:
+    """Finds the peak Puzzle/Riddle, Social/Roleplay, and Combat windows in a transcript."""
+    clean_lines = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if re.match(r"^\[[^\]]{1,40}\]$", line):
+            continue
+        if re.match(r"^(?:===|---|TRANSCRIPT\s+ATTRIBUTION)", line, re.I):
+            continue
+        clean_lines.append(line)
+
+    return {
+        "lineCount": len(clean_lines),
+        "puzzle": _best_window(clean_lines, "puzzle"),
+        "social": _best_window(clean_lines, "social"),
+        "combat": _best_window(clean_lines, "combat"),
+    }
+
+
+def get_transcript_highlights(file_id: str = "latest") -> dict | None:
+    """Returns detected scene highlight jump ranges for a cached Drive transcript."""
+    tr = get_cached_transcript(file_id)
+    if not tr:
+        return None
+    highlights = detect_transcript_highlights(tr.get("text") or "")
+    return {
+        "id": tr["id"],
+        "name": tr["name"],
+        "sessionNumber": tr.get("sessionNumber"),
+        **highlights,
+    }
+
+
 def get_overview() -> dict:
     """Returns lightweight overview stats + the 6 most recent summaries for UI display."""
     status = get_status()
