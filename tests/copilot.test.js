@@ -2300,3 +2300,94 @@ test("DDBParser extracts item spell bonuses/saves/traits and RollMaximizer maxim
   assert.ok(rayToastCoach.reminders.some((r) => /Wand of the War Mage/i.test(r.title)));
   assert.ok(rayToastCoach.reminders.some((r) => /Elemental Adept \(Cold\)/i.test(r.title)));
 });
+
+test("AboveVTT slash command builder & Shadow DOM cross-frame VTT relay contract", () => {
+  const sb = createBrowserSandbox();
+  const rm = sb.DnDCopilot.RollMaximizer;
+  assert.equal(typeof rm.buildAboveVttSlashCommand, "function");
+
+  assert.equal(
+    rm.buildAboveVttSlashCommand(
+      { name: "Ray of Frost", kind: "spell_attack", attackBonus: 9, damageFormula: "2d8", damageTypes: ["cold"] },
+      "tohit",
+      "normal"
+    ),
+    "/hit 1d20+9 Ray of Frost"
+  );
+  assert.equal(
+    rm.buildAboveVttSlashCommand(
+      { name: "Ray of Frost", kind: "spell_attack", attackBonus: 9, damageFormula: "2d8", damageTypes: ["cold"] },
+      "tohit",
+      "adv"
+    ),
+    "/hit 2d20kh1+9 Ray of Frost"
+  );
+  assert.equal(
+    rm.buildAboveVttSlashCommand(
+      { name: "Ray of Frost", kind: "spell_attack", attackBonus: 9, damageFormula: "2d8", damageTypes: ["cold"] },
+      "tohit",
+      "dis"
+    ),
+    "/hit 2d20kl1+9 Ray of Frost"
+  );
+  assert.equal(
+    rm.buildAboveVttSlashCommand(
+      { name: "Ray of Frost", kind: "spell_attack", attackBonus: 9, damageFormula: "2d8", damageTypes: ["cold"] },
+      "damage"
+    ),
+    "/dmg 2d8 Ray of Frost:cold"
+  );
+  assert.equal(
+    rm.buildAboveVttSlashCommand(
+      { name: "WIS Saving Throw", kind: "save", ability: "wis", attackBonus: 6 },
+      "tohit"
+    ),
+    "/save 1d20+6 Wisdom"
+  );
+  assert.equal(
+    rm.buildAboveVttSlashCommand(
+      { name: "Concentration Save (CON)", kind: "save", ability: "con", isConcentration: true, attackBonus: 3 },
+      "tohit"
+    ),
+    "/save 1d20+3 Concentration"
+  );
+  assert.equal(
+    rm.buildAboveVttSlashCommand({ name: "History", kind: "skill", attackBonus: 6 }, "tohit"),
+    "/skill 1d20+6 History"
+  );
+  assert.equal(
+    rm.buildAboveVttSlashCommand({ name: "Initiative", kind: "initiative", attackBonus: 2 }, "tohit"),
+    "/r 1d20+2 Initiative:initiative"
+  );
+  assert.equal(
+    rm.buildAboveVttSlashCommand({ name: "Counterspell", kind: "spell_check", attackBonus: 3 }, "tohit"),
+    "/skill 1d20+3 Counterspell"
+  );
+  assert.equal(
+    rm.buildAboveVttSlashCommand(
+      { name: "Fireball", kind: "spell_save", saveDc: 14, saveAbility: "DEX", damageFormula: "8d6", damageTypes: ["fire"] },
+      "damage"
+    ),
+    "/dmg 8d6 Fireball:fire"
+  );
+  assert.equal(
+    rm.buildAboveVttSlashCommand({ name: "Web", kind: "spell_save", saveDc: 14, saveAbility: "DEX", damageFormula: "" }, "tohit"),
+    null
+  );
+
+  // Verify Shadow DOM isolation, chat-text submission, and cross-frame relay contracts in extension scripts
+  const csCode = fs.readFileSync(path.join(ROOT, "content-script.js"), "utf8");
+  const bgCode = fs.readFileSync(path.join(ROOT, "background.js"), "utf8");
+  assert.doesNotThrow(() => new vm.Script(csCode));
+  assert.doesNotThrow(() => new vm.Script(bgCode));
+  assert.ok(csCode.includes("attachShadow"));
+  assert.ok(csCode.includes("#chat-text") || csCode.includes('"chat-text"'));
+  assert.ok(csCode.includes("REGISTER_FRAME"));
+  assert.ok(csCode.includes("RELAY_TRIGGER_SHEET_ROLL"));
+  assert.ok(csCode.includes("EXECUTE_VTT_ROLL_LOCAL"));
+  assert.ok(csCode.includes("FORWARD_ROLL_COACH_TO_TOP"));
+  assert.ok(bgCode.includes("REGISTER_FRAME"));
+  assert.ok(bgCode.includes("RELAY_TRIGGER_SHEET_ROLL"));
+  assert.ok(bgCode.includes("FORWARD_ROLL_COACH_TO_TOP"));
+  assert.ok(bgCode.includes("frameId"));
+});

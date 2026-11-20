@@ -1019,6 +1019,86 @@
     };
   }
 
+  const ABILITY_FULL = {
+    str: "Strength",
+    dex: "Dexterity",
+    con: "Constitution",
+    int: "Intelligence",
+    wis: "Wisdom",
+    cha: "Charisma"
+  };
+
+  function buildAboveVttSlashCommand(rollSpec, part = "tohit", mode = "normal") {
+    if (!rollSpec || typeof rollSpec !== "object") return null;
+
+    const signedMod = (n) => {
+      const v = Number(n || 0);
+      if (!Number.isFinite(v) || v === 0) return "";
+      return v > 0 ? `+${v}` : `${v}`;
+    };
+
+    const cleanActionName = (name) =>
+      String(name || "")
+        .replace(/[:/]/g, " ")
+        .replace(/^[\s\d+-]+/, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    const cleanName = cleanActionName(rollSpec.name);
+    const d20 = mode === "adv" ? "2d20kh1" : mode === "dis" ? "2d20kl1" : "1d20";
+
+    if (part === "damage") {
+      const rawFormula = String(rollSpec.damageFormula || "").replace(/\s+/g, "");
+      const exprMatch = rawFormula.match(/^\d+d\d+(?:[+-]\d+)*/i);
+      if (!exprMatch) return null;
+      const expr = exprMatch[0];
+      const rawType =
+        rollSpec.damageType ||
+        (Array.isArray(rollSpec.damageTypes) ? rollSpec.damageTypes[0] : "") ||
+        "";
+      const dmgType = String(rawType)
+        .toLowerCase()
+        .replace(/[^a-z]/g, "");
+      return `/dmg ${expr} ${cleanName || "Damage"}${dmgType ? `:${dmgType}` : ""}`;
+    }
+
+    if (rollSpec.kind === "spell_attack" || rollSpec.kind === "weapon_attack") {
+      return `/hit ${d20}${signedMod(rollSpec.attackBonus)} ${cleanName || "Attack"}`;
+    }
+
+    if (rollSpec.kind === "spell_check") {
+      return `/skill ${d20}${signedMod(rollSpec.attackBonus)} ${cleanName || "Spell Check"}`;
+    }
+
+    if (rollSpec.kind === "save") {
+      const abilKey = String(rollSpec.ability || "").toLowerCase();
+      const label = rollSpec.isConcentration
+        ? "Concentration"
+        : ABILITY_FULL[abilKey] || cleanName || "Save";
+      const mod = rollSpec.bonus !== undefined ? rollSpec.bonus : rollSpec.attackBonus;
+      return `/save ${d20}${signedMod(mod)} ${label}`;
+    }
+
+    if (rollSpec.kind === "initiative") {
+      const mod = rollSpec.bonus !== undefined ? rollSpec.bonus : rollSpec.attackBonus;
+      return `/r ${d20}${signedMod(mod)} Initiative:initiative`;
+    }
+
+    if (rollSpec.kind === "skill") {
+      const mod = rollSpec.bonus !== undefined ? rollSpec.bonus : rollSpec.attackBonus;
+      return `/skill ${d20}${signedMod(mod)} ${cleanName || "Check"}`;
+    }
+
+    if (rollSpec.kind === "spell_save" || rollSpec.kind === "item_save") {
+      if (rollSpec.damageFormula) {
+        return buildAboveVttSlashCommand(rollSpec, "damage", mode);
+      }
+      return null;
+    }
+
+    return null;
+  }
+
   global.DnDCopilot = global.DnDCopilot || {};
   global.DnDCopilot.RollMaximizer = {
     getPaladinAuraBonus,
@@ -1028,6 +1108,7 @@
     getRollCatalog,
     analyzeRollPotential,
     executeRoll,
-    analyzeAboveVttRoll
+    analyzeAboveVttRoll,
+    buildAboveVttSlashCommand
   };
 })(window);

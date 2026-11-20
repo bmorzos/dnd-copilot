@@ -24,6 +24,9 @@
   let coachToastTimer = null;
   let suppressClickCoachUntil = 0;
   let activeCoachState = null;
+  let shadowUiRoot = null;
+  let hasTopFrameCoach = false;
+  let lastFrameRegKey = "";
 
   function isElementVisible(el) {
     if (!el) return false;
@@ -207,10 +210,30 @@
     return "roll";
   }
 
+  function inferCatalogActionFromText(rawText) {
+    const rm = window.DnDCopilot?.RollMaximizer;
+    const myChar = rollContext?.myChar;
+    if (!rm || !myChar || !rawText) return "";
+    const low = String(rawText).toLowerCase();
+    const cat = rm.getRollCatalog(myChar, rollContext.party || []);
+    const allSpecs = [
+      ...(cat.spellsAndAttacks || []),
+      ...(cat.skills || []),
+      ...(cat.saves || [])
+    ].sort((a, b) => String(b.name || "").length - String(a.name || "").length);
+    for (const sp of allSpecs) {
+      const nm = String(sp?.name || "").trim();
+      if (nm.length >= 3 && low.includes(nm.toLowerCase())) {
+        return nm;
+      }
+    }
+    return "";
+  }
+
   function parseGameLogEntry(li) {
     // Strictly skip DM-only hidden game log entries and our own coach UI
     if (!isElementVisible(li)) return null;
-    if (li.closest("#dnd-copilot-roll-toast, #dnd-copilot-roll-drawer, #dnd-copilot-roll-pill, #dnd-copilot-cross-tab-alert")) {
+    if (li.closest("#dnd-copilot-ui-host, #dnd-copilot-roll-toast, #dnd-copilot-roll-drawer, #dnd-copilot-roll-pill, #dnd-copilot-cross-tab-alert")) {
       return null;
     }
 
@@ -218,9 +241,9 @@
     if (!rawText || rawText.length < 2) return null;
 
     // Extract structured segments from DDB / AboveVTT / Noty game log markup
-    const actionLabel =
+    let actionLabel =
       li.querySelector(
-        "[class*='action'], [class*='rollName'], [class*='title'], .dice_result__info__title, [class*='RollName'], [class*='Source']"
+        "[class*='action'], [class*='rollName'], [class*='title'], .dice_result__info__title, .dice_result__info__rolldetail, [class*='RollName'], [class*='ActionName'], [class*='RollTitle'], [class*='GameLogEntry_Action'], [class*='Source']"
       )?.textContent?.trim() || "";
 
     let sender =
@@ -287,6 +310,10 @@
 
     const timeLabel = li.querySelector("time")?.textContent?.trim() || "";
     const kind = total !== null ? classifyRollKind(rawText, `${actionLabel} ${rollTypeLabel}`) : "chat";
+    if (!actionLabel || /^roll$/i.test(actionLabel)) {
+      const inferred = inferCatalogActionFromText(rawText);
+      if (inferred) actionLabel = inferred;
+    }
 
     const fingerprint = `${sender}|${actionLabel}|${kind}|${total}|${rawText.slice(0, 120)}|${timeLabel}`;
 
@@ -447,7 +474,332 @@
     return null;
   }
 
-  async function triggerNativeDdbRoll(rollSpec, part = "tohit") {
+  function ensureShadowUiRoot() {
+    if (shadowUiRoot && shadowUiRoot.host && shadowUiRoot.host.isConnected) {
+      return shadowUiRoot;
+    }
+    const mountParent = document.body || document.documentElement;
+    if (!mountParent) return null;
+
+    let host = document.getElementById("dnd-copilot-ui-host");
+    if (!host) {
+      host = document.createElement("div");
+      host.id = "dnd-copilot-ui-host";
+      mountParent.appendChild(host);
+    } else if (!host.isConnected) {
+      mountParent.appendChild(host);
+    }
+
+    host.style.cssText =
+      "all: initial !important; position: fixed !important; inset: 0 !important; width: 0 !important; height: 0 !important; overflow: visible !important; pointer-events: none !important; z-index: 2147483647 !important;";
+
+    const root = host.shadowRoot || host.attachShadow({ mode: "open" });
+    if (!root.getElementById("dnd-copilot-shadow-styles")) {
+      const style = document.createElement("style");
+      style.id = "dnd-copilot-shadow-styles";
+      style.textContent = `
+        *, *::before, *::after { box-sizing: border-box; }
+        :host { all: initial; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        button {
+          appearance: none;
+          -webkit-appearance: none;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          margin: 0;
+          line-height: 1.2;
+          vertical-align: middle;
+          background: transparent;
+          border: none;
+          color: inherit;
+        }
+        input {
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          margin: 0;
+        }
+        .dc-pill {
+          position: fixed;
+          bottom: 16px;
+          right: 16px;
+          z-index: 2147483646;
+          pointer-events: auto;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 6px;
+          height: 38px;
+          padding: 0 15px;
+          border-radius: 999px;
+          background: #171d2b;
+          border: 1.5px solid #f0c46c;
+          color: #f0c46c;
+          font-size: 13.5px;
+          font-weight: 700;
+          line-height: 1;
+          white-space: nowrap;
+          cursor: pointer;
+          box-shadow: 0 8px 24px rgba(0, 0, 0, 0.65);
+          transition: transform 0.12s ease, background 0.12s ease;
+        }
+        .dc-pill:hover {
+          background: #20293e;
+          transform: translateY(-1px);
+        }
+        .dc-drawer {
+          position: fixed;
+          bottom: 62px;
+          right: 16px;
+          z-index: 2147483647;
+          pointer-events: auto;
+          width: 410px;
+          max-width: calc(100vw - 32px);
+          max-height: 74vh;
+          overflow-y: auto;
+          background: #131824;
+          border: 1.5px solid #f0c46c;
+          border-radius: 12px;
+          padding: 12px 14px;
+          color: #f3f6fc;
+          font-size: 13px;
+          line-height: 1.4;
+          box-shadow: 0 16px 42px rgba(0, 0, 0, 0.82);
+        }
+        .dc-toast {
+          position: fixed;
+          bottom: 64px;
+          right: 16px;
+          z-index: 2147483646;
+          pointer-events: auto;
+          width: 400px;
+          max-width: calc(100vw - 32px);
+          background: #171d2b;
+          border: 1.5px solid #f0c46c;
+          border-radius: 12px;
+          padding: 12px 14px;
+          color: #f3f6fc;
+          font-size: 13.5px;
+          line-height: 1.45;
+          box-shadow: 0 14px 36px rgba(0, 0, 0, 0.78);
+        }
+        .dc-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          margin-bottom: 8px;
+        }
+        .dc-head-title {
+          color: #f0c46c;
+          font-weight: 700;
+          flex: 1;
+          font-size: 13.5px;
+        }
+        .dc-actions {
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+        }
+        .dc-icon-btn {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          height: 24px;
+          padding: 0 7px;
+          background: #1f273a;
+          border: 1px solid #2c3752;
+          border-radius: 5px;
+          color: #f3f6fc;
+          cursor: pointer;
+          font-size: 12px;
+        }
+        .dc-icon-btn.is-gold { color: #f0c46c; }
+        .dc-close-btn {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 24px;
+          height: 24px;
+          background: transparent;
+          border: none;
+          color: #cbd5e8;
+          cursor: pointer;
+          font-size: 15px;
+        }
+        .dc-search {
+          width: 100%;
+          padding: 7px 10px;
+          border-radius: 7px;
+          border: 1px solid #2c3752;
+          background: #1b2232;
+          color: #f3f6fc;
+          margin-bottom: 8px;
+          font-size: 12.5px;
+          outline: none;
+        }
+        .dc-search:focus { border-color: #f0c46c; }
+        .dc-sec-label {
+          font-size: 11px;
+          font-weight: 700;
+          color: #8b9bb8;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+          margin: 7px 0 4px;
+        }
+        .dc-grid {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 5px;
+        }
+        .dc-chip-wrap {
+          display: inline-flex;
+          gap: 2px;
+          align-items: center;
+        }
+        .dc-chip {
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+          padding: 5px 9px;
+          min-height: 28px;
+          border-radius: 7px;
+          border: 1px solid #2c3752;
+          background: #1f273a;
+          color: #f3f6fc;
+          font-size: 12.5px;
+          font-weight: 600;
+          cursor: pointer;
+          text-align: left;
+        }
+        .dc-chip:hover { border-color: #f0c46c; background: #26314a; }
+        .dc-chip.is-accent {
+          border-color: #3ecf8e;
+          background: rgba(62, 207, 142, 0.14);
+          color: #6ee7b7;
+        }
+        .dc-chip-sub {
+          color: #f0c46c;
+          font-weight: 700;
+          font-size: 12px;
+        }
+        .dc-chip.is-accent .dc-chip-sub { color: #6ee7b7; }
+        .dc-say-box {
+          padding: 7px 10px;
+          border-left: 3px solid #f0c46c;
+          border-radius: 0 8px 8px 0;
+          background: rgba(240, 196, 108, 0.13);
+          color: #fef3c7;
+          margin-bottom: 6px;
+        }
+        .dc-vtt-status {
+          font-size: 12px;
+          font-weight: 600;
+          padding: 5px 8px;
+          border-radius: 6px;
+          margin-bottom: 6px;
+        }
+        .dc-vtt-status.is-sent {
+          background: rgba(62, 207, 142, 0.14);
+          border: 1px solid rgba(62, 207, 142, 0.45);
+          color: #6ee7b7;
+        }
+        .dc-vtt-status.is-info {
+          background: rgba(91, 138, 245, 0.15);
+          border: 1px solid rgba(91, 138, 245, 0.45);
+          color: #bfdbfe;
+        }
+        .dc-vtt-status.is-warn {
+          background: rgba(245, 158, 11, 0.16);
+          border: 1px solid rgba(245, 158, 11, 0.55);
+          color: #fde68a;
+        }
+        .dc-bullets {
+          margin: 4px 0 6px 16px;
+          padding: 0;
+          color: #cbd5e8;
+        }
+        .dc-bullets li { margin-bottom: 2px; }
+        .dc-follow-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+          margin-top: 4px;
+        }
+        .dc-follow-btn {
+          display: inline-flex;
+          align-items: center;
+          padding: 4px 9px;
+          min-height: 26px;
+          border-radius: 6px;
+          border: 1px solid #2c3752;
+          background: #1f273a;
+          color: #cbd5e8;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+        }
+        .dc-follow-btn.is-dmg {
+          border-color: #3ecf8e;
+          background: rgba(62, 207, 142, 0.16);
+          color: #6ee7b7;
+          font-weight: 700;
+        }
+        .dc-follow-btn.is-adv {
+          border-color: #5b8af5;
+          background: rgba(91, 138, 245, 0.18);
+          color: #bfdbfe;
+          font-weight: 700;
+        }
+        .dc-follow-btn.is-active {
+          border-color: #f0c46c;
+          background: rgba(240, 196, 108, 0.22);
+          color: #fde68a;
+        }
+        .dc-alert {
+          position: fixed;
+          top: 14px;
+          right: 14px;
+          z-index: 2147483647;
+          pointer-events: auto;
+          max-width: 420px;
+          padding: 12px 16px;
+          border-radius: 10px;
+          background: #7f1d1d;
+          border: 2px solid #f87171;
+          color: #ffffff;
+          font-size: 14.5px;
+          font-weight: 600;
+          box-shadow: 0 12px 32px rgba(0, 0, 0, 0.65);
+          display: flex;
+          align-items: center;
+          gap: 12px;
+        }
+        .dc-alert-open {
+          background: #ffffff;
+          color: #7f1d1d;
+          border: none;
+          border-radius: 6px;
+          padding: 6px 10px;
+          font-weight: 700;
+          cursor: pointer;
+          white-space: nowrap;
+        }
+        .dc-alert-close {
+          background: transparent;
+          color: #fecaca;
+          border: none;
+          font-size: 16px;
+          cursor: pointer;
+        }
+      `;
+      root.appendChild(style);
+    }
+    shadowUiRoot = root;
+    return shadowUiRoot;
+  }
+
+  function getShadowEl(id) {
+    return shadowUiRoot && shadowUiRoot.host?.isConnected ? shadowUiRoot.getElementById(id) : null;
+  }
+
+  async function triggerNativeDdbRollLocal(rollSpec, part = "tohit") {
     let btn = findVisibleNativeDdbRollButton(rollSpec, part);
     if (!btn && (rollSpec.isSpell || rollSpec.kind === "weapon_attack" || rollSpec.kind === "spell_attack" || rollSpec.kind === "spell_save")) {
       const desiredTestId = rollSpec.isSpell ? "SPELLS" : "ACTIONS";
@@ -470,52 +822,109 @@
     if (!btn) return { triggered: false };
     suppressClickCoachUntil = Date.now() + 300;
     btn.click();
-    return { triggered: true, part };
+    return { triggered: true, part, via: "ddb-sheet" };
+  }
+
+  async function tryAboveVttChatRoll(rollSpec, part = "tohit", mode = "normal") {
+    const rm = window.DnDCopilot?.RollMaximizer;
+    if (!rm?.buildAboveVttSlashCommand) return { triggered: false };
+    const cmd = rm.buildAboveVttSlashCommand(rollSpec, part, mode);
+    if (!cmd) return { triggered: false };
+
+    let chatInput = document.getElementById("chat-text");
+    if (!chatInput) {
+      const logTabBtn = document.getElementById("switch_gamelog");
+      if (logTabBtn) {
+        logTabBtn.click();
+        await new Promise((r) => setTimeout(r, 250));
+        chatInput = document.getElementById("chat-text");
+      }
+    }
+    if (!chatInput) return { triggered: false };
+
+    const prevVal = chatInput.value || "";
+    const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    if (nativeSetter) {
+      nativeSetter.call(chatInput, cmd);
+    } else {
+      chatInput.value = cmd;
+    }
+    chatInput.dispatchEvent(new Event("input", { bubbles: true }));
+    chatInput.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Enter",
+        code: "Enter",
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true
+      })
+    );
+
+    if (chatInput.value === "") {
+      return { triggered: true, part, via: "abovevtt-chat", command: cmd };
+    }
+    if (nativeSetter) {
+      nativeSetter.call(chatInput, prevVal);
+    } else {
+      chatInput.value = prevVal;
+    }
+    return { triggered: false };
+  }
+
+  async function triggerVttRollLocal(rollSpec, part = "tohit", mode = "normal") {
+    if (!rollSpec) return { triggered: false };
+    if (mode === "adv" || mode === "dis") {
+      const chatRes = await tryAboveVttChatRoll(rollSpec, part, mode);
+      if (chatRes.triggered) return chatRes;
+      return await triggerNativeDdbRollLocal(rollSpec, part);
+    }
+    const nativeRes = await triggerNativeDdbRollLocal(rollSpec, part);
+    if (nativeRes.triggered) return nativeRes;
+    return await tryAboveVttChatRoll(rollSpec, part, mode);
+  }
+
+  async function triggerSharedVttRoll(rollSpec, part = "tohit", mode = "normal") {
+    const localRes = await triggerVttRollLocal(rollSpec, part, mode);
+    if (localRes?.triggered) return localRes;
+
+    try {
+      const relayRes = await chrome.runtime.sendMessage({
+        type: "RELAY_TRIGGER_SHEET_ROLL",
+        rollSpec,
+        part,
+        mode,
+        characterId: rollContext?.myChar?.id || ""
+      });
+      if (relayRes?.triggered) return relayRes;
+    } catch (_) {}
+
+    return { triggered: false };
   }
 
   function renderRollCoachToast() {
     const st = activeCoachState;
     if (!st) {
-      document.getElementById("dnd-copilot-roll-toast")?.remove();
+      getShadowEl("dnd-copilot-roll-toast")?.remove();
       return;
     }
 
-    let card = document.getElementById("dnd-copilot-roll-toast");
+    const root = ensureShadowUiRoot();
+    if (!root) return;
+
+    let card = getShadowEl("dnd-copilot-roll-toast");
     if (!card) {
       card = document.createElement("div");
       card.id = "dnd-copilot-roll-toast";
-      Object.assign(card.style, {
-        position: "fixed",
-        bottom: "64px",
-        right: "16px",
-        zIndex: "2147483646",
-        width: "390px",
-        maxWidth: "calc(100vw - 32px)",
-        background: "#171d2b",
-        border: "1.5px solid #f0c46c",
-        borderRadius: "12px",
-        padding: "12px 14px",
-        color: "#f3f6fc",
-        fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
-        fontSize: "13.5px",
-        lineHeight: "1.45",
-        boxShadow: "0 14px 36px rgba(0,0,0,0.75)"
-      });
-      document.body.appendChild(card);
+      card.className = "dc-toast";
+      root.appendChild(card);
     }
     card.textContent = "";
 
     const header = document.createElement("div");
-    Object.assign(header.style, {
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      gap: "6px",
-      marginBottom: "6px"
-    });
+    header.className = "dc-head";
     const titleEl = document.createElement("strong");
-    titleEl.style.color = "#f0c46c";
-    titleEl.style.flex = "1";
+    titleEl.className = "dc-head-title";
     const totalSuffix =
       st.rolledTotal != null
         ? st.appliedAddonBonus
@@ -525,22 +934,14 @@
     titleEl.textContent = `🎲 ${st.title}${totalSuffix}`;
 
     const actionBtns = document.createElement("div");
-    Object.assign(actionBtns.style, { display: "flex", alignItems: "center", gap: "4px" });
+    actionBtns.className = "dc-actions";
 
     if (st.sayScript) {
       const copyBtn = document.createElement("button");
       copyBtn.type = "button";
+      copyBtn.className = "dc-icon-btn";
       copyBtn.textContent = "📋";
       copyBtn.title = "Copy Say-Aloud script";
-      Object.assign(copyBtn.style, {
-        background: "#1f273a",
-        border: "1px solid #2c3752",
-        borderRadius: "5px",
-        color: "#f3f6fc",
-        cursor: "pointer",
-        fontSize: "12px",
-        padding: "2px 6px"
-      });
       copyBtn.addEventListener("click", () => {
         navigator.clipboard?.writeText(st.sayScript).catch(() => {});
         copyBtn.textContent = "✓";
@@ -553,17 +954,9 @@
 
     const openDrawerBtn = document.createElement("button");
     openDrawerBtn.type = "button";
+    openDrawerBtn.className = "dc-icon-btn is-gold";
     openDrawerBtn.textContent = "🎲";
     openDrawerBtn.title = "Open 1-Click Quick Roll bar";
-    Object.assign(openDrawerBtn.style, {
-      background: "#1f273a",
-      border: "1px solid #2c3752",
-      borderRadius: "5px",
-      color: "#f0c46c",
-      cursor: "pointer",
-      fontSize: "12px",
-      padding: "2px 6px"
-    });
     openDrawerBtn.addEventListener("click", () => {
       coachDrawerOpen = true;
       renderFloatingRollDrawer();
@@ -571,14 +964,8 @@
 
     const closeBtn = document.createElement("button");
     closeBtn.type = "button";
+    closeBtn.className = "dc-close-btn";
     closeBtn.textContent = "✕";
-    Object.assign(closeBtn.style, {
-      background: "transparent",
-      border: "none",
-      color: "#cbd5e8",
-      cursor: "pointer",
-      fontSize: "15px"
-    });
     closeBtn.addEventListener("click", () => {
       activeCoachState = null;
       card.remove();
@@ -587,23 +974,33 @@
     header.append(titleEl, actionBtns);
     card.appendChild(header);
 
+    if (st.vttStatus === "sent") {
+      const stBox = document.createElement("div");
+      stBox.className = "dc-vtt-status is-sent";
+      stBox.textContent = "✓ Posted to AboveVTT Game Log (visible to DM & party)";
+      card.appendChild(stBox);
+    } else if (st.vttStatus === "save_dc_only") {
+      const stBox = document.createElement("div");
+      stBox.className = "dc-vtt-status is-info";
+      stBox.textContent = `ℹ️ Enemy Save DC ${st.matchedSpec?.saveDc || ""} (${st.matchedSpec?.saveAbility || "Save"}) — announce this DC to the DM!`;
+      card.appendChild(stBox);
+    } else if (st.vttStatus === "local_only") {
+      const stBox = document.createElement("div");
+      stBox.className = "dc-vtt-status is-warn";
+      stBox.textContent = "⚠️ Not posted to VTT Log yet — open Raine's sheet once inside AboveVTT (or open the Game Log sidebar) so 1-click rolls post straight to the table!";
+      card.appendChild(stBox);
+    }
+
     if (st.sayScript) {
       const sayBox = document.createElement("div");
-      Object.assign(sayBox.style, {
-        padding: "7px 10px",
-        borderLeft: "3px solid #f0c46c",
-        borderRadius: "0 8px 8px 0",
-        background: "rgba(240, 196, 108, 0.13)",
-        color: "#fef3c7",
-        marginBottom: "6px"
-      });
+      sayBox.className = "dc-say-box";
       sayBox.textContent = `🗣️ Say: “${st.sayScript}”`;
       card.appendChild(sayBox);
     }
 
     if (st.bullets && st.bullets.length > 0) {
       const ul = document.createElement("ul");
-      Object.assign(ul.style, { margin: "4px 0 6px 16px", padding: "0", color: "#cbd5e8" });
+      ul.className = "dc-bullets";
       for (const b of st.bullets.slice(0, 4)) {
         const li = document.createElement("li");
         li.textContent = b;
@@ -614,33 +1011,17 @@
 
     // 1-click VTT follow-ups & situational bonus math right inside the popup
     const followRow = document.createElement("div");
-    Object.assign(followRow.style, {
-      display: "flex",
-      flexWrap: "wrap",
-      gap: "6px",
-      marginTop: "4px"
-    });
+    followRow.className = "dc-follow-row";
 
     const rm = window.DnDCopilot?.RollMaximizer;
     if (st.matchedSpec && st.part !== "damage" && (st.matchedSpec.damageFormula || st.matchedSpec.kind === "spell_attack" || st.matchedSpec.kind === "weapon_attack")) {
       const dmgFollowBtn = document.createElement("button");
       dmgFollowBtn.type = "button";
+      dmgFollowBtn.className = "dc-follow-btn is-dmg";
       dmgFollowBtn.textContent = `💥 Roll ${st.matchedSpec.damageFormula || "Damage"} → VTT`;
-      Object.assign(dmgFollowBtn.style, {
-        padding: "4px 9px",
-        borderRadius: "6px",
-        border: "1px solid #3ecf8e",
-        background: "rgba(62, 207, 142, 0.16)",
-        color: "#6ee7b7",
-        fontSize: "12px",
-        fontWeight: "700",
-        cursor: "pointer"
-      });
       dmgFollowBtn.addEventListener("click", async () => {
-        const res = await triggerNativeDdbRoll(st.matchedSpec, "damage");
-        if (res.triggered) {
-          showAnalyzedRollCoach(st.matchedSpec, "damage", null);
-        }
+        const res = await triggerSharedVttRoll(st.matchedSpec, "damage", "normal");
+        showAnalyzedRollCoach(st.matchedSpec, "damage", null, "", res?.triggered ? "sent" : "local_only");
       });
       followRow.appendChild(dmgFollowBtn);
     }
@@ -648,19 +1029,13 @@
     if (st.matchedSpec && st.part !== "damage" && st.matchedSpec.kind !== "spell_save" && st.matchedSpec.kind !== "item_save") {
       const advBtn = document.createElement("button");
       advBtn.type = "button";
-      advBtn.textContent = st.hasAdvantageFeature ? "⚡ Roll 2nd d20 (Adv) → VTT" : "⚡ 2nd d20 → VTT";
-      Object.assign(advBtn.style, {
-        padding: "4px 9px",
-        borderRadius: "6px",
-        border: "1px solid #5b8af5",
-        background: "rgba(91, 138, 245, 0.18)",
-        color: "#bfdbfe",
-        fontSize: "12px",
-        fontWeight: "700",
-        cursor: "pointer"
-      });
+      advBtn.className = "dc-follow-btn is-adv";
+      advBtn.textContent = st.hasAdvantageFeature ? "⚡ Roll Adv (2d20) → VTT" : "⚡ 2d20 Adv → VTT";
       advBtn.addEventListener("click", async () => {
-        await triggerNativeDdbRoll(st.matchedSpec, "tohit");
+        const res = await triggerSharedVttRoll(st.matchedSpec, "tohit", "adv");
+        st.vttStatus = res?.triggered ? "sent" : "local_only";
+        st.updatedAt = Date.now();
+        renderRollCoachToast();
       });
       followRow.appendChild(advBtn);
     }
@@ -669,17 +1044,8 @@
       const applied = st.appliedAddonIds?.has(addon.id);
       const aBtn = document.createElement("button");
       aBtn.type = "button";
+      aBtn.className = applied ? "dc-follow-btn is-active" : "dc-follow-btn";
       aBtn.textContent = applied ? `✓ ${addon.shortLabel}` : `+ ${addon.shortLabel}`;
-      Object.assign(aBtn.style, {
-        padding: "4px 8px",
-        borderRadius: "6px",
-        border: applied ? "1px solid #f0c46c" : "1px solid #2c3752",
-        background: applied ? "rgba(240, 196, 108, 0.22)" : "#1f273a",
-        color: applied ? "#fde68a" : "#cbd5e8",
-        fontSize: "12px",
-        fontWeight: "600",
-        cursor: "pointer"
-      });
       aBtn.addEventListener("click", () => {
         if (!st.appliedAddonIds) st.appliedAddonIds = new Set();
         if (st.appliedAddonIds.has(addon.id)) {
@@ -707,11 +1073,11 @@
     if (coachToastTimer) clearTimeout(coachToastTimer);
     coachToastTimer = setTimeout(() => {
       activeCoachState = null;
-      document.getElementById("dnd-copilot-roll-toast")?.remove();
+      getShadowEl("dnd-copilot-roll-toast")?.remove();
     }, 20000);
   }
 
-  function showAnalyzedRollCoach(matchedSpec, part = "tohit", rolledTotal = null, rawActionLabel = "") {
+  function renderAnalyzedRollCoachLocal(matchedSpec, part = "tohit", rolledTotal = null, rawActionLabel = "", vttStatus = "") {
     const rm = window.DnDCopilot?.RollMaximizer;
     const myChar = rollContext?.myChar;
     if (!rm || !myChar || !matchedSpec) return;
@@ -741,6 +1107,8 @@
       matchedSpec,
       part,
       rolledTotal,
+      vttStatus,
+      updatedAt: Date.now(),
       title: `${myChar.name} · ${matchedSpec.name || rawActionLabel || "Roll"}${part === "damage" ? " Damage" : ""}`,
       sayScript: sayLines.join(" "),
       bullets,
@@ -752,11 +1120,37 @@
     renderRollCoachToast();
   }
 
-  function showRollCoachToast(title, bullets = [], sayScript = "") {
+  function showAnalyzedRollCoach(matchedSpec, part = "tohit", rolledTotal = null, rawActionLabel = "", vttStatus = "") {
+    if (window.top !== window && hasTopFrameCoach) {
+      chrome.runtime
+        .sendMessage({
+          type: "FORWARD_ROLL_COACH_TO_TOP",
+          matchedSpec,
+          part,
+          rolledTotal,
+          rawActionLabel,
+          vttStatus
+        })
+        .then((resp) => {
+          if (!resp?.forwarded) {
+            renderAnalyzedRollCoachLocal(matchedSpec, part, rolledTotal, rawActionLabel, vttStatus);
+          }
+        })
+        .catch(() => {
+          renderAnalyzedRollCoachLocal(matchedSpec, part, rolledTotal, rawActionLabel, vttStatus);
+        });
+      return;
+    }
+    renderAnalyzedRollCoachLocal(matchedSpec, part, rolledTotal, rawActionLabel, vttStatus);
+  }
+
+  function showRollCoachToast(title, bullets = [], sayScript = "", vttStatus = "") {
     activeCoachState = {
       matchedSpec: null,
       part: "tohit",
       rolledTotal: null,
+      vttStatus,
+      updatedAt: Date.now(),
       title: title || "Full Potential Coach",
       sayScript,
       bullets,
@@ -792,20 +1186,21 @@
         roll.total != null
       ) {
         activeCoachState.rolledTotal = roll.total;
+        activeCoachState.vttStatus = "sent";
         activeCoachState.updatedAt = Date.now();
         renderRollCoachToast();
         continue;
       }
 
       if (res.matchedSpec) {
-        showAnalyzedRollCoach(res.matchedSpec, part, roll.total, roll.action);
-        if (activeCoachState) activeCoachState.updatedAt = Date.now();
+        showAnalyzedRollCoach(res.matchedSpec, part, roll.total, roll.action, "sent");
       }
     }
   }
 
   function shouldShowFloatingRollUi() {
     if (!document.body) return false;
+    if (window.top !== window && hasTopFrameCoach) return false;
     if (window.innerWidth < 280 || window.innerHeight < 200) return false;
     if (window.top === window) {
       return (
@@ -827,26 +1222,15 @@
   function makeQuickChipBtn(label, sub, isAccent = false) {
     const btn = document.createElement("button");
     btn.type = "button";
-    Object.assign(btn.style, {
-      padding: "5px 8px",
-      borderRadius: "7px",
-      border: isAccent ? "1px solid #3ecf8e" : "1px solid #2c3752",
-      background: isAccent ? "rgba(62, 207, 142, 0.14)" : "#1f273a",
-      color: isAccent ? "#6ee7b7" : "#f3f6fc",
-      fontSize: "12.5px",
-      fontWeight: "600",
-      cursor: "pointer",
-      display: "inline-flex",
-      alignItems: "center",
-      gap: "4px",
-      textAlign: "left"
-    });
-    const t = document.createElement("span");
-    t.textContent = label;
-    btn.appendChild(t);
+    btn.className = isAccent ? "dc-chip is-accent" : "dc-chip";
+    if (label) {
+      const t = document.createElement("span");
+      t.textContent = label;
+      btn.appendChild(t);
+    }
     if (sub) {
       const s = document.createElement("span");
-      s.style.cssText = "color:#f0c46c;font-weight:700;font-size:12px;";
+      s.className = "dc-chip-sub";
       s.textContent = sub;
       btn.appendChild(s);
     }
@@ -854,67 +1238,41 @@
   }
 
   function renderFloatingRollDrawer() {
-    if (!shouldShowFloatingRollUi()) return;
-    let pill = document.getElementById("dnd-copilot-roll-pill");
-    if (!pill && document.body) {
+    if (!shouldShowFloatingRollUi()) {
+      getShadowEl("dnd-copilot-roll-pill")?.remove();
+      getShadowEl("dnd-copilot-roll-drawer")?.remove();
+      return;
+    }
+
+    const root = ensureShadowUiRoot();
+    if (!root) return;
+
+    let pill = getShadowEl("dnd-copilot-roll-pill");
+    if (!pill) {
       pill = document.createElement("button");
       pill.id = "dnd-copilot-roll-pill";
       pill.type = "button";
+      pill.className = "dc-pill";
       pill.textContent = "🎲 Quick Roll";
-      Object.assign(pill.style, {
-        position: "fixed",
-        bottom: "16px",
-        right: "16px",
-        zIndex: "2147483646",
-        padding: "8px 14px",
-        borderRadius: "999px",
-        background: "#171d2b",
-        border: "1.5px solid #f0c46c",
-        color: "#f0c46c",
-        fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
-        fontSize: "13.5px",
-        fontWeight: "700",
-        cursor: "pointer",
-        boxShadow: "0 8px 24px rgba(0,0,0,0.65)"
-      });
       pill.addEventListener("click", () => {
         coachDrawerOpen = !coachDrawerOpen;
         renderFloatingRollDrawer();
       });
-      document.body.appendChild(pill);
+      root.appendChild(pill);
     }
 
-    let drawer = document.getElementById("dnd-copilot-roll-drawer");
+    let drawer = getShadowEl("dnd-copilot-roll-drawer");
     if (!coachDrawerOpen) {
       if (drawer) drawer.style.display = "none";
       return;
     }
 
-    if (!drawer && document.body) {
+    if (!drawer) {
       drawer = document.createElement("div");
       drawer.id = "dnd-copilot-roll-drawer";
-      Object.assign(drawer.style, {
-        position: "fixed",
-        bottom: "62px",
-        right: "16px",
-        zIndex: "2147483647",
-        width: "400px",
-        maxWidth: "calc(100vw - 32px)",
-        maxHeight: "74vh",
-        overflowY: "auto",
-        background: "#131824",
-        border: "1.5px solid #f0c46c",
-        borderRadius: "12px",
-        padding: "11px 13px",
-        color: "#f3f6fc",
-        fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
-        fontSize: "13px",
-        lineHeight: "1.4",
-        boxShadow: "0 16px 42px rgba(0,0,0,0.8)"
-      });
-      document.body.appendChild(drawer);
+      drawer.className = "dc-drawer";
+      root.appendChild(drawer);
     }
-    if (!drawer) return;
     drawer.style.display = "block";
     drawer.textContent = "";
 
@@ -923,26 +1281,14 @@
     const party = rollContext?.party || [];
 
     const head = document.createElement("div");
-    Object.assign(head.style, {
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      gap: "8px",
-      marginBottom: "8px"
-    });
+    head.className = "dc-head";
     const hTitle = document.createElement("strong");
-    hTitle.style.color = "#f0c46c";
+    hTitle.className = "dc-head-title";
     hTitle.textContent = myChar ? `🎲 1-Click Roll → VTT (${myChar.name})` : "🎲 1-Click Roll";
     const hClose = document.createElement("button");
     hClose.type = "button";
+    hClose.className = "dc-close-btn";
     hClose.textContent = "✕";
-    Object.assign(hClose.style, {
-      background: "transparent",
-      border: "none",
-      color: "#cbd5e8",
-      cursor: "pointer",
-      fontSize: "15px"
-    });
     hClose.addEventListener("click", () => {
       coachDrawerOpen = false;
       renderFloatingRollDrawer();
@@ -960,24 +1306,21 @@
 
     const searchInp = document.createElement("input");
     searchInp.type = "text";
+    searchInp.className = "dc-search";
     searchInp.placeholder = "Filter any spell, save, or skill (1 click rolls to VTT)...";
     searchInp.value = coachFilterQuery;
-    Object.assign(searchInp.style, {
-      width: "100%",
-      boxSizing: "border-box",
-      padding: "6px 9px",
-      borderRadius: "7px",
-      border: "1px solid #2c3752",
-      background: "#1b2232",
-      color: "#f3f6fc",
-      marginBottom: "8px",
-      fontSize: "12.5px"
+    ["keydown", "keyup", "keypress"].forEach((evtName) => {
+      searchInp.addEventListener(evtName, (ev) => ev.stopPropagation());
     });
     searchInp.addEventListener("input", () => {
       coachFilterQuery = searchInp.value;
       renderFloatingRollDrawer();
-      const reopenedInp = document.querySelector("#dnd-copilot-roll-drawer input[type='text']");
-      reopenedInp?.focus();
+      const reopenedInp = shadowUiRoot?.querySelector("#dnd-copilot-roll-drawer input[type='text']");
+      if (reopenedInp) {
+        reopenedInp.focus();
+        const len = reopenedInp.value.length;
+        reopenedInp.setSelectionRange?.(len, len);
+      }
     });
     drawer.appendChild(searchInp);
 
@@ -987,47 +1330,31 @@
     const triggerQuickItem = async (spec, part = "tohit") => {
       coachDrawerOpen = false;
       renderFloatingRollDrawer();
-      const vttRes = await triggerNativeDdbRoll(spec, part);
-      if (vttRes.triggered) {
-        showAnalyzedRollCoach(spec, part, null);
-        if (activeCoachState) activeCoachState.updatedAt = Date.now();
+
+      if ((spec.kind === "spell_save" || spec.kind === "item_save") && !spec.damageFormula) {
+        showAnalyzedRollCoach(spec, part, null, "", "save_dc_only");
         return;
       }
-      // Fallback for items with no native DDB button (e.g. Necklace of Fireballs)
+
+      const vttRes = await triggerSharedVttRoll(spec, part, "normal");
+      if (vttRes?.triggered) {
+        showAnalyzedRollCoach(spec, part, null, "", "sent");
+        return;
+      }
+
+      // Local fallback preview when neither native sheet nor VTT chat box is open
       const fallbackRoll = rm.executeRoll(spec, myChar, party);
-      const rolledNum = fallbackRoll.d20Result
-        ? fallbackRoll.d20Result.total
-        : fallbackRoll.damageResult
-        ? fallbackRoll.damageResult.total
-        : null;
-      showRollCoachToast(
-        `${myChar.name} · ${spec.name}${rolledNum != null ? ` (${rolledNum})` : ""}`,
-        fallbackRoll.activeMods.slice(0, 3).map((m) => `${m.title}${m.badge ? ` — ${m.badge}` : ""}`),
-        fallbackRoll.sayAloudScript
-      );
-      chrome.runtime
-        .sendMessage({
-          type: "GAMELOG_ROLLS",
-          rolls: [
-            {
-              fingerprint: `avtt-quick-${Date.now()}-${spec.id}`,
-              timestamp: Date.now(),
-              actor: myChar.name,
-              action: spec.name,
-              kind: spec.kind === "save" ? "save" : "attack",
-              total: rolledNum,
-              formula: spec.damageFormula || "",
-              rawText: fallbackRoll.sayAloudScript
-            }
-          ]
-        })
-        .catch(() => {});
+      const rolledNum =
+        part === "damage"
+          ? fallbackRoll.damageResult?.total ?? fallbackRoll.d20Result?.total ?? null
+          : fallbackRoll.d20Result?.total ?? fallbackRoll.damageResult?.total ?? null;
+      showAnalyzedRollCoach(spec, part, rolledNum, "", "local_only");
     };
 
     const addSectionLabel = (txt) => {
       const lbl = document.createElement("div");
+      lbl.className = "dc-sec-label";
       lbl.textContent = txt;
-      lbl.style.cssText = "font-size:11.5px;font-weight:700;color:#8b9bb8;text-transform:uppercase;letter-spacing:0.04em;margin:6px 0 4px;";
       drawer.appendChild(lbl);
     };
 
@@ -1038,10 +1365,10 @@
     if (combatItems.length > 0) {
       addSectionLabel("✨ Spells & Attacks (Rolls into VTT Log)");
       const grid = document.createElement("div");
-      Object.assign(grid.style, { display: "flex", flexWrap: "wrap", gap: "5px" });
+      grid.className = "dc-grid";
       for (const sp of (q ? combatItems : combatItems.slice(0, 8))) {
         const wrap = document.createElement("div");
-        Object.assign(wrap.style, { display: "inline-flex", gap: "2px" });
+        wrap.className = "dc-chip-wrap";
         const mainSub =
           sp.kind === "spell_attack" || sp.kind === "weapon_attack" || sp.kind === "spell_check"
             ? `+${Number(sp.attackBonus || 0)}`
@@ -1069,7 +1396,7 @@
     if (saveItems.length > 0) {
       addSectionLabel("🛡️ Saving Throws");
       const row = document.createElement("div");
-      Object.assign(row.style, { display: "flex", flexWrap: "wrap", gap: "5px" });
+      row.className = "dc-grid";
       for (const sv of saveItems) {
         const shortNm = sv.isConcentration ? "Conc" : (sv.ability || sv.name).toUpperCase();
         const b = makeQuickChipBtn(shortNm, sv.subLabel);
@@ -1088,7 +1415,7 @@
     if (allSkills.length > 0) {
       addSectionLabel("🔎 Init & Skills");
       const skRow = document.createElement("div");
-      Object.assign(skRow.style, { display: "flex", flexWrap: "wrap", gap: "5px" });
+      skRow.className = "dc-grid";
       for (const sk of (q ? allSkills : allSkills.slice(0, 10))) {
         const shortMod = sk.subLabel.split("·")[0].trim();
         const b = makeQuickChipBtn(sk.name === "Initiative" ? "Init" : sk.name, shortMod);
@@ -1177,65 +1504,65 @@
   }
 
   function showInPageHealthAlert(msgText) {
-    let banner = document.getElementById("dnd-copilot-cross-tab-alert");
+    const root = ensureShadowUiRoot();
+    if (!root) return;
+    let banner = getShadowEl("dnd-copilot-cross-tab-alert");
     if (!banner) {
       banner = document.createElement("div");
       banner.id = "dnd-copilot-cross-tab-alert";
-      Object.assign(banner.style, {
-        position: "fixed",
-        top: "14px",
-        right: "14px",
-        zIndex: "2147483647",
-        maxWidth: "420px",
-        padding: "12px 16px",
-        borderRadius: "10px",
-        background: "#7f1d1d",
-        border: "2px solid #f87171",
-        color: "#ffffff",
-        fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
-        fontSize: "15px",
-        fontWeight: "600",
-        boxShadow: "0 12px 32px rgba(0,0,0,0.65)",
-        display: "flex",
-        alignItems: "center",
-        gap: "12px"
-      });
-      document.body.appendChild(banner);
+      banner.className = "dc-alert";
+      root.appendChild(banner);
     }
-    banner.innerHTML = "";
+    banner.textContent = "";
     const textSpan = document.createElement("span");
     textSpan.style.flex = "1";
     textSpan.textContent = msgText;
 
     const openBtn = document.createElement("button");
+    openBtn.type = "button";
+    openBtn.className = "dc-alert-open";
     openBtn.textContent = "Check Copilot";
-    Object.assign(openBtn.style, {
-      background: "#ffffff",
-      color: "#7f1d1d",
-      border: "none",
-      borderRadius: "6px",
-      padding: "6px 10px",
-      fontWeight: "700",
-      cursor: "pointer",
-      whiteSpace: "nowrap"
-    });
     openBtn.addEventListener("click", () => {
       chrome.runtime.sendMessage({ type: "OPEN_DASHBOARD_TAB" }).catch(() => {});
       banner.remove();
     });
 
     const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "dc-alert-close";
     closeBtn.textContent = "✕";
-    Object.assign(closeBtn.style, {
-      background: "transparent",
-      color: "#fecaca",
-      border: "none",
-      fontSize: "16px",
-      cursor: "pointer"
-    });
     closeBtn.addEventListener("click", () => banner.remove());
 
     banner.append(textSpan, openBtn, closeBtn);
+  }
+
+  async function registerCurrentFrame(force = false) {
+    const isTop = window.top === window;
+    const characterId =
+      extractCharacterIdFromString(window.location.href) ||
+      String(rollContext?.myChar?.id || "");
+    const hasChatInput = Boolean(document.getElementById("chat-text"));
+    const hasSheet = Boolean(
+      document.querySelector(".ct-character-sheet, .ddbc-saving-throws-summary__ability, .ct-skills__item")
+    );
+    const key = `${isTop}|${characterId}|${hasChatInput}|${hasSheet}`;
+    if (!force && key === lastFrameRegKey) return;
+    lastFrameRegKey = key;
+
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        type: "REGISTER_FRAME",
+        isTop,
+        characterId,
+        hasChatInput,
+        hasSheet
+      });
+      if (!isTop && resp?.hasTopFrameCoach) {
+        hasTopFrameCoach = true;
+        getShadowEl("dnd-copilot-roll-pill")?.remove();
+        getShadowEl("dnd-copilot-roll-drawer")?.remove();
+      }
+    } catch (_) {}
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -1245,7 +1572,7 @@
       return false;
     }
     if (message?.type === "CLEAR_COPILOT_ALERT") {
-      document.getElementById("dnd-copilot-cross-tab-alert")?.remove();
+      getShadowEl("dnd-copilot-cross-tab-alert")?.remove();
       sendResponse({ ok: true });
       return false;
     }
@@ -1265,11 +1592,31 @@
         party: Array.isArray(message.party) ? message.party : []
       };
       renderFloatingRollDrawer();
+      registerCurrentFrame(false);
       sendResponse({ ok: true });
       return false;
     }
     if (message?.type === "SHOW_ROLL_COACH") {
       showRollCoachToast(message.title || "Full Potential", [], message.sayScript || "");
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (message?.type === "EXECUTE_VTT_ROLL_LOCAL") {
+      triggerVttRollLocal(message.rollSpec, message.part || "tohit", message.mode || "normal")
+        .then((res) => sendResponse({ ok: true, ...(res || { triggered: false }) }))
+        .catch(() => sendResponse({ ok: false, triggered: false }));
+      return true;
+    }
+    if (message?.type === "SHOW_ANALYZED_COACH_FROM_FRAME") {
+      if (message.matchedSpec) {
+        renderAnalyzedRollCoachLocal(
+          message.matchedSpec,
+          message.part || "tohit",
+          message.rolledTotal ?? null,
+          message.rawActionLabel || "",
+          message.vttStatus || ""
+        );
+      }
       sendResponse({ ok: true });
       return false;
     }
@@ -1353,7 +1700,7 @@
           if (Date.now() < suppressClickCoachUntil) return;
           const target = ev.target;
           if (!target || typeof target.closest !== "function") return;
-          if (target.closest("#dnd-copilot-roll-pill, #dnd-copilot-roll-drawer, #dnd-copilot-roll-toast")) return;
+          if (target.id === "dnd-copilot-ui-host" || target.closest("#dnd-copilot-ui-host, #dnd-copilot-roll-pill, #dnd-copilot-roll-drawer, #dnd-copilot-roll-toast")) return;
           const rm = window.DnDCopilot?.RollMaximizer;
           const myChar = rollContext?.myChar;
           if (!rm || !myChar) return;
@@ -1365,8 +1712,7 @@
 
           const exactMatch = extractClickedDdbRollInfo(clickable);
           if (exactMatch?.matchedSpec) {
-            showAnalyzedRollCoach(exactMatch.matchedSpec, exactMatch.part, null);
-            if (activeCoachState) activeCoachState.updatedAt = Date.now();
+            showAnalyzedRollCoach(exactMatch.matchedSpec, exactMatch.part, null, "", "sent");
             return;
           }
 
@@ -1403,9 +1749,9 @@
               analyzed.matchedSpec,
               clickKind === "damage" ? "damage" : "tohit",
               null,
-              ctxText.slice(0, 48)
+              ctxText.slice(0, 48),
+              "sent"
             );
-            if (activeCoachState) activeCoachState.updatedAt = Date.now();
           }
         } catch (_) {
           // Never interfere with host DDB click handlers
@@ -1415,7 +1761,7 @@
     );
   }
 
-  async function ensureRollContextLoaded() {
+  async function ensureRollContextLoaded(forceReg = false) {
     try {
       const resp = await chrome.runtime.sendMessage({ type: "GET_ROLL_CONTEXT" });
       if (resp?.myChar) {
@@ -1433,19 +1779,24 @@
         } catch (_) {}
       }
     }
+    await registerCurrentFrame(forceReg);
     renderFloatingRollDrawer();
   }
 
-  ensureRollContextLoaded();
+  registerCurrentFrame(true);
+  ensureRollContextLoaded(true);
   initSheetRollClickListener();
-  setInterval(ensureRollContextLoaded, 60000);
+  setInterval(() => ensureRollContextLoaded(true), 60000);
   window.addEventListener("resize", () => renderFloatingRollDrawer());
 
   // Observe DOM updates cleanly with debounce
   let mutationTimer = null;
   const observer = new MutationObserver(() => {
     if (mutationTimer) clearTimeout(mutationTimer);
-    mutationTimer = setTimeout(pushUpdatesIfChanged, 350);
+    mutationTimer = setTimeout(() => {
+      registerCurrentFrame(false);
+      pushUpdatesIfChanged();
+    }, 350);
   });
 
   observer.observe(document.documentElement, {
@@ -1456,6 +1807,12 @@
   });
 
   // Periodic gentle heartbeat for input.value updates that don't fire DOM attribute mutations
-  setInterval(pushUpdatesIfChanged, 2500);
-  setTimeout(pushUpdatesIfChanged, 900);
+  setInterval(() => {
+    registerCurrentFrame(false);
+    pushUpdatesIfChanged();
+  }, 2500);
+  setTimeout(() => {
+    registerCurrentFrame(false);
+    pushUpdatesIfChanged();
+  }, 900);
 })();

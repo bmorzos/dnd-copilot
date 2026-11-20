@@ -5,6 +5,17 @@
 
 let latestAboveVttSnapshot = null;
 let latestSourceTabId = null;
+const registeredTopFrames = new Set();
+const registeredFrames = new Map();
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  registeredTopFrames.delete(tabId);
+  for (const key of Array.from(registeredFrames.keys())) {
+    if (key.startsWith(`${tabId}:`)) {
+      registeredFrames.delete(key);
+    }
+  }
+});
 
 async function fetchLocalServerRollContext() {
   try {
@@ -226,6 +237,141 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     sendResponse({ ok: true });
     return false;
+  }
+
+  if (message.type === "REGISTER_FRAME") {
+    const tabId = sender?.tab?.id;
+    const frameId = typeof sender?.frameId === "number" ? sender.frameId : 0;
+    const isTop = Boolean(message.isTop || frameId === 0);
+    if (tabId != null) {
+      registeredFrames.set(`${tabId}:${frameId}`, {
+        tabId,
+        frameId,
+        isTop,
+        characterId: String(message.characterId || ""),
+        hasChatInput: Boolean(message.hasChatInput),
+        hasSheet: Boolean(message.hasSheet),
+        updatedAt: Date.now()
+      });
+      if (isTop) {
+        registeredTopFrames.add(tabId);
+      }
+    }
+    sendResponse({
+      ok: true,
+      hasTopFrameCoach: tabId != null ? registeredTopFrames.has(tabId) : false,
+      frameId
+    });
+    return false;
+  }
+
+  if (message.type === "RELAY_TRIGGER_SHEET_ROLL") {
+    (async () => {
+      const senderTabId = sender?.tab?.id ?? null;
+      const senderFrameId = typeof sender?.frameId === "number" ? sender.frameId : 0;
+      const targetCharId = String(message.characterId || "");
+      const rollMsg = {
+        type: "EXECUTE_VTT_ROLL_LOCAL",
+        rollSpec: message.rollSpec || null,
+        part: message.part || "tohit",
+        mode: message.mode || "normal"
+      };
+
+      const allFrames = Array.from(registeredFrames.values()).filter(
+        (f) => !(f.tabId === senderTabId && f.frameId === senderFrameId)
+      );
+      const charScore = (f) => (targetCharId && f.characterId === targetCharId ? 0 : 1);
+
+      const candidates = [];
+      const seenKeys = new Set();
+      const pushCandidate = (tabId, frameId) => {
+        if (tabId == null) return;
+        const key = `${tabId}:${frameId}`;
+        if (seenKeys.has(key)) return;
+        if (tabId === senderTabId && frameId === senderFrameId) return;
+        seenKeys.add(key);
+        candidates.push({ tabId, frameId });
+      };
+
+      if (senderTabId != null) {
+        allFrames
+          .filter((f) => f.tabId === senderTabId && f.hasSheet)
+          .sort((a, b) => charScore(a) - charScore(b) || b.updatedAt - a.updatedAt)
+          .forEach((f) => pushCandidate(f.tabId, f.frameId));
+        allFrames
+          .filter((f) => f.tabId === senderTabId && (f.hasChatInput || f.frameId === 0))
+          .sort((a, b) => (b.hasChatInput ? 1 : 0) - (a.hasChatInput ? 1 : 0) || b.updatedAt - a.updatedAt)
+          .forEach((f) => pushCandidate(f.tabId, f.frameId));
+        if (senderFrameId !== 0) {
+          pushCandidate(senderTabId, 0);
+        }
+      }
+
+      allFrames
+        .filter((f) => f.tabId !== senderTabId && f.hasSheet)
+        .sort((a, b) => charScore(a) - charScore(b) || b.updatedAt - a.updatedAt)
+        .forEach((f) => pushCandidate(f.tabId, f.frameId));
+
+      allFrames
+        .filter((f) => f.tabId !== senderTabId && f.hasChatInput)
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .forEach((f) => pushCandidate(f.tabId, f.frameId));
+
+      const triedTabIds = new Set();
+      for (const c of candidates) {
+        triedTabIds.add(c.tabId);
+        try {
+          const resp = await chrome.tabs.sendMessage(c.tabId, rollMsg, { frameId: c.frameId });
+          if (resp?.triggered) {
+            sendResponse({ ok: true, triggered: true, via: resp.via || "relayed-frame" });
+            return;
+          }
+        } catch (_) {}
+      }
+
+      const tabs = await findDndBeyondTabs();
+      for (const tab of tabs) {
+        if (tab.id === senderTabId) continue;
+        if (triedTabIds.has(tab.id)) continue;
+        try {
+          const resp = await chrome.tabs.sendMessage(tab.id, rollMsg);
+          if (resp?.triggered) {
+            sendResponse({ ok: true, triggered: true, via: resp.via || "relayed-tab" });
+            return;
+          }
+        } catch (_) {}
+      }
+
+      sendResponse({ ok: true, triggered: false });
+    })();
+    return true;
+  }
+
+  if (message.type === "FORWARD_ROLL_COACH_TO_TOP") {
+    (async () => {
+      const senderTabId = sender?.tab?.id ?? null;
+      const senderFrameId = typeof sender?.frameId === "number" ? sender.frameId : 0;
+      if (senderTabId != null && senderFrameId !== 0 && registeredTopFrames.has(senderTabId)) {
+        try {
+          const resp = await chrome.tabs.sendMessage(
+            senderTabId,
+            {
+              type: "SHOW_ANALYZED_COACH_FROM_FRAME",
+              matchedSpec: message.matchedSpec || null,
+              part: message.part || "tohit",
+              rolledTotal: message.rolledTotal ?? null,
+              rawActionLabel: message.rawActionLabel || "",
+              vttStatus: message.vttStatus || ""
+            },
+            { frameId: 0 }
+          );
+          sendResponse({ ok: true, forwarded: Boolean(resp?.ok) });
+          return;
+        } catch (_) {}
+      }
+      sendResponse({ ok: true, forwarded: false });
+    })();
+    return true;
   }
 
   if (message.type === "GET_ROLL_CONTEXT") {
