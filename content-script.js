@@ -24,6 +24,7 @@
   let coachToastTimer = null;
   let suppressClickCoachUntil = 0;
   let activeCoachState = null;
+  let prepRollState = null;
   let shadowUiRoot = null;
   let hasTopFrameCoach = false;
   let lastFrameRegKey = "";
@@ -278,14 +279,54 @@
         "[class*='rollType'], .dice_result__rolltype, [class*='subTitle'], .dice_result__info__breakdown"
       )?.textContent?.trim() || "";
 
-    const totalEl = li.querySelector(
-      ".dice_result__total-result, [class*='resultTotal'], [class*='finalResult'], [class*='totalResult'], [class*='Total'], [class*='total']"
-    );
+    const totalEl =
+      li.querySelector(
+        ".aboveDiceTotal, .dice_result__total-result, [class*='resultTotal'], [class*='finalResult'], [class*='totalResult']"
+      ) ||
+      li.querySelector("[class*='Total-Other'], [class*='-Total-']") ||
+      Array.from(li.querySelectorAll("[class*='Total'], [class*='total']")).find(
+        (el) => !/container/i.test(String(el.className || "")) && el.children.length === 0
+      );
 
     let total = null;
     if (totalEl) {
-      const parsed = parseInt(totalEl.textContent.replace(/[^\d-]/g, ""), 10);
-      if (Number.isFinite(parsed)) total = parsed;
+      const numMatch = String(totalEl.textContent || "")
+        .trim()
+        .match(/-?\d+/);
+      if (numMatch) {
+        const parsed = parseInt(numMatch[0], 10);
+        if (Number.isFinite(parsed)) total = parsed;
+      }
+    }
+
+    const titleAttr =
+      li.querySelector(".abovevtt-roll-container[title]")?.getAttribute("title") ||
+      li.getAttribute("title") ||
+      "";
+    const breakdownEl = li.querySelector(
+      ".dice_result__info__breakdown, [class*='breakdown'], [class*='Notation'], [class*='Values']"
+    );
+    const cleanedBreakdown = (titleAttr || breakdownEl?.textContent || "")
+      .replace(/<br\s*\/?>/gi, " · ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120);
+    const upgradedOnes = (String(titleAttr).match(/\b2\^/g) || []).length;
+    const rawDiceValues = [];
+    if (cleanedBreakdown) {
+      const afterColon = cleanedBreakdown.includes(":")
+        ? cleanedBreakdown.split(":").slice(1).join(":")
+        : cleanedBreakdown;
+      const beforeEq = afterColon.split("=")[0];
+      const grpRe = /\[([^\]]+)\]|\(([^)]+)\)/g;
+      let gm;
+      while ((gm = grpRe.exec(beforeEq)) !== null) {
+        const inner = gm[1] || gm[2] || "";
+        for (const tok of inner.split(/[,+]/)) {
+          const dm = tok.trim().match(/^(\d+)(?:\^)?$/);
+          if (dm) rawDiceValues.push(parseInt(dm[1], 10));
+        }
+      }
     }
 
     const formulaMatch = rawText.match(/\b(\d+d\d+(?:\s*[+-]\s*\d+)?)\b/i);
@@ -326,6 +367,9 @@
       kind,
       total,
       formula,
+      breakdown: cleanedBreakdown,
+      upgradedOnes,
+      rawDiceValues,
       isCrit,
       isFumble,
       rawText: rawText.slice(0, 280)
@@ -753,6 +797,195 @@
           background: rgba(240, 196, 108, 0.22);
           color: #fde68a;
         }
+        .dc-prep-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 5px;
+          margin-bottom: 8px;
+        }
+        .dc-seg-btn {
+          display: inline-flex;
+          align-items: center;
+          padding: 4px 9px;
+          min-height: 26px;
+          border-radius: 6px;
+          border: 1px solid #2c3752;
+          background: #1b2232;
+          color: #cbd5e8;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+        }
+        .dc-seg-btn:hover { border-color: #f0c46c; }
+        .dc-seg-btn.is-selected {
+          border-color: #f0c46c;
+          background: rgba(240, 196, 108, 0.2);
+          color: #fde68a;
+          font-weight: 700;
+        }
+        .dc-seg-btn.is-empty { opacity: 0.55; }
+        .dc-check-list {
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+          margin-bottom: 8px;
+        }
+        .dc-check-row {
+          display: flex;
+          align-items: center;
+          gap: 7px;
+          padding: 5px 8px;
+          border-radius: 7px;
+          background: #1b2232;
+          border: 1px solid #26314a;
+          font-size: 12.5px;
+          color: #f3f6fc;
+          cursor: pointer;
+        }
+        .dc-check-row input[type='checkbox'] {
+          margin: 0;
+          accent-color: #f0c46c;
+          cursor: pointer;
+          flex-shrink: 0;
+        }
+        .dc-check-lbl { flex: 1; }
+        .dc-tag-in {
+          font-size: 10.5px;
+          font-weight: 700;
+          padding: 1px 5px;
+          border-radius: 4px;
+          background: rgba(62, 207, 142, 0.16);
+          color: #6ee7b7;
+          border: 1px solid rgba(62, 207, 142, 0.35);
+          white-space: nowrap;
+        }
+        .dc-tag-note {
+          font-size: 10.5px;
+          font-weight: 700;
+          padding: 1px 5px;
+          border-radius: 4px;
+          background: rgba(245, 158, 11, 0.15);
+          color: #fde68a;
+          border: 1px solid rgba(245, 158, 11, 0.35);
+          white-space: nowrap;
+        }
+        .dc-formula-bar {
+          padding: 6px 9px;
+          border-radius: 7px;
+          background: #0d111a;
+          border: 1px solid #2c3752;
+          color: #93c5fd;
+          font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          font-size: 11.5px;
+          margin-bottom: 8px;
+          word-break: break-word;
+        }
+        .dc-cta-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+        .dc-roll-primary {
+          flex: 1;
+          min-width: 160px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          padding: 8px 12px;
+          min-height: 34px;
+          border-radius: 8px;
+          background: #f0c46c;
+          color: #131824;
+          font-size: 13px;
+          font-weight: 800;
+          cursor: pointer;
+        }
+        .dc-roll-primary:hover { background: #fbd38d; }
+        .dc-roll-secondary {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          padding: 6px 10px;
+          min-height: 34px;
+          border-radius: 8px;
+          border: 1px solid #2c3752;
+          background: #1f273a;
+          color: #f3f6fc;
+          font-size: 12px;
+          font-weight: 700;
+          cursor: pointer;
+        }
+        .dc-roll-secondary:hover { border-color: #f0c46c; }
+        .dc-result-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+          gap: 8px;
+          margin-bottom: 7px;
+        }
+        .dc-result-box {
+          padding: 7px 10px;
+          border-radius: 8px;
+          background: #101521;
+          border: 1px solid #2c3752;
+        }
+        .dc-result-box.is-dmg { border-color: rgba(62, 207, 142, 0.5); }
+        .dc-result-box.is-hit { border-color: rgba(240, 196, 108, 0.55); }
+        .dc-result-box.is-dc { border-color: rgba(91, 138, 245, 0.5); }
+        .dc-result-lbl {
+          font-size: 10.5px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+          color: #94a3b8;
+        }
+        .dc-result-val {
+          font-size: 22px;
+          font-weight: 800;
+          line-height: 1.15;
+          color: #f0c46c;
+          margin: 2px 0;
+        }
+        .dc-result-box.is-dmg .dc-result-val { color: #6ee7b7; }
+        .dc-result-box.is-dc .dc-result-val { color: #93c5fd; font-size: 18px; }
+        .dc-result-sub {
+          font-size: 11px;
+          color: #94a3b8;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .dc-crit-pill {
+          display: inline-block;
+          margin-left: 6px;
+          padding: 1px 6px;
+          border-radius: 4px;
+          background: rgba(240, 196, 108, 0.22);
+          border: 1px solid #f0c46c;
+          color: #fde68a;
+          font-size: 10.5px;
+          font-weight: 800;
+          vertical-align: middle;
+        }
+        .dc-note-group {
+          margin-bottom: 5px;
+        }
+        .dc-note-title {
+          font-size: 11px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.03em;
+          margin-bottom: 2px;
+        }
+        .dc-note-title.is-in { color: #6ee7b7; }
+        .dc-note-title.is-out { color: #fde68a; }
+        .dc-note-list {
+          margin: 0 0 0 15px;
+          padding: 0;
+          font-size: 12px;
+          line-height: 1.35;
+          color: #cbd5e8;
+        }
+        .dc-note-list li { margin-bottom: 1px; }
         .dc-alert {
           position: fixed;
           top: 14px;
@@ -895,10 +1128,10 @@
     return { triggered: true, part, via: "ddb-sheet" };
   }
 
-  async function tryAboveVttChatRoll(rollSpec, part = "tohit", mode = "normal") {
+  async function tryAboveVttChatRoll(rollSpec, part = "tohit", mode = "normal", cmdOptions = {}) {
     const rm = window.DnDCopilot?.RollMaximizer;
     if (!rm?.buildAboveVttSlashCommand) return { triggered: false };
-    const cmd = rm.buildAboveVttSlashCommand(rollSpec, part, mode);
+    const cmd = rm.buildAboveVttSlashCommand(rollSpec, part, mode, cmdOptions);
     if (!cmd) return { triggered: false };
 
     let chatInput = document.getElementById("chat-text");
@@ -942,20 +1175,33 @@
     return { triggered: false };
   }
 
-  async function triggerVttRollLocal(rollSpec, part = "tohit", mode = "normal") {
+  function hasCustomRollOptions(rollSpec, cmdOptions) {
+    if (!cmdOptions || typeof cmdOptions !== "object") return false;
+    return Boolean(
+      Number(cmdOptions.minDieValue || 1) > 1 ||
+        cmdOptions.setD20To != null ||
+        Number(cmdOptions.flatBonus || 0) !== 0 ||
+        cmdOptions.diceBonus ||
+        cmdOptions.extraDamageDice ||
+        Number(cmdOptions.damageFlatBonus || 0) !== 0 ||
+        (cmdOptions.castLevel && rollSpec?.baseLevel != null && Number(cmdOptions.castLevel) > Number(rollSpec.baseLevel))
+    );
+  }
+
+  async function triggerVttRollLocal(rollSpec, part = "tohit", mode = "normal", cmdOptions = {}) {
     if (!rollSpec) return { triggered: false };
-    if (mode === "adv" || mode === "dis") {
-      const chatRes = await tryAboveVttChatRoll(rollSpec, part, mode);
+    const hasChatHost = Boolean(document.getElementById("chat-text") || document.getElementById("switch_gamelog"));
+    if (hasChatHost || mode === "adv" || mode === "dis" || hasCustomRollOptions(rollSpec, cmdOptions)) {
+      const chatRes = await tryAboveVttChatRoll(rollSpec, part, mode, cmdOptions);
       if (chatRes.triggered) return chatRes;
-      return await triggerNativeDdbRollLocal(rollSpec, part, mode);
     }
     const nativeRes = await triggerNativeDdbRollLocal(rollSpec, part, mode);
     if (nativeRes.triggered) return nativeRes;
-    return await tryAboveVttChatRoll(rollSpec, part, mode);
+    return await tryAboveVttChatRoll(rollSpec, part, mode, cmdOptions);
   }
 
-  async function triggerSharedVttRoll(rollSpec, part = "tohit", mode = "normal") {
-    const localRes = await triggerVttRollLocal(rollSpec, part, mode);
+  async function triggerSharedVttRoll(rollSpec, part = "tohit", mode = "normal", cmdOptions = {}) {
+    const localRes = await triggerVttRollLocal(rollSpec, part, mode, cmdOptions);
     if (localRes?.triggered) return localRes;
 
     try {
@@ -964,12 +1210,58 @@
         rollSpec,
         part,
         mode,
+        cmdOptions,
         characterId: rollContext?.myChar?.id || ""
       });
       if (relayRes?.triggered) return relayRes;
     } catch (_) {}
 
     return { triggered: false };
+  }
+
+  function computeColdAdeptOutcomeLines(st) {
+    if (!st?.coldAdeptMod) return { inLine: "", outLine: "" };
+    const typeMatch = String(st.coldAdeptMod.title || "").match(/\((cold|fire|lightning|acid|thunder)\)/i);
+    const typeCap = typeMatch
+      ? typeMatch[1].charAt(0).toUpperCase() + typeMatch[1].slice(1).toLowerCase()
+      : "Cold";
+
+    if (st.usedMin2) {
+      if (st.upgradedOnes > 0) {
+        return {
+          inLine: `+${st.upgradedOnes} dmg for ${typeCap} Adept (${st.upgradedOnes}× 1→2)`,
+          outLine: `Ignores ${typeCap.toLowerCase()} resistance`
+        };
+      }
+      if (st.damageTotal != null && st.damageBreakdown) {
+        return {
+          inLine: `${typeCap} Adept 1s→2s active (0 ones rolled)`,
+          outLine: `Ignores ${typeCap.toLowerCase()} resistance`
+        };
+      }
+      return {
+        inLine: `${typeCap} Adept 1s→2s active (in VTT)`,
+        outLine: `Ignores ${typeCap.toLowerCase()} resistance`
+      };
+    }
+
+    // Not baked into VTT (e.g. rolled from native sheet or unchecked in Prep)
+    if (st.rawOnes > 0 && st.damageTotal != null) {
+      return {
+        inLine: "",
+        outLine: `+${st.rawOnes} dmg for ${typeCap} Adept → Total ${st.damageTotal + st.rawOnes} (ignores resist)`
+      };
+    }
+    if (st.damageTotal != null && st.rawDiceCount > 0) {
+      return {
+        inLine: "",
+        outLine: `${typeCap} Adept: 0 ones rolled · ignores ${typeCap.toLowerCase()} resist`
+      };
+    }
+    return {
+      inLine: "",
+      outLine: `+1 dmg per 1 rolled for ${typeCap} Adept (not in VTT) · ignores resist`
+    };
   }
 
   function renderRollCoachToast() {
@@ -992,55 +1284,41 @@
     card.textContent = "";
     applyUiRightOffset();
 
-    const effectiveSayScript = st.matchedSpec
-      ? [
-          ...(st.baseSayLines || []),
-          ...(st.addons || [])
-            .filter((a) => st.appliedAddonIds?.has(a.id) && a.sayThis)
-            .map((a) => a.sayThis)
-        ]
-          .filter(Boolean)
-          .slice(0, 3)
-          .join(" ")
-      : st.sayScript || "";
-
+    const rm = window.DnDCopilot?.RollMaximizer;
     const header = document.createElement("div");
     header.className = "dc-head";
     const titleEl = document.createElement("strong");
     titleEl.className = "dc-head-title";
-    const totalSuffix =
-      st.rolledTotal != null
-        ? st.appliedAddonBonus
-          ? ` (${st.rolledTotal} → ${st.rolledTotal + st.appliedAddonBonus})`
-          : ` (Rolled ${st.rolledTotal})`
-        : "";
-    titleEl.textContent = `🎲 ${st.title}${totalSuffix}`;
+    titleEl.textContent = `🎲 ${st.title}`;
+    if (st.hitIsCrit) {
+      const critBadge = document.createElement("span");
+      critBadge.className = "dc-crit-pill";
+      critBadge.textContent = "NAT 20 CRIT";
+      titleEl.appendChild(critBadge);
+    }
 
     const actionBtns = document.createElement("div");
     actionBtns.className = "dc-actions";
 
-    if (effectiveSayScript) {
-      const copyBtn = document.createElement("button");
-      copyBtn.type = "button";
-      copyBtn.className = "dc-icon-btn";
-      copyBtn.textContent = "📋";
-      copyBtn.title = "Copy Say-Aloud script";
-      copyBtn.addEventListener("click", () => {
-        navigator.clipboard?.writeText(effectiveSayScript).catch(() => {});
-        copyBtn.textContent = "✓";
-        setTimeout(() => {
-          copyBtn.textContent = "📋";
-        }, 1200);
+    if (st.matchedSpec && !String(st.matchedSpec.id || "").startsWith("generic:")) {
+      const prepAgainBtn = document.createElement("button");
+      prepAgainBtn.type = "button";
+      prepAgainBtn.className = "dc-icon-btn";
+      prepAgainBtn.textContent = "↻ Prep";
+      prepAgainBtn.title = "Change spell level / enhancements & re-roll";
+      prepAgainBtn.addEventListener("click", () => {
+        openRollPrep(st.matchedSpec);
       });
-      actionBtns.appendChild(copyBtn);
+      actionBtns.appendChild(prepAgainBtn);
     }
 
     const openDrawerBtn = document.createElement("button");
     openDrawerBtn.type = "button";
     openDrawerBtn.className = "dc-icon-btn is-gold";
     openDrawerBtn.textContent = "🎲";
-    openDrawerBtn.title = "Open 1-Click Quick Roll bar";
+    openDrawerBtn.title = "Open Quick Roll picker";
     openDrawerBtn.addEventListener("click", () => {
+      prepRollState = null;
       coachDrawerOpen = true;
       renderFloatingRollDrawer();
     });
@@ -1057,33 +1335,169 @@
     header.append(titleEl, actionBtns);
     card.appendChild(header);
 
-    if (st.vttStatus === "sent") {
-      const stBox = document.createElement("div");
-      stBox.className = "dc-vtt-status is-sent";
-      stBox.textContent = "✓ Posted to AboveVTT Game Log (visible to DM & party)";
-      card.appendChild(stBox);
-    } else if (st.vttStatus === "save_dc_only") {
-      const stBox = document.createElement("div");
-      stBox.className = "dc-vtt-status is-info";
-      stBox.textContent = `ℹ️ Enemy Save DC ${st.matchedSpec?.saveDc || ""} (${st.matchedSpec?.saveAbility || "Save"}) — announce this DC to the DM!`;
-      card.appendChild(stBox);
-    } else if (st.vttStatus === "local_only") {
+    if (st.vttStatus === "local_only") {
       const stBox = document.createElement("div");
       stBox.className = "dc-vtt-status is-warn";
-      stBox.textContent = "⚠️ Not posted to VTT Log yet — open Raine's sheet once inside AboveVTT (or open the Game Log sidebar) so 1-click rolls post straight to the table!";
+      stBox.textContent = "⚠️ Local preview only — open AboveVTT Game Log or Raine's sheet to post to table.";
       card.appendChild(stBox);
     }
 
-    if (effectiveSayScript) {
-      const sayBox = document.createElement("div");
-      sayBox.className = "dc-say-box";
-      sayBox.textContent = `🗣️ Say: “${effectiveSayScript}”`;
-      card.appendChild(sayBox);
+    // Outcome Total Grid (Hit / Save DC / Damage — big readable final numbers!)
+    const hitAddonExtra = !st.wantsDamage || st.wantsHit ? Number(st.appliedHitAddonBonus || 0) : 0;
+    const dmgAddonExtra = Number(st.appliedDmgAddonBonus || 0);
+    const manualColdBonus = !st.usedMin2 && st.rawOnes > 0 && st.damageTotal != null ? st.rawOnes : 0;
+
+    if (st.wantsHit || st.isSaveSpell || st.wantsDamage) {
+      const grid = document.createElement("div");
+      grid.className = "dc-result-grid";
+
+      if (st.wantsHit) {
+        const box = document.createElement("div");
+        box.className = "dc-result-box is-hit";
+        const lbl = document.createElement("div");
+        lbl.className = "dc-result-lbl";
+        const kindTag =
+          st.matchedSpec?.kind === "save"
+            ? `${(st.matchedSpec.ability || "").toUpperCase()} Save`
+            : st.matchedSpec?.kind === "spell_attack" || st.matchedSpec?.kind === "weapon_attack"
+            ? "To Hit"
+            : st.matchedSpec?.name || "Total";
+        lbl.textContent = kindTag;
+
+        const val = document.createElement("div");
+        val.className = "dc-result-val";
+        if (st.hitTotal != null) {
+          const finalHit = st.hitTotal + hitAddonExtra;
+          val.textContent = hitAddonExtra ? `${st.hitTotal} → ${finalHit}` : `${finalHit}`;
+        } else {
+          val.style.fontSize = "14px";
+          val.style.color = "#94a3b8";
+          val.textContent = "Rolling…";
+        }
+
+        const sub = document.createElement("div");
+        sub.className = "dc-result-sub";
+        if (st.hatCheck && st.hitTotal != null) {
+          const finalHit = st.hitTotal + hitAddonExtra;
+          sub.textContent = finalHit >= 10 ? "✓ PASS DC 10 (Hat of Wizardry)" : "✕ FAIL DC 10 (Hat of Wizardry)";
+          sub.style.color = finalHit >= 10 ? "#6ee7b7" : "#fca5a5";
+        } else if (st.hitBreakdown) {
+          sub.textContent = st.hitBreakdown;
+          sub.title = st.hitBreakdown;
+        } else if (st.rollMode === "adv") {
+          sub.textContent = "2d20 keep highest";
+        } else if (st.rollMode === "dis") {
+          sub.textContent = "2d20 keep lowest";
+        } else if (st.vttStatus === "sent" && st.hitTotal != null) {
+          sub.textContent = "In AboveVTT Game Log";
+        }
+        box.append(lbl, val);
+        if (sub.textContent) box.appendChild(sub);
+        grid.appendChild(box);
+      } else if (st.isSaveSpell && st.matchedSpec?.saveDc) {
+        const box = document.createElement("div");
+        box.className = "dc-result-box is-dc";
+        const lbl = document.createElement("div");
+        lbl.className = "dc-result-lbl";
+        lbl.textContent = "Enemy Save";
+        const val = document.createElement("div");
+        val.className = "dc-result-val";
+        val.textContent = `DC ${st.matchedSpec.saveDc} ${st.matchedSpec.saveAbility || ""}`.trim();
+        const sub = document.createElement("div");
+        sub.className = "dc-result-sub";
+        sub.textContent = st.matchedSpec.upcastNote || "Targets roll save";
+        box.append(lbl, val, sub);
+        grid.appendChild(box);
+      }
+
+      if (st.wantsDamage) {
+        const dmgType = (st.matchedSpec?.damageTypes || [])[0] || "";
+        const box = document.createElement("div");
+        box.className = "dc-result-box is-dmg";
+        const lbl = document.createElement("div");
+        lbl.className = "dc-result-lbl";
+        lbl.textContent = dmgType ? `Damage (${dmgType})` : "Damage";
+        const val = document.createElement("div");
+        val.className = "dc-result-val";
+        if (st.damageTotal != null) {
+          const totalExtra = dmgAddonExtra + manualColdBonus;
+          const finalDmg = st.damageTotal + totalExtra;
+          val.textContent = totalExtra > 0 ? `${st.damageTotal} → ${finalDmg}` : `${finalDmg}`;
+        } else {
+          val.style.fontSize = "14px";
+          val.style.color = "#94a3b8";
+          val.textContent = "Rolling…";
+        }
+        const sub = document.createElement("div");
+        sub.className = "dc-result-sub";
+        if (st.damageBreakdown) {
+          sub.textContent = st.damageBreakdown;
+          sub.title = st.damageBreakdown;
+        } else if (st.matchedSpec?.damageFormula) {
+          sub.textContent = st.matchedSpec.damageFormula;
+        }
+        box.append(lbl, val);
+        if (sub.textContent) box.appendChild(sub);
+        grid.appendChild(box);
+      }
+
+      card.appendChild(grid);
     }
 
-    if (st.bullets && st.bullets.length > 0) {
+    // Compact split: What's ALREADY in VTT total vs What's NOT in VTT
+    const coldLines = computeColdAdeptOutcomeLines(st);
+    const inItems = [...(st.inVttNotes || [])];
+    if (coldLines.inLine && !inItems.includes(coldLines.inLine)) inItems.push(coldLines.inLine);
+
+    const outItems = [...(st.tellDmNotes || [])];
+    if (coldLines.outLine && !outItems.includes(coldLines.outLine)) outItems.push(coldLines.outLine);
+    for (const a of st.addons || []) {
+      if (st.appliedAddonIds?.has(a.id)) {
+        const baseTarget = st.hitTotal != null ? st.hitTotal : st.damageTotal;
+        const valTxt = Number(a.rolledValue || 0);
+        outItems.push(
+          baseTarget != null
+            ? `+${valTxt} ${a.shortLabel} → Total ${baseTarget + hitAddonExtra}`
+            : `+${valTxt} ${a.shortLabel}`
+        );
+      }
+    }
+
+    if (inItems.length > 0) {
+      const grp = document.createElement("div");
+      grp.className = "dc-note-group";
+      const nt = document.createElement("div");
+      nt.className = "dc-note-title is-in";
+      nt.textContent = st.vttStatus === "sent" ? "✓ In VTT total:" : "✓ Included:";
       const ul = document.createElement("ul");
-      ul.className = "dc-bullets";
+      ul.className = "dc-note-list";
+      for (const line of inItems.slice(0, 4)) {
+        const li = document.createElement("li");
+        li.textContent = line;
+        ul.appendChild(li);
+      }
+      grp.append(nt, ul);
+      card.appendChild(grp);
+    }
+
+    if (outItems.length > 0) {
+      const grp = document.createElement("div");
+      grp.className = "dc-note-group";
+      const nt = document.createElement("div");
+      nt.className = "dc-note-title is-out";
+      nt.textContent = "⚡ Not in VTT — tell DM / add:";
+      const ul = document.createElement("ul");
+      ul.className = "dc-note-list";
+      for (const line of outItems.slice(0, 4)) {
+        const li = document.createElement("li");
+        li.textContent = line;
+        ul.appendChild(li);
+      }
+      grp.append(nt, ul);
+      card.appendChild(grp);
+    } else if (st.bullets && st.bullets.length > 0 && inItems.length === 0) {
+      const ul = document.createElement("ul");
+      ul.className = "dc-note-list";
       for (const b of st.bullets.slice(0, 4)) {
         const li = document.createElement("li");
         li.textContent = b;
@@ -1092,32 +1506,53 @@
       card.appendChild(ul);
     }
 
-    // 1-click VTT follow-ups & situational bonus math right inside the popup
+    // 1-click follow-ups (missing Damage, Crit extra dice, Adv re-roll, or post-roll optional buffs)
     const followRow = document.createElement("div");
     followRow.className = "dc-follow-row";
 
-    const rm = window.DnDCopilot?.RollMaximizer;
-    if (st.matchedSpec && st.part !== "damage" && (st.matchedSpec.damageFormula || st.matchedSpec.kind === "spell_attack" || st.matchedSpec.kind === "weapon_attack")) {
+    if (st.matchedSpec && !st.wantsDamage && (st.matchedSpec.damageFormula || st.matchedSpec.kind === "spell_attack" || st.matchedSpec.kind === "weapon_attack")) {
       const dmgFollowBtn = document.createElement("button");
       dmgFollowBtn.type = "button";
       dmgFollowBtn.className = "dc-follow-btn is-dmg";
       dmgFollowBtn.textContent = `💥 Roll ${st.matchedSpec.damageFormula || "Damage"} → VTT`;
       dmgFollowBtn.addEventListener("click", async () => {
-        const res = await triggerSharedVttRoll(st.matchedSpec, "damage", "normal");
-        showAnalyzedRollCoach(st.matchedSpec, "damage", null, "", res?.triggered ? "sent" : "local_only");
+        st.wantsDamage = true;
+        st.damageTotal = null;
+        st.damageBreakdown = "";
+        st.updatedAt = Date.now();
+        renderRollCoachToast();
+        const res = await triggerSharedVttRoll(st.matchedSpec, "damage", "normal", st.cmdOptions || {});
+        st.vttStatus = res?.triggered ? "sent" : "local_only";
+        if (!res?.triggered && rm?.executeRoll && rollContext?.myChar) {
+          const fb = rm.executeRoll(st.matchedSpec, rollContext.myChar, rollContext.party || []);
+          st.damageTotal = fb.damageResult?.total ?? null;
+        }
+        renderRollCoachToast();
       });
       followRow.appendChild(dmgFollowBtn);
     }
 
-    if (st.matchedSpec && st.part !== "damage" && st.matchedSpec.kind !== "spell_save" && st.matchedSpec.kind !== "item_save") {
+    if (st.hitIsCrit && st.matchedSpec?.damageFormula) {
+      const critBtn = document.createElement("button");
+      critBtn.type = "button";
+      critBtn.className = "dc-follow-btn is-dmg";
+      critBtn.textContent = `💥 Roll Crit Dice (${st.matchedSpec.damageFormula}) → VTT`;
+      critBtn.addEventListener("click", async () => {
+        await triggerSharedVttRoll(st.matchedSpec, "damage", "normal", st.cmdOptions || {});
+      });
+      followRow.appendChild(critBtn);
+    }
+
+    if (st.matchedSpec && st.wantsHit && st.matchedSpec.kind !== "spell_save" && st.matchedSpec.kind !== "item_save") {
       const advBtn = document.createElement("button");
       advBtn.type = "button";
       advBtn.className = "dc-follow-btn is-adv";
-      advBtn.textContent = st.hasAdvantageFeature ? "⚡ Roll Adv (2d20) → VTT" : "⚡ 2d20 Adv → VTT";
+      advBtn.textContent = st.hasAdvantageFeature ? "⚡ Re-roll 2d20 Adv → VTT" : "⚡ 2nd d20 → VTT";
       advBtn.addEventListener("click", async () => {
-        const res = await triggerSharedVttRoll(st.matchedSpec, "tohit", "adv");
-        st.vttStatus = res?.triggered ? "sent" : "local_only";
+        st.rollMode = st.hasAdvantageFeature ? "adv" : st.rollMode;
         st.updatedAt = Date.now();
+        const res = await triggerSharedVttRoll(st.matchedSpec, "tohit", st.hasAdvantageFeature ? "adv" : "normal", st.cmdOptions || {});
+        st.vttStatus = res?.triggered ? "sent" : "local_only";
         renderRollCoachToast();
       });
       followRow.appendChild(advBtn);
@@ -1141,8 +1576,11 @@
           addon.rolledValue = val;
           st.appliedAddonIds.add(addon.id);
         }
-        st.appliedAddonBonus = (st.addons || [])
-          .filter((a) => st.appliedAddonIds.has(a.id))
+        st.appliedHitAddonBonus = (st.addons || [])
+          .filter((a) => st.appliedAddonIds.has(a.id) && !a.isDamage)
+          .reduce((sum, a) => sum + Number(a.rolledValue || 0), 0);
+        st.appliedDmgAddonBonus = (st.addons || [])
+          .filter((a) => st.appliedAddonIds.has(a.id) && a.isDamage)
           .reduce((sum, a) => sum + Number(a.rolledValue || 0), 0);
         renderRollCoachToast();
       });
@@ -1157,7 +1595,7 @@
     coachToastTimer = setTimeout(() => {
       activeCoachState = null;
       getShadowEl("dnd-copilot-roll-toast")?.remove();
-    }, 20000);
+    }, 45000);
   }
 
   function formatCoachAddonLabel(m) {
@@ -1171,66 +1609,123 @@
     return bonusTxt ? `${baseName} (${bonusTxt})` : baseName;
   }
 
-  function renderAnalyzedRollCoachLocal(matchedSpec, part = "tohit", rolledTotal = null, rawActionLabel = "", vttStatus = "") {
+  function buildCoachNotesFromAnalysis(scaledSpec, activeMods, includedSet, cmdOptions = {}, upcastLabel = "") {
+    const rm = window.DnDCopilot?.RollMaximizer;
+    const inVttNotes = [];
+    const tellDmNotes = [];
+    let coldAdeptMod = null;
+
+    if (upcastLabel) {
+      inVttNotes.push(upcastLabel);
+    } else if (scaledSpec.upcastNote) {
+      inVttNotes.push(scaledSpec.upcastNote);
+    }
+    if (cmdOptions?.setD20To != null) {
+      inVttNotes.push(`Clockwork Amulet: d20 = ${cmdOptions.setD20To}`);
+    }
+
+    for (const m of activeMods) {
+      if (m.id === "help_advantage" || m.id === "heroic_inspiration") continue;
+      if (m.id.startsWith("elemental_adept_")) {
+        coldAdeptMod = m;
+        continue;
+      }
+      if (m.id === "clockwork_amulet") continue;
+
+      const compactTxt = rm?.formatCompactModifierNote
+        ? rm.formatCompactModifierNote(m, { upcastNote: scaledSpec.upcastNote })
+        : m.title;
+      if (!compactTxt) continue;
+
+      const isMathIncluded =
+        includedSet?.has(m.id) &&
+        Boolean(m.flatBonus || m.diceBonus || m.damageDiceBonus || m.damageFlatBonus || m.grantsAdvantage);
+
+      if (isMathIncluded) {
+        inVttNotes.push(compactTxt);
+      } else if (m.defaultOn || includedSet?.has(m.id) || m.id.startsWith("rider_")) {
+        tellDmNotes.push(compactTxt);
+      }
+    }
+
+    return { inVttNotes, tellDmNotes, coldAdeptMod };
+  }
+
+  function renderAnalyzedRollCoachLocal(matchedSpec, part = "tohit", rolledTotal = null, rawActionLabel = "", vttStatus = "", rollMeta = null) {
     const rm = window.DnDCopilot?.RollMaximizer;
     const myChar = rollContext?.myChar;
     if (!rm || !myChar || !matchedSpec) return;
 
     const analysis = rm.analyzeRollPotential(matchedSpec, myChar, rollContext.party || []);
     const activeMods = (analysis.modifiers || []).filter(
-      (m) => m.sayThis || m.flatBonus || m.diceBonus || m.grantsAdvantage || m.minDieValue
+      (m) => m.sayThis || m.flatBonus || m.diceBonus || m.grantsAdvantage || m.minDieValue || m.damageDiceBonus || m.damageFlatBonus
     );
-    const baseSayLines = activeMods
-      .filter((m) => (m.defaultOn || m.id === "gnome_cunning") && m.sayThis)
-      .map((m) => m.sayThis)
-      .slice(0, 3);
 
-    const normBulletTxt = (s) =>
-      String(s || "")
-        .toLowerCase()
-        .replace(/s\b/g, "")
-        .replace(/[^a-z0-9]+/g, " ")
-        .trim();
-    const compactMods = activeMods.filter(
-      (m) => m.id !== "help_advantage" && (m.id !== "heroic_inspiration" || Boolean(myChar.inspiration))
+    const isDamagePart = part === "damage";
+    const isSaveSpell = matchedSpec.kind === "spell_save" || matchedSpec.kind === "item_save";
+    const isD20Roll = !isSaveSpell && matchedSpec.kind !== "spell_auto";
+
+    const bakedIds = rollMeta?.bakedIds instanceof Set ? rollMeta.bakedIds : new Set();
+    const { inVttNotes, tellDmNotes, coldAdeptMod } = buildCoachNotesFromAnalysis(
+      matchedSpec,
+      activeMods,
+      bakedIds,
+      rollMeta?.cmdOptions || {},
+      rollMeta?.upcastLabel || ""
     );
-    const bullets = compactMods.slice(0, 4).map((m) => {
-      const note = m.flatBonus && rolledTotal != null ? `${rolledTotal} → ${rolledTotal + m.flatBonus} (${m.badge})` : m.badge;
-      if (note && !normBulletTxt(m.title).includes(normBulletTxt(note))) {
-        return `${m.title} — ${note}`;
-      }
-      return m.title;
-    });
+
+    if (matchedSpec.kind === "spell_attack" && Number(myChar.spellAttackBonus || 0) > 0 && !rollMeta?.skipBaseInNote) {
+      inVttNotes.unshift(`+${Number(myChar.spellAttackBonus)} to hit (incl. Wand +${Number(myChar.spellAttackItemBonus || 0)})`);
+    }
 
     const addons = activeMods
-      .filter((m) => m.flatBonus || m.diceBonus)
+      .filter((m) => (m.flatBonus || m.diceBonus) && !bakedIds.has(m.id))
       .map((m) => ({
         id: m.id,
         shortLabel: formatCoachAddonLabel(m),
         flatBonus: m.flatBonus || 0,
         diceBonus: m.diceBonus || "",
-        sayThis: m.sayThis || ""
+        isDamage: Boolean(m.damageDiceBonus || m.damageFlatBonus)
       }));
+
+    const wantsHit = rollMeta?.wantsHit !== undefined ? rollMeta.wantsHit : !isDamagePart && isD20Roll;
+    const wantsDamage = rollMeta?.wantsDamage !== undefined ? rollMeta.wantsDamage : isDamagePart;
 
     activeCoachState = {
       matchedSpec,
       part,
-      rolledTotal,
+      wantsHit,
+      wantsDamage,
+      isSaveSpell,
+      rollMode: rollMeta?.rollMode || "normal",
+      cmdOptions: rollMeta?.cmdOptions || {},
+      usedMin2: Boolean(rollMeta?.usedMin2),
+      hatCheck: Boolean(rollMeta?.hatCheck || matchedSpec.slug === "arcana"),
+      hitTotal: wantsHit && !isDamagePart ? (rollMeta?.initialHitTotal ?? rolledTotal) : null,
+      hitBreakdown: rollMeta?.initialHitBreakdown || (!isDamagePart ? rollMeta?.breakdown || "" : ""),
+      hitIsCrit: Boolean(!isDamagePart && rollMeta?.isCrit),
+      damageTotal: isDamagePart ? rolledTotal : rollMeta?.initialDamageTotal ?? null,
+      damageBreakdown: isDamagePart ? rollMeta?.breakdown || "" : "",
+      upgradedOnes: isDamagePart ? Number(rollMeta?.upgradedOnes || 0) : 0,
+      rawOnes: isDamagePart ? Number(rollMeta?.rawOnes || 0) : 0,
+      rawDiceCount: isDamagePart ? Number(rollMeta?.rawDiceCount || 0) : 0,
       vttStatus,
       updatedAt: Date.now(),
-      title: `${myChar.name} · ${matchedSpec.name || rawActionLabel || "Roll"}${part === "damage" ? " Damage" : ""}`,
-      baseSayLines,
-      sayScript: baseSayLines.join(" "),
-      bullets,
+      title: `${myChar.name} · ${matchedSpec.name || rawActionLabel || "Roll"}${rollMeta?.upcastTag ? ` (${rollMeta.upcastTag})` : ""}`,
+      inVttNotes,
+      tellDmNotes,
+      coldAdeptMod,
+      bullets: [],
       hasAdvantageFeature: activeMods.some((m) => m.grantsAdvantage),
       addons,
       appliedAddonIds: new Set(),
-      appliedAddonBonus: 0
+      appliedHitAddonBonus: 0,
+      appliedDmgAddonBonus: 0
     };
     renderRollCoachToast();
   }
 
-  function showAnalyzedRollCoach(matchedSpec, part = "tohit", rolledTotal = null, rawActionLabel = "", vttStatus = "") {
+  function showAnalyzedRollCoach(matchedSpec, part = "tohit", rolledTotal = null, rawActionLabel = "", vttStatus = "", rollMeta = null) {
     if (window.top !== window && hasTopFrameCoach) {
       chrome.runtime
         .sendMessage({
@@ -1243,31 +1738,38 @@
         })
         .then((resp) => {
           if (!resp?.forwarded) {
-            renderAnalyzedRollCoachLocal(matchedSpec, part, rolledTotal, rawActionLabel, vttStatus);
+            renderAnalyzedRollCoachLocal(matchedSpec, part, rolledTotal, rawActionLabel, vttStatus, rollMeta);
           }
         })
         .catch(() => {
-          renderAnalyzedRollCoachLocal(matchedSpec, part, rolledTotal, rawActionLabel, vttStatus);
+          renderAnalyzedRollCoachLocal(matchedSpec, part, rolledTotal, rawActionLabel, vttStatus, rollMeta);
         });
       return;
     }
-    renderAnalyzedRollCoachLocal(matchedSpec, part, rolledTotal, rawActionLabel, vttStatus);
+    renderAnalyzedRollCoachLocal(matchedSpec, part, rolledTotal, rawActionLabel, vttStatus, rollMeta);
   }
 
   function showRollCoachToast(title, bullets = [], sayScript = "", vttStatus = "") {
     activeCoachState = {
       matchedSpec: null,
       part: "tohit",
-      rolledTotal: null,
+      wantsHit: false,
+      wantsDamage: false,
+      isSaveSpell: false,
+      hitTotal: null,
+      damageTotal: null,
       vttStatus,
       updatedAt: Date.now(),
-      title: title || "Full Potential Coach",
+      title: title || "Roll Summary",
       sayScript,
       bullets,
+      inVttNotes: [],
+      tellDmNotes: bullets,
       hasAdvantageFeature: false,
       addons: [],
       appliedAddonIds: new Set(),
-      appliedAddonBonus: 0
+      appliedHitAddonBonus: 0,
+      appliedDmgAddonBonus: 0
     };
     renderRollCoachToast();
   }
@@ -1289,13 +1791,25 @@
       if (!res) continue;
 
       const part = roll.kind === "damage" ? "damage" : "tohit";
-      if (
+      const rawDice = Array.isArray(roll.rawDiceValues) ? roll.rawDiceValues : [];
+      const rawOnes = rawDice.filter((v) => v === 1).length;
+      const sameSpecActive =
         activeCoachState &&
         activeCoachState.matchedSpec?.id === res.matchedSpec?.id &&
-        Date.now() - (activeCoachState.updatedAt || 0) < 4000 &&
-        roll.total != null
-      ) {
-        activeCoachState.rolledTotal = roll.total;
+        Date.now() - (activeCoachState.updatedAt || 0) < 12000;
+
+      if (sameSpecActive && roll.total != null) {
+        if (part === "damage" || (activeCoachState.wantsDamage && !activeCoachState.wantsHit)) {
+          activeCoachState.damageTotal = roll.total;
+          activeCoachState.damageBreakdown = roll.breakdown || "";
+          activeCoachState.upgradedOnes = Number(roll.upgradedOnes || 0);
+          activeCoachState.rawOnes = rawOnes;
+          activeCoachState.rawDiceCount = rawDice.length;
+        } else {
+          activeCoachState.hitTotal = roll.total;
+          activeCoachState.hitBreakdown = roll.breakdown || "";
+          activeCoachState.hitIsCrit = Boolean(roll.isCrit);
+        }
         activeCoachState.vttStatus = "sent";
         activeCoachState.updatedAt = Date.now();
         renderRollCoachToast();
@@ -1303,7 +1817,13 @@
       }
 
       if (res.matchedSpec) {
-        showAnalyzedRollCoach(res.matchedSpec, part, roll.total, roll.action, "sent");
+        showAnalyzedRollCoach(res.matchedSpec, part, roll.total, roll.action, "sent", {
+          breakdown: roll.breakdown || "",
+          upgradedOnes: Number(roll.upgradedOnes || 0),
+          rawOnes,
+          rawDiceCount: rawDice.length,
+          isCrit: Boolean(roll.isCrit)
+        });
       }
     }
   }
@@ -1347,6 +1867,195 @@
     return btn;
   }
 
+  function openRollPrep(spec) {
+    const rm = window.DnDCopilot?.RollMaximizer;
+    const myChar = rollContext?.myChar;
+    if (!rm || !myChar || !spec) return;
+
+    const baseLvl =
+      spec.kind === "item_save" && /necklace/i.test(spec.name || "")
+        ? 1
+        : Number(spec.baseLevel ?? spec.level ?? 0);
+    const baseSpec = { ...spec, baseLevel: baseLvl };
+    const analysis = rm.analyzeRollPotential(baseSpec, myChar, rollContext.party || []);
+    const activeToggleIds = new Set();
+    let defaultAdv = false;
+
+    for (const m of analysis.modifiers || []) {
+      if (m.id === "gnome_cunning") continue; // Conditional vs magic — let player check if needed
+      if (m.defaultOn) {
+        activeToggleIds.add(m.id);
+        if (m.grantsAdvantage) defaultAdv = true;
+      }
+    }
+
+    prepRollState = {
+      baseSpec,
+      castLevel: Number(spec.castLevel ?? baseLvl),
+      rollMode: defaultAdv ? "adv" : "normal",
+      activeToggleIds
+    };
+    coachDrawerOpen = true;
+    renderFloatingRollDrawer();
+  }
+
+  function buildCmdOptionsFromPrep(scaledSpec, prep, activeMods) {
+    let flatBonus = 0;
+    const diceBonuses = [];
+    let setD20To = null;
+    let minDieValue = 1;
+    let extraDamageDice = "";
+    let damageFlatBonus = 0;
+    const bakedIds = new Set();
+    const dmgTypesLow = (scaledSpec.damageTypes || []).map((t) => String(t).toLowerCase());
+
+    for (const m of activeMods) {
+      if (!prep.activeToggleIds.has(m.id)) continue;
+      if (m.flatBonus) {
+        flatBonus += Number(m.flatBonus);
+        bakedIds.add(m.id);
+      }
+      if (m.diceBonus) {
+        diceBonuses.push(m.diceBonus);
+        bakedIds.add(m.id);
+      }
+      if (m.setD20To != null) {
+        setD20To = Number(m.setD20To);
+        bakedIds.add(m.id);
+      }
+      if (
+        m.minDieValue > 1 &&
+        (!m.minDieDamageTypes?.length ||
+          m.minDieDamageTypes.some((t) => dmgTypesLow.includes(String(t).toLowerCase())))
+      ) {
+        minDieValue = Math.max(minDieValue, Number(m.minDieValue));
+        bakedIds.add(m.id);
+      }
+      if (m.damageDiceBonus && !extraDamageDice) {
+        extraDamageDice = m.damageDiceBonus;
+        bakedIds.add(m.id);
+      }
+      if (m.damageFlatBonus) {
+        damageFlatBonus += Number(m.damageFlatBonus);
+        bakedIds.add(m.id);
+      }
+      if (m.grantsAdvantage && prep.rollMode === "adv") {
+        bakedIds.add(m.id);
+      }
+    }
+
+    return {
+      cmdOptions: {
+        flatBonus,
+        diceBonus: diceBonuses[0] || "",
+        setD20To,
+        minDieValue,
+        extraDamageDice,
+        damageFlatBonus,
+        castLevel: prep.castLevel
+      },
+      bakedIds
+    };
+  }
+
+  async function executePreparedRoll(prep, whichParts = ["tohit"]) {
+    const rm = window.DnDCopilot?.RollMaximizer;
+    const myChar = rollContext?.myChar;
+    const party = rollContext?.party || [];
+    if (!rm || !myChar || !prep?.baseSpec) return;
+
+    const scaledSpec = rm.applyUpcastToRollSpec
+      ? rm.applyUpcastToRollSpec(prep.baseSpec, prep.castLevel)
+      : prep.baseSpec;
+    const analysis = rm.analyzeRollPotential(scaledSpec, myChar, party);
+    const activeMods = analysis.modifiers || [];
+    const { cmdOptions, bakedIds } = buildCmdOptionsFromPrep(scaledSpec, prep, activeMods);
+
+    const isSaveSpell = scaledSpec.kind === "spell_save" || scaledSpec.kind === "item_save";
+    const wantsHit = whichParts.includes("tohit") && !isSaveSpell && scaledSpec.kind !== "spell_auto";
+    const wantsDamage = whichParts.includes("damage") && Boolean(scaledSpec.damageFormula);
+
+    coachDrawerOpen = false;
+    prepRollState = null;
+    renderFloatingRollDrawer();
+
+    const isUpcast = prep.castLevel > Number(prep.baseSpec.baseLevel ?? prep.baseSpec.level ?? 0);
+    const upcastTag = isUpcast
+      ? scaledSpec.kind === "item_save" && /necklace/i.test(scaledSpec.name || "")
+        ? `${prep.castLevel} beads`
+        : `L${prep.castLevel}`
+      : "";
+    const upcastLabel = isUpcast
+      ? `${upcastTag} upcast (${scaledSpec.upcastNote || scaledSpec.damageFormula || ""})`.trim()
+      : "";
+
+    const deterministicHit =
+      wantsHit && cmdOptions.setD20To != null && !cmdOptions.diceBonus
+        ? Number(cmdOptions.setD20To) + Number(scaledSpec.attackBonus || 0) + Number(cmdOptions.flatBonus || 0)
+        : null;
+
+    if (isSaveSpell && !scaledSpec.damageFormula) {
+      showAnalyzedRollCoach(scaledSpec, "tohit", null, "", "save_dc_only", {
+        wantsHit: false,
+        wantsDamage: false,
+        rollMode: prep.rollMode,
+        cmdOptions,
+        bakedIds,
+        upcastTag,
+        upcastLabel,
+        hatCheck: prep.activeToggleIds.has("hat_of_wizardry")
+      });
+      return;
+    }
+
+    // Create the live outcome card before firing rolls so fast Game Log entries never race ahead
+    showAnalyzedRollCoach(scaledSpec, wantsDamage && !wantsHit ? "damage" : "tohit", null, "", "sent", {
+      wantsHit,
+      wantsDamage,
+      rollMode: prep.rollMode,
+      cmdOptions,
+      bakedIds,
+      usedMin2: cmdOptions.minDieValue > 1,
+      upcastTag,
+      upcastLabel,
+      hatCheck: prep.activeToggleIds.has("hat_of_wizardry") || scaledSpec.slug === "arcana",
+      initialHitTotal: deterministicHit,
+      initialHitBreakdown:
+        cmdOptions.setD20To != null
+          ? `Clockwork ${cmdOptions.setD20To} + ${Number(scaledSpec.attackBonus || 0) + Number(cmdOptions.flatBonus || 0)}`
+          : "",
+      initialDamageTotal: null
+    });
+
+    let anySent = false;
+    if (wantsHit) {
+      const hitRes = await triggerSharedVttRoll(scaledSpec, "tohit", prep.rollMode, cmdOptions);
+      if (hitRes?.triggered) anySent = true;
+    }
+    if (wantsHit && wantsDamage) {
+      await new Promise((r) => setTimeout(r, 240));
+    }
+    if (wantsDamage) {
+      const dmgRes = await triggerSharedVttRoll(scaledSpec, "damage", "normal", cmdOptions);
+      if (dmgRes?.triggered) anySent = true;
+    }
+
+    if (!anySent && activeCoachState) {
+      const fb = rm.executeRoll(scaledSpec, myChar, party, {
+        activeToggleIds: prep.activeToggleIds,
+        forceAdvantage: prep.rollMode === "adv"
+      });
+      activeCoachState.vttStatus = "local_only";
+      if (wantsHit && activeCoachState.hitTotal == null) {
+        activeCoachState.hitTotal = fb.d20Result?.total ?? null;
+      }
+      if (wantsDamage && activeCoachState.damageTotal == null) {
+        activeCoachState.damageTotal = fb.damageResult?.total ?? null;
+      }
+      renderRollCoachToast();
+    }
+  }
+
   function renderFloatingRollDrawer() {
     if (!shouldShowFloatingRollUi()) {
       getShadowEl("dnd-copilot-roll-pill")?.remove();
@@ -1366,6 +2075,7 @@
       pill.textContent = "🎲 Quick Roll";
       pill.addEventListener("click", () => {
         coachDrawerOpen = !coachDrawerOpen;
+        if (!coachDrawerOpen) prepRollState = null;
         renderFloatingRollDrawer();
       });
       root.appendChild(pill);
@@ -1392,11 +2102,232 @@
     const myChar = rollContext?.myChar;
     const party = rollContext?.party || [];
 
+    if (!rm || !myChar) {
+      const head = document.createElement("div");
+      head.className = "dc-head";
+      const hTitle = document.createElement("strong");
+      hTitle.className = "dc-head-title";
+      hTitle.textContent = "🎲 Quick Roll";
+      const hClose = document.createElement("button");
+      hClose.type = "button";
+      hClose.className = "dc-close-btn";
+      hClose.textContent = "✕";
+      hClose.addEventListener("click", () => {
+        coachDrawerOpen = false;
+        renderFloatingRollDrawer();
+      });
+      head.append(hTitle, hClose);
+      drawer.appendChild(head);
+
+      const msg = document.createElement("div");
+      msg.style.color = "#cbd5e8";
+      msg.textContent = "Open your character sheet or http://localhost:8765 once to sync your sheet.";
+      drawer.appendChild(msg);
+      return;
+    }
+
+    // STEP 2: Prep View (Upcast Level + Roll Mode + Enhancements Checklist + Roll Button)
+    if (prepRollState?.baseSpec) {
+      const prep = prepRollState;
+      const scaledSpec = rm.applyUpcastToRollSpec
+        ? rm.applyUpcastToRollSpec(prep.baseSpec, prep.castLevel)
+        : prep.baseSpec;
+      const analysis = rm.analyzeRollPotential(scaledSpec, myChar, party);
+      const isSaveSpell = scaledSpec.kind === "spell_save" || scaledSpec.kind === "item_save";
+      const isD20Roll = !isSaveSpell && scaledSpec.kind !== "spell_auto";
+      const hasClockwork = prep.activeToggleIds.has("clockwork_amulet");
+
+      const head = document.createElement("div");
+      head.className = "dc-head";
+      const backBtn = document.createElement("button");
+      backBtn.type = "button";
+      backBtn.className = "dc-icon-btn";
+      backBtn.textContent = "← Back";
+      backBtn.addEventListener("click", () => {
+        prepRollState = null;
+        renderFloatingRollDrawer();
+      });
+      const hTitle = document.createElement("strong");
+      hTitle.className = "dc-head-title";
+      hTitle.textContent = scaledSpec.name;
+      const hClose = document.createElement("button");
+      hClose.type = "button";
+      hClose.className = "dc-close-btn";
+      hClose.textContent = "✕";
+      hClose.addEventListener("click", () => {
+        coachDrawerOpen = false;
+        prepRollState = null;
+        renderFloatingRollDrawer();
+      });
+      head.append(backBtn, hTitle, hClose);
+      drawer.appendChild(head);
+
+      const addSectionLabel = (txt) => {
+        const lbl = document.createElement("div");
+        lbl.className = "dc-sec-label";
+        lbl.textContent = txt;
+        drawer.appendChild(lbl);
+      };
+
+      // Upcast / Beads selector
+      const upcastOpts = rm.getUpcastOptions ? rm.getUpcastOptions(prep.baseSpec, myChar) : [];
+      if (upcastOpts.length > 1) {
+        addSectionLabel(scaledSpec.kind === "item_save" ? "💎 Beads to Throw" : "✨ Cast Level");
+        const upRow = document.createElement("div");
+        upRow.className = "dc-prep-row";
+        for (const opt of upcastOpts) {
+          const b = document.createElement("button");
+          b.type = "button";
+          const isSel = Number(prep.castLevel) === Number(opt.level);
+          b.className = `dc-seg-btn${isSel ? " is-selected" : ""}${opt.remaining === 0 ? " is-empty" : ""}`;
+          b.textContent = opt.remaining != null ? `${opt.label} (${opt.remaining})` : opt.label;
+          b.addEventListener("click", () => {
+            prep.castLevel = opt.level;
+            renderFloatingRollDrawer();
+          });
+          upRow.appendChild(b);
+        }
+        drawer.appendChild(upRow);
+      }
+
+      // Advantage / Normal / Disadvantage selector
+      if (isD20Roll && !hasClockwork) {
+        addSectionLabel("🎯 Roll Mode");
+        const modeRow = document.createElement("div");
+        modeRow.className = "dc-prep-row";
+        for (const [modeVal, modeLbl] of [
+          ["normal", "Normal"],
+          ["adv", "Adv (2d20)"],
+          ["dis", "Disadv"]
+        ]) {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = `dc-seg-btn${prep.rollMode === modeVal ? " is-selected" : ""}`;
+          b.textContent = modeLbl;
+          b.addEventListener("click", () => {
+            prep.rollMode = modeVal;
+            renderFloatingRollDrawer();
+          });
+          modeRow.appendChild(b);
+        }
+        drawer.appendChild(modeRow);
+      }
+
+      // Enhancements Checklist (only actionable toggles; omit generic help_advantage & auto riders)
+      const checkMods = (analysis.modifiers || []).filter(
+        (m) => m.id !== "help_advantage" && !m.id.startsWith("rider_")
+      );
+      if (checkMods.length > 0) {
+        addSectionLabel("⚡ Enhancements");
+        const list = document.createElement("div");
+        list.className = "dc-check-list";
+        for (const m of checkMods) {
+          const row = document.createElement("label");
+          row.className = "dc-check-row";
+          const cb = document.createElement("input");
+          cb.type = "checkbox";
+          cb.checked = prep.activeToggleIds.has(m.id);
+          cb.addEventListener("change", () => {
+            if (cb.checked) {
+              prep.activeToggleIds.add(m.id);
+              if (m.grantsAdvantage) prep.rollMode = "adv";
+            } else {
+              prep.activeToggleIds.delete(m.id);
+              if (m.grantsAdvantage) {
+                const stillHasAdv = checkMods.some((x) => x.grantsAdvantage && prep.activeToggleIds.has(x.id));
+                if (!stillHasAdv && prep.rollMode === "adv") prep.rollMode = "normal";
+              }
+            }
+            renderFloatingRollDrawer();
+          });
+
+          const lblSpan = document.createElement("span");
+          lblSpan.className = "dc-check-lbl";
+          const shortTitle = String(m.title || "").split("—")[0].trim();
+          lblSpan.textContent = m.badge && !shortTitle.toLowerCase().includes(m.badge.toLowerCase())
+            ? `${shortTitle} · ${m.badge}`
+            : shortTitle;
+
+          const isVttCalc = Boolean(
+            m.flatBonus || m.diceBonus || m.setD20To != null || m.minDieValue > 1 || m.damageDiceBonus || m.damageFlatBonus || m.grantsAdvantage
+          );
+          const tag = document.createElement("span");
+          tag.className = isVttCalc ? "dc-tag-in" : "dc-tag-note";
+          tag.textContent = isVttCalc ? "In VTT" : "Note";
+
+          row.append(cb, lblSpan, tag);
+          list.appendChild(row);
+        }
+        drawer.appendChild(list);
+      }
+
+      // Live Formula Preview
+      const { cmdOptions } = buildCmdOptionsFromPrep(scaledSpec, prep, checkMods);
+      const previewParts = [];
+      if (isD20Roll) {
+        const hitCmd = rm.buildAboveVttSlashCommand(scaledSpec, "tohit", prep.rollMode, cmdOptions);
+        if (hitCmd) previewParts.push(`Roll: ${hitCmd}`);
+      } else if (isSaveSpell && scaledSpec.saveDc) {
+        previewParts.push(`Save: DC ${scaledSpec.saveDc} ${scaledSpec.saveAbility || ""}`);
+      }
+      if (scaledSpec.damageFormula) {
+        const dmgCmd = rm.buildAboveVttSlashCommand(scaledSpec, "damage", "normal", cmdOptions);
+        if (dmgCmd) previewParts.push(`Dmg: ${dmgCmd}`);
+      }
+      if (previewParts.length > 0) {
+        const fBar = document.createElement("div");
+        fBar.className = "dc-formula-bar";
+        fBar.textContent = previewParts.join("  ·  ");
+        drawer.appendChild(fBar);
+      }
+
+      // Primary Roll Action Row
+      const ctaRow = document.createElement("div");
+      ctaRow.className = "dc-cta-row";
+      const mainBtn = document.createElement("button");
+      mainBtn.type = "button";
+      mainBtn.className = "dc-roll-primary";
+
+      if (isD20Roll && scaledSpec.damageFormula) {
+        mainBtn.textContent = "🎲 Roll Hit + Damage → VTT";
+        mainBtn.addEventListener("click", () => executePreparedRoll(prep, ["tohit", "damage"]));
+        ctaRow.appendChild(mainBtn);
+
+        const hitOnly = document.createElement("button");
+        hitOnly.type = "button";
+        hitOnly.className = "dc-roll-secondary";
+        hitOnly.textContent = "Hit only";
+        hitOnly.addEventListener("click", () => executePreparedRoll(prep, ["tohit"]));
+
+        const dmgOnly = document.createElement("button");
+        dmgOnly.type = "button";
+        dmgOnly.className = "dc-roll-secondary";
+        dmgOnly.textContent = "Dmg only";
+        dmgOnly.addEventListener("click", () => executePreparedRoll(prep, ["damage"]));
+        ctaRow.append(hitOnly, dmgOnly);
+      } else if (isSaveSpell && scaledSpec.damageFormula) {
+        mainBtn.textContent = `🎲 Roll ${scaledSpec.damageFormula} Damage → VTT`;
+        mainBtn.addEventListener("click", () => executePreparedRoll(prep, ["damage"]));
+        ctaRow.appendChild(mainBtn);
+      } else if (isSaveSpell) {
+        mainBtn.textContent = `📢 Show DC ${scaledSpec.saveDc || ""} Summary`;
+        mainBtn.addEventListener("click", () => executePreparedRoll(prep, ["tohit"]));
+        ctaRow.appendChild(mainBtn);
+      } else {
+        mainBtn.textContent = "🎲 Roll → VTT";
+        mainBtn.addEventListener("click", () => executePreparedRoll(prep, ["tohit"]));
+        ctaRow.appendChild(mainBtn);
+      }
+      drawer.appendChild(ctaRow);
+      return;
+    }
+
+    // STEP 1: Picker View
     const head = document.createElement("div");
     head.className = "dc-head";
     const hTitle = document.createElement("strong");
     hTitle.className = "dc-head-title";
-    hTitle.textContent = myChar ? `🎲 1-Click Roll → VTT (${myChar.name})` : "🎲 1-Click Roll";
+    hTitle.textContent = `🎲 Pick Spell / Check (${myChar.name})`;
     const hClose = document.createElement("button");
     hClose.type = "button";
     hClose.className = "dc-close-btn";
@@ -1408,18 +2339,10 @@
     head.append(hTitle, hClose);
     drawer.appendChild(head);
 
-    if (!rm || !myChar) {
-      const msg = document.createElement("div");
-      msg.style.color = "#cbd5e8";
-      msg.textContent = "Open your character sheet or http://localhost:8765 once to sync your sheet.";
-      drawer.appendChild(msg);
-      return;
-    }
-
     const searchInp = document.createElement("input");
     searchInp.type = "text";
     searchInp.className = "dc-search";
-    searchInp.placeholder = "Filter any spell, save, or skill (1 click rolls to VTT)...";
+    searchInp.placeholder = "Filter any spell, save, or skill...";
     searchInp.value = coachFilterQuery;
     ["keydown", "keyup", "keypress"].forEach((evtName) => {
       searchInp.addEventListener(evtName, (ev) => ev.stopPropagation());
@@ -1439,30 +2362,6 @@
     const catalog = rm.getRollCatalog(myChar, party);
     const q = coachFilterQuery.trim().toLowerCase();
 
-    const triggerQuickItem = async (spec, part = "tohit") => {
-      coachDrawerOpen = false;
-      renderFloatingRollDrawer();
-
-      if ((spec.kind === "spell_save" || spec.kind === "item_save") && !spec.damageFormula) {
-        showAnalyzedRollCoach(spec, part, null, "", "save_dc_only");
-        return;
-      }
-
-      const vttRes = await triggerSharedVttRoll(spec, part, "normal");
-      if (vttRes?.triggered) {
-        showAnalyzedRollCoach(spec, part, null, "", "sent");
-        return;
-      }
-
-      // Local fallback preview when neither native sheet nor VTT chat box is open
-      const fallbackRoll = rm.executeRoll(spec, myChar, party);
-      const rolledNum =
-        part === "damage"
-          ? fallbackRoll.damageResult?.total ?? fallbackRoll.d20Result?.total ?? null
-          : fallbackRoll.d20Result?.total ?? fallbackRoll.damageResult?.total ?? null;
-      showAnalyzedRollCoach(spec, part, rolledNum, "", "local_only");
-    };
-
     const addSectionLabel = (txt) => {
       const lbl = document.createElement("div");
       lbl.className = "dc-sec-label";
@@ -1470,38 +2369,29 @@
       drawer.appendChild(lbl);
     };
 
-    // 1. Spells & Attacks (1-click direct + optional damage pill right beside it!)
+    // 1. Spells & Attacks (1 click -> Step 2 Prep & Enhancements)
     const combatItems = (catalog.spellsAndAttacks || []).filter((s) =>
       !q || `${s.name} ${s.subLabel}`.toLowerCase().includes(q)
     );
     if (combatItems.length > 0) {
-      addSectionLabel("✨ Spells & Attacks (Rolls into VTT Log)");
+      addSectionLabel("✨ Spells & Attacks (Pick → Enhance & Roll)");
       const grid = document.createElement("div");
       grid.className = "dc-grid";
-      for (const sp of (q ? combatItems : combatItems.slice(0, 8))) {
-        const wrap = document.createElement("div");
-        wrap.className = "dc-chip-wrap";
-        const mainSub =
-          sp.kind === "spell_attack" || sp.kind === "weapon_attack" || sp.kind === "spell_check"
+      for (const sp of (q ? combatItems : combatItems.slice(0, 10))) {
+        const subTxt =
+          sp.kind === "spell_attack" || sp.kind === "weapon_attack"
+            ? `+${Number(sp.attackBonus || 0)}${sp.damageFormula ? ` · ${sp.damageFormula}` : ""}`
+            : sp.kind === "spell_check"
             ? `+${Number(sp.attackBonus || 0)}`
             : sp.damageFormula || (sp.saveDc ? `DC ${sp.saveDc}` : "");
-        const mainPart = sp.kind === "spell_save" ? "damage" : "tohit";
-        const bMain = makeQuickChipBtn(sp.name, mainSub);
-        bMain.addEventListener("click", () => triggerQuickItem(sp, mainPart));
-        wrap.appendChild(bMain);
-
-        if ((sp.kind === "spell_attack" || sp.kind === "weapon_attack") && sp.damageFormula) {
-          const bDmg = makeQuickChipBtn("", sp.damageFormula, true);
-          bDmg.title = `Roll ${sp.name} damage straight into VTT`;
-          bDmg.addEventListener("click", () => triggerQuickItem(sp, "damage"));
-          wrap.appendChild(bDmg);
-        }
-        grid.appendChild(wrap);
+        const bMain = makeQuickChipBtn(sp.name, subTxt);
+        bMain.addEventListener("click", () => openRollPrep(sp));
+        grid.appendChild(bMain);
       }
       drawer.appendChild(grid);
     }
 
-    // 2. Saving Throws (1 tight single row)
+    // 2. Saving Throws
     const saveItems = (catalog.saves || []).filter((s) =>
       s.id !== "save:death" && (!q || `${s.name} ${s.ability}`.toLowerCase().includes(q))
     );
@@ -1512,7 +2402,7 @@
       for (const sv of saveItems) {
         const shortNm = sv.isConcentration ? "Conc" : (sv.ability || sv.name).toUpperCase();
         const b = makeQuickChipBtn(shortNm, sv.subLabel);
-        b.addEventListener("click", () => triggerQuickItem(sv, "tohit"));
+        b.addEventListener("click", () => openRollPrep(sv));
         row.appendChild(b);
       }
       drawer.appendChild(row);
@@ -1521,7 +2411,7 @@
     // 3. Initiative & Skills
     const allSkills = (catalog.skills || []).filter((sk) =>
       !q
-        ? sk.kind === "initiative" || sk.tier === "proficiency" || sk.tier === "expertise"
+        ? sk.kind === "initiative" || sk.tier === "proficiency" || sk.tier === "expertise" || sk.slug === "arcana"
         : `${sk.name} ${sk.ability}`.toLowerCase().includes(q)
     );
     if (allSkills.length > 0) {
@@ -1531,7 +2421,7 @@
       for (const sk of (q ? allSkills : allSkills.slice(0, 10))) {
         const shortMod = sk.subLabel.split("·")[0].trim();
         const b = makeQuickChipBtn(sk.name === "Initiative" ? "Init" : sk.name, shortMod);
-        b.addEventListener("click", () => triggerQuickItem(sk, "tohit"));
+        b.addEventListener("click", () => openRollPrep(sk));
         skRow.appendChild(b);
       }
       drawer.appendChild(skRow);
@@ -1718,7 +2608,12 @@
       return false;
     }
     if (message?.type === "EXECUTE_VTT_ROLL_LOCAL") {
-      triggerVttRollLocal(message.rollSpec, message.part || "tohit", message.mode || "normal")
+      triggerVttRollLocal(
+        message.rollSpec,
+        message.part || "tohit",
+        message.mode || "normal",
+        message.cmdOptions || {}
+      )
         .then((res) => sendResponse({ ok: true, ...(res || { triggered: false }) }))
         .catch(() => sendResponse({ ok: false, triggered: false }));
       return true;

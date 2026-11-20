@@ -1028,9 +1028,193 @@
     cha: "Charisma"
   };
 
-  function buildAboveVttSlashCommand(rollSpec, part = "tohit", mode = "normal") {
+  const UPCAST_RULES = {
+    "rime's binding ice": { dicePerLevel: [1, 8] },
+    "rimes binding ice": { dicePerLevel: [1, 8] },
+    "chromatic orb": { dicePerLevel: [1, 8] },
+    "shatter": { dicePerLevel: [1, 8] },
+    "thunderwave": { dicePerLevel: [1, 8] },
+    "cone of cold": { dicePerLevel: [1, 8] },
+    "cure wounds": { dicePerLevel: [1, 8] },
+    "blight": { dicePerLevel: [1, 8] },
+    "fireball": { dicePerLevel: [1, 6] },
+    "lightning bolt": { dicePerLevel: [1, 6] },
+    "burning hands": { dicePerLevel: [1, 6] },
+    "guiding bolt": { dicePerLevel: [1, 6] },
+    "ice knife": { dicePerLevel: [1, 6] },
+    "inflict wounds": { dicePerLevel: [1, 10] },
+    "scorching ray": { raysBase: 3, raysPerLevel: 1 },
+    "magic missile": { dartsBase: 3, dartsPerLevel: 1 },
+    "hold person": { targetsPerLevel: 1 },
+    "invisibility": { targetsPerLevel: 1 },
+    "fly": { targetsPerLevel: 1 },
+    "banishment": { targetsPerLevel: 1 },
+    "blindness/deafness": { targetsPerLevel: 1 }
+  };
+
+  function addDiceToFormula(formula, addCount, addSides) {
+    const clean = String(formula || "").replace(/\s+/g, "");
+    if (!addCount || !addSides) return clean;
+    if (!clean) return `${addCount}d${addSides}`;
+    const leadMatch = clean.match(/^(\d+)d(\d+)(.*)$/i);
+    if (leadMatch && Number(leadMatch[2]) === Number(addSides)) {
+      return `${Number(leadMatch[1]) + Number(addCount)}d${addSides}${leadMatch[3]}`;
+    }
+    return `${clean}+${addCount}d${addSides}`;
+  }
+
+  function applyUpcastToRollSpec(rollSpec, castLevel) {
+    if (!rollSpec || typeof rollSpec !== "object") return rollSpec;
+
+    if (rollSpec.kind === "item_save" && /necklace of fireballs/i.test(rollSpec.name || "")) {
+      const beads = Math.max(1, Math.min(4, Number(castLevel || 1)));
+      return {
+        ...rollSpec,
+        baseLevel: 1,
+        level: beads,
+        castLevel: beads,
+        damageFormula: `${7 + beads}d6`,
+        upcastNote: beads > 1 ? `${beads} beads` : ""
+      };
+    }
+
+    const baseLevel = Number(rollSpec.baseLevel ?? rollSpec.level ?? 0);
+    const targetLevel = Math.max(baseLevel, Number(castLevel || baseLevel));
+    const extra = Math.max(0, targetLevel - baseLevel);
+    const nameLow = String(rollSpec.name || "").trim().toLowerCase();
+    const rule = UPCAST_RULES[nameLow] || null;
+
+    let damageFormula = String(rollSpec.damageFormula || "");
+    let upcastNote = "";
+
+    if (extra > 0) {
+      if (rule?.dicePerLevel) {
+        damageFormula = addDiceToFormula(damageFormula, extra * rule.dicePerLevel[0], rule.dicePerLevel[1]);
+      } else if (rule?.raysBase) {
+        upcastNote = `${rule.raysBase + extra * (rule.raysPerLevel || 1)} rays total`;
+      } else if (rule?.dartsBase) {
+        upcastNote = `${rule.dartsBase + extra * (rule.dartsPerLevel || 1)} darts (1d4+1 each)`;
+      } else if (rule?.targetsPerLevel) {
+        const totExtra = extra * rule.targetsPerLevel;
+        upcastNote = `+${totExtra} target${totExtra > 1 ? "s" : ""}`;
+      } else {
+        const sumMatch = String(rollSpec.summary || "").match(/increases?\s+by\s+(\d+)d(\d+)/i);
+        if (sumMatch) {
+          damageFormula = addDiceToFormula(damageFormula, extra * Number(sumMatch[1]), Number(sumMatch[2]));
+        }
+      }
+    }
+
+    return {
+      ...rollSpec,
+      baseLevel,
+      level: targetLevel,
+      castLevel: targetLevel,
+      damageFormula,
+      upcastNote
+    };
+  }
+
+  function getUpcastOptions(rollSpec, myChar) {
+    if (!rollSpec || typeof rollSpec !== "object") return [];
+
+    if (rollSpec.kind === "item_save" && /necklace of fireballs/i.test(rollSpec.name || "")) {
+      return [1, 2, 3, 4].map((beads) => {
+        const scaled = applyUpcastToRollSpec(rollSpec, beads);
+        return {
+          level: beads,
+          remaining: null,
+          max: null,
+          damageFormula: scaled.damageFormula,
+          upcastNote: scaled.upcastNote,
+          label: `${beads} bead${beads > 1 ? "s" : ""} · ${scaled.damageFormula}`
+        };
+      });
+    }
+
+    const baseLevel = Number(rollSpec.baseLevel ?? rollSpec.level ?? 0);
+    if (!rollSpec.isSpell || baseLevel < 1) return [];
+
+    const slotByLevel = new Map();
+    for (const slot of Array.isArray(myChar?.spellSlots) ? myChar.spellSlots : []) {
+      const lvl = Number(slot?.level || 0);
+      const max = Number(slot?.max || 0);
+      const remaining = Number(slot?.remaining ?? Math.max(0, max - Number(slot?.used || 0)));
+      if (lvl >= baseLevel && max > 0) {
+        slotByLevel.set(lvl, { max, remaining });
+      }
+    }
+    if (!slotByLevel.has(baseLevel)) {
+      slotByLevel.set(baseLevel, { max: null, remaining: null });
+    }
+
+    return Array.from(slotByLevel.keys())
+      .sort((a, b) => a - b)
+      .map((lvl) => {
+        const scaled = applyUpcastToRollSpec({ ...rollSpec, baseLevel }, lvl);
+        const info = slotByLevel.get(lvl);
+        const slotSuffix = scaled.damageFormula
+          ? ` · ${scaled.damageFormula}`
+          : scaled.upcastNote
+          ? ` · ${scaled.upcastNote}`
+          : "";
+        return {
+          level: lvl,
+          remaining: info?.remaining ?? null,
+          max: info?.max ?? null,
+          damageFormula: scaled.damageFormula,
+          upcastNote: scaled.upcastNote,
+          label: `L${lvl}${slotSuffix}`
+        };
+      });
+  }
+
+  function formatCompactModifierNote(mod, ctx = {}) {
+    if (!mod || typeof mod !== "object") return "";
+    const id = String(mod.id || "");
+    if (id === "wand_half_cover") return "Ignores half cover (Wand)";
+    if (id.startsWith("elemental_adept_")) {
+      const typeMatch = String(mod.title || "").match(/\((cold|fire|lightning|acid|thunder)\)/i);
+      const typeCap = typeMatch
+        ? typeMatch[1].charAt(0).toUpperCase() + typeMatch[1].slice(1).toLowerCase()
+        : "Elemental";
+      const upCount = Number(ctx?.upgradedOnes || 0);
+      if (upCount > 0) {
+        return `+${upCount} dmg for ${typeCap} Adept (${upCount}× 1→2)`;
+      }
+      if (ctx?.usedMin2) {
+        return `${typeCap} Adept 1s→2s active & ignores resist`;
+      }
+      return `+1 dmg per 1 rolled (${typeCap} Adept)`;
+    }
+    if (id === "sculpt_spells") {
+      const m = String(mod.title || "").match(/(\d+)\s+all/i);
+      return `Protect ${m ? m[1] : "allies"} allies (Sculpt Spells)`;
+    }
+    if (id === "potent_cantrip") return "½ dmg even on save (Potent Cantrip)";
+    if (id === "clockwork_amulet") return "Flat 10 on d20 (Clockwork Amulet)";
+    if (id === "hat_of_wizardry") return "DC 10 → any Wizard cantrip (Hat)";
+    if (id === "gnome_cunning") return "Adv vs magic (Gnome Cunning)";
+    if (id === "war_caster") return "Adv on Concentration (War Caster)";
+    if (id === "artificers_lore") return `+${Number(mod.flatBonus || 0)} Artificer's Lore (magic/tech)`;
+    if (id === "stonecunning") return `+${Number(mod.flatBonus || 0)} Stonecunning`;
+    if (id === "paladin_aura") return `+${Number(mod.flatBonus || 0)} Paladin Aura (within 10 ft)`;
+    if (id === "party_bless") return "+1d4 Bless";
+    if (id === "party_guidance") return "+1d4 Guidance";
+    if (id === "spider_staff_poison") return `+${mod.damageDiceBonus || "1d6"} ${mod.damageBonusType || "poison"} (Spider Staff)`;
+    if (id === "rider_ray_of_frost") return "Target speed -10 ft";
+    if (id === "rider_binding_ice") return "Fail = 0 speed (Action to break)";
+    if (id === "rider_scorching_ray") {
+      return ctx?.upcastNote || "3 rays total";
+    }
+    if (id === "rider_fireball") return "20-ft sphere · ½ dmg on save";
+    return mod.badge ? `${String(mod.title || "").split("—")[0].trim()} (${mod.badge})` : String(mod.title || "");
+  }
+
+  function buildAboveVttSlashCommand(rollSpec, part = "tohit", mode = "normal", options = {}) {
     if (!rollSpec || typeof rollSpec !== "object") return null;
 
+    const opts = options && typeof options === "object" ? options : {};
     const signedMod = (n) => {
       const v = Number(n || 0);
       if (!Number.isFinite(v) || v === 0) return "";
@@ -1045,13 +1229,44 @@
         .trim();
 
     const cleanName = cleanActionName(rollSpec.name);
+    const castLvl = opts.castLevel ?? rollSpec.castLevel ?? null;
+    const baseLvl = rollSpec.baseLevel ?? rollSpec.level ?? null;
+    const isUpcasted = Boolean(castLvl && baseLvl != null && Number(castLvl) > Number(baseLvl));
+    const levelSuffix = isUpcasted
+      ? rollSpec.kind === "item_save" && /necklace/i.test(cleanName)
+        ? ` (${castLvl} beads)`
+        : ` (L${castLvl})`
+      : "";
+    const actionLabel = `${cleanName}${levelSuffix}`.trim();
+
     const d20 = mode === "adv" ? "2d20kh1" : mode === "dis" ? "2d20kl1" : "1d20";
+    const baseDie = opts.setD20To != null ? String(Number(opts.setD20To)) : d20;
+    const extraFlat = Number(opts.flatBonus || 0);
+    const rawDiceBonus = String(opts.diceBonus || "")
+      .replace(/[^0-9d+-]/gi, "")
+      .trim();
+    const diceSuffix = /^\d+d\d+/i.test(rawDiceBonus) ? `+${rawDiceBonus}` : "";
 
     if (part === "damage") {
       const rawFormula = String(rollSpec.damageFormula || "").replace(/\s+/g, "");
       const exprMatch = rawFormula.match(/^\d+d\d+(?:[+-]\d+)*/i);
       if (!exprMatch) return null;
-      const expr = exprMatch[0];
+      let expr = exprMatch[0];
+      const minDie = Number(opts.minDieValue || 1);
+      if (minDie > 1 && !/min\d+/i.test(expr)) {
+        expr = expr.replace(/^(\d+d\d+)/i, `$1min${minDie}`);
+      }
+      const extraDmgDice = String(opts.extraDamageDice || "")
+        .replace(/[^0-9d+-]/gi, "")
+        .trim();
+      if (/^\d+d\d+/i.test(extraDmgDice)) {
+        expr += `+${extraDmgDice}`;
+      }
+      const dmgFlat = Number(opts.damageFlatBonus || 0);
+      if (Number.isFinite(dmgFlat) && dmgFlat !== 0) {
+        expr += signedMod(dmgFlat);
+      }
+
       const rawType =
         rollSpec.damageType ||
         (Array.isArray(rollSpec.damageTypes) ? rollSpec.damageTypes[0] : "") ||
@@ -1059,15 +1274,17 @@
       const dmgType = String(rawType)
         .toLowerCase()
         .replace(/[^a-z]/g, "");
-      return `/dmg ${expr} ${cleanName || "Damage"}${dmgType ? `:${dmgType}` : ""}`;
+      return `/dmg ${expr} ${actionLabel || "Damage"}${dmgType ? `:${dmgType}` : ""}`;
     }
 
     if (rollSpec.kind === "spell_attack" || rollSpec.kind === "weapon_attack") {
-      return `/hit ${d20}${signedMod(rollSpec.attackBonus)} ${cleanName || "Attack"}`;
+      const totalMod = Number(rollSpec.attackBonus || 0) + extraFlat;
+      return `/hit ${baseDie}${signedMod(totalMod)}${diceSuffix} ${actionLabel || "Attack"}`;
     }
 
     if (rollSpec.kind === "spell_check") {
-      return `/skill ${d20}${signedMod(rollSpec.attackBonus)} ${cleanName || "Spell Check"}`;
+      const totalMod = Number(rollSpec.attackBonus || 0) + extraFlat;
+      return `/skill ${baseDie}${signedMod(totalMod)}${diceSuffix} ${actionLabel || "Spell Check"}`;
     }
 
     if (rollSpec.kind === "save") {
@@ -1075,23 +1292,26 @@
       const label = rollSpec.isConcentration
         ? "Concentration"
         : ABILITY_FULL[abilKey] || cleanName || "Save";
-      const mod = rollSpec.bonus !== undefined ? rollSpec.bonus : rollSpec.attackBonus;
-      return `/save ${d20}${signedMod(mod)} ${label}`;
+      const baseMod = rollSpec.bonus !== undefined ? rollSpec.bonus : rollSpec.attackBonus;
+      const totalMod = Number(baseMod || 0) + extraFlat;
+      return `/save ${baseDie}${signedMod(totalMod)}${diceSuffix} ${label}`;
     }
 
     if (rollSpec.kind === "initiative") {
-      const mod = rollSpec.bonus !== undefined ? rollSpec.bonus : rollSpec.attackBonus;
-      return `/r ${d20}${signedMod(mod)} Initiative:initiative`;
+      const baseMod = rollSpec.bonus !== undefined ? rollSpec.bonus : rollSpec.attackBonus;
+      const totalMod = Number(baseMod || 0) + extraFlat;
+      return `/r ${baseDie}${signedMod(totalMod)}${diceSuffix} Initiative:initiative`;
     }
 
     if (rollSpec.kind === "skill") {
-      const mod = rollSpec.bonus !== undefined ? rollSpec.bonus : rollSpec.attackBonus;
-      return `/skill ${d20}${signedMod(mod)} ${cleanName || "Check"}`;
+      const baseMod = rollSpec.bonus !== undefined ? rollSpec.bonus : rollSpec.attackBonus;
+      const totalMod = Number(baseMod || 0) + extraFlat;
+      return `/skill ${baseDie}${signedMod(totalMod)}${diceSuffix} ${actionLabel || "Check"}`;
     }
 
     if (rollSpec.kind === "spell_save" || rollSpec.kind === "item_save") {
       if (rollSpec.damageFormula) {
-        return buildAboveVttSlashCommand(rollSpec, "damage", mode);
+        return buildAboveVttSlashCommand(rollSpec, "damage", mode, opts);
       }
       return null;
     }
@@ -1109,6 +1329,9 @@
     analyzeRollPotential,
     executeRoll,
     analyzeAboveVttRoll,
+    applyUpcastToRollSpec,
+    getUpcastOptions,
+    formatCompactModifierNote,
     buildAboveVttSlashCommand
   };
 })(window);

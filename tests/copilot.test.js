@@ -2391,8 +2391,122 @@ test("AboveVTT slash command builder & Shadow DOM cross-frame VTT relay contract
   assert.ok(csCode.includes("Bless (+1d4)"));
   assert.ok(csCode.includes('new PointerEvent("pointerdown"'));
   assert.ok(csCode.includes("abovevtt-pointerdown"));
+  assert.ok(csCode.includes(".aboveDiceTotal"));
+  assert.ok(csCode.includes("prepRollState"));
+  assert.ok(!csCode.includes("🗣️ Say:"));
   assert.ok(bgCode.includes("REGISTER_FRAME"));
   assert.ok(bgCode.includes("RELAY_TRIGGER_SHEET_ROLL"));
   assert.ok(bgCode.includes("FORWARD_ROLL_COACH_TO_TOP"));
   assert.ok(bgCode.includes("frameId"));
+});
+
+test("Upcast scaling, enhanced AboveVTT slash options, and compact modifier formatting", () => {
+  const sb = createBrowserSandbox();
+  const rm = sb.DnDCopilot.RollMaximizer;
+
+  const raine = {
+    name: "Raine",
+    level: 6,
+    spellSaveDc: 14,
+    spellAttackBonus: 9,
+    notableFeatures: ["Elemental Adept (Cold)", "Sculpt Spells", "Potent Cantrip"],
+    notableItems: [
+      { name: "Wand of the War Mage, +3", snippet: "Ignore half cover" },
+      { name: "Clockwork Amulet", snippet: "1/dawn take 10" },
+      { name: "Hat of Wizardry", snippet: "DC 10 Arcana" }
+    ],
+    spellSlots: [
+      { level: 1, max: 4, remaining: 4 },
+      { level: 2, max: 3, remaining: 2 },
+      { level: 3, max: 3, remaining: 3 }
+    ]
+  };
+
+  const iceSpec = {
+    id: "spell:rime-s-binding-ice",
+    name: "Rime's Binding Ice",
+    isSpell: true,
+    level: 2,
+    school: "Evocation",
+    kind: "spell_save",
+    saveDc: 14,
+    saveAbility: "CON",
+    damageFormula: "3d8",
+    damageTypes: ["cold"]
+  };
+  const upOpts = rm.getUpcastOptions(iceSpec, raine);
+  assert.equal(upOpts.length, 2);
+  assert.equal(upOpts[0].label, "L2 · 3d8");
+  assert.equal(upOpts[1].label, "L3 · 4d8");
+
+  const iceL3 = rm.applyUpcastToRollSpec(iceSpec, 3);
+  assert.equal(iceL3.damageFormula, "4d8");
+  assert.equal(iceL3.level, 3);
+  const iceL3Analysis = rm.analyzeRollPotential(iceL3, raine, [raine]);
+  assert.ok(iceL3Analysis.modifiers.some((m) => m.id === "sculpt_spells" && /4 Allies/i.test(m.title)));
+
+  assert.equal(
+    rm.buildAboveVttSlashCommand(iceL3, "damage", "normal", { minDieValue: 2, castLevel: 3 }),
+    "/dmg 4d8min2 Rime's Binding Ice (L3):cold"
+  );
+
+  const fbL4 = rm.applyUpcastToRollSpec(
+    { name: "Fireball", isSpell: true, level: 3, kind: "spell_save", damageFormula: "8d6", damageTypes: ["fire"] },
+    4
+  );
+  assert.equal(fbL4.damageFormula, "9d6");
+
+  const rayL3 = rm.applyUpcastToRollSpec(
+    { name: "Scorching Ray", isSpell: true, level: 2, kind: "spell_attack", attackBonus: 9, damageFormula: "2d6", damageTypes: ["fire"] },
+    3
+  );
+  assert.equal(rayL3.damageFormula, "2d6");
+  assert.equal(rayL3.upcastNote, "4 rays total");
+
+  const necklaceOpts = rm.getUpcastOptions(
+    { name: "Necklace of Fireballs", kind: "item_save", level: 3, damageFormula: "8d6", damageTypes: ["fire"] },
+    raine
+  );
+  assert.equal(necklaceOpts.length, 4);
+  assert.equal(necklaceOpts[1].damageFormula, "9d6");
+
+  assert.equal(
+    rm.buildAboveVttSlashCommand(
+      { name: "Ray of Frost", kind: "spell_attack", attackBonus: 9, damageFormula: "2d8", damageTypes: ["cold"] },
+      "tohit",
+      "normal",
+      { setD20To: 10 }
+    ),
+    "/hit 10+9 Ray of Frost"
+  );
+  assert.equal(
+    rm.buildAboveVttSlashCommand(
+      { name: "WIS Saving Throw", kind: "save", ability: "wis", attackBonus: 6 },
+      "tohit",
+      "normal",
+      { flatBonus: 3, diceBonus: "1d4" }
+    ),
+    "/save 1d20+9+1d4 Wisdom"
+  );
+  assert.equal(
+    rm.buildAboveVttSlashCommand(
+      { name: "Spider Staff", kind: "weapon_attack", attackBonus: 4, damageFormula: "1d6+1", damageTypes: ["bludgeoning"] },
+      "damage",
+      "normal",
+      { extraDamageDice: "1d6" }
+    ),
+    "/dmg 1d6+1+1d6 Spider Staff:bludgeoning"
+  );
+
+  assert.equal(
+    rm.formatCompactModifierNote(
+      { id: "elemental_adept_cold", title: "Elemental Adept (Cold)" },
+      { upgradedOnes: 1, usedMin2: true }
+    ),
+    "+1 dmg for Cold Adept (1× 1→2)"
+  );
+  assert.equal(
+    rm.formatCompactModifierNote({ id: "wand_half_cover", title: "Wand of the War Mage +3" }),
+    "Ignores half cover (Wand)"
+  );
 });
