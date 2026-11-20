@@ -846,7 +846,7 @@
     return findVisibleNativeDdbRollButton(rollSpec, part);
   }
 
-  async function triggerNativeDdbRollLocal(rollSpec, part = "tohit") {
+  async function triggerNativeDdbRollLocal(rollSpec, part = "tohit", mode = "normal") {
     let btn = findVisibleNativeDdbRollButton(rollSpec, part);
     if (!btn && (rollSpec.isSpell || rollSpec.kind === "weapon_attack" || rollSpec.kind === "spell_attack" || rollSpec.kind === "spell_save")) {
       const desiredTestId = rollSpec.isSpell ? "SPELLS" : "ACTIONS";
@@ -865,7 +865,32 @@
     }
 
     if (!btn) return { triggered: false };
-    suppressClickCoachUntil = Date.now() + 300;
+
+    const isAboveVttPage = Boolean(
+      document.getElementById("chat-text") ||
+        document.getElementById("combat_tracker") ||
+        document.getElementById("tokens") ||
+        /abovevtt=true/i.test(window.location.search)
+    );
+
+    suppressClickCoachUntil = Date.now() + 400;
+    const ptrEv = new PointerEvent("pointerdown", {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      button: 0,
+      buttons: 1,
+      pointerType: "mouse",
+      shiftKey: mode === "adv",
+      ctrlKey: mode === "dis"
+    });
+    const notPrevented = btn.dispatchEvent(ptrEv);
+    if (!notPrevented) {
+      return { triggered: true, part, via: "abovevtt-pointerdown" };
+    }
+    if (isAboveVttPage) {
+      return { triggered: false };
+    }
     btn.click();
     return { triggered: true, part, via: "ddb-sheet" };
   }
@@ -922,9 +947,9 @@
     if (mode === "adv" || mode === "dis") {
       const chatRes = await tryAboveVttChatRoll(rollSpec, part, mode);
       if (chatRes.triggered) return chatRes;
-      return await triggerNativeDdbRollLocal(rollSpec, part);
+      return await triggerNativeDdbRollLocal(rollSpec, part, mode);
     }
-    const nativeRes = await triggerNativeDdbRollLocal(rollSpec, part);
+    const nativeRes = await triggerNativeDdbRollLocal(rollSpec, part, mode);
     if (nativeRes.triggered) return nativeRes;
     return await tryAboveVttChatRoll(rollSpec, part, mode);
   }
@@ -1160,12 +1185,21 @@
       .map((m) => m.sayThis)
       .slice(0, 3);
 
+    const normBulletTxt = (s) =>
+      String(s || "")
+        .toLowerCase()
+        .replace(/s\b/g, "")
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim();
     const compactMods = activeMods.filter(
       (m) => m.id !== "help_advantage" && (m.id !== "heroic_inspiration" || Boolean(myChar.inspiration))
     );
     const bullets = compactMods.slice(0, 4).map((m) => {
       const note = m.flatBonus && rolledTotal != null ? `${rolledTotal} → ${rolledTotal + m.flatBonus} (${m.badge})` : m.badge;
-      return `${m.title}${note ? ` — ${note}` : ""}`;
+      if (note && !normBulletTxt(m.title).includes(normBulletTxt(note))) {
+        return `${m.title} — ${note}`;
+      }
+      return m.title;
     });
 
     const addons = activeMods
@@ -1775,72 +1809,75 @@
   function initSheetRollClickListener() {
     if (window.__dndCopilotClickListenerBound) return;
     window.__dndCopilotClickListenerBound = true;
-    document.addEventListener(
-      "click",
-      (ev) => {
-        try {
-          if (Date.now() < suppressClickCoachUntil) return;
-          const target = ev.target;
-          if (!target || typeof target.closest !== "function") return;
-          if (target.id === "dnd-copilot-ui-host" || target.closest("#dnd-copilot-ui-host, #dnd-copilot-roll-pill, #dnd-copilot-roll-drawer, #dnd-copilot-roll-toast")) return;
-          const rm = window.DnDCopilot?.RollMaximizer;
-          const myChar = rollContext?.myChar;
-          if (!rm || !myChar) return;
 
-          const clickable = target.closest(
-            "button.integrated-dice__container, .integrated-dice__container, [class*='integrated-dice'], [class*='rollable'], [class*='dice-button'], [data-dice-notation], button, [role='button']"
-          );
-          if (!clickable) return;
+    const handleNativeSheetInteraction = (ev) => {
+      try {
+        if (ev.type === "pointerdown" && ev.button === 2) return;
+        if (Date.now() < suppressClickCoachUntil) return;
+        const target = ev.target;
+        if (!target || typeof target.closest !== "function") return;
+        if (target.id === "dnd-copilot-ui-host" || target.closest("#dnd-copilot-ui-host, #dnd-copilot-roll-pill, #dnd-copilot-roll-drawer, #dnd-copilot-roll-toast")) return;
+        const rm = window.DnDCopilot?.RollMaximizer;
+        const myChar = rollContext?.myChar;
+        if (!rm || !myChar) return;
 
-          const exactMatch = extractClickedDdbRollInfo(clickable);
-          if (exactMatch?.matchedSpec) {
-            showAnalyzedRollCoach(exactMatch.matchedSpec, exactMatch.part, null, "", "sent");
-            return;
-          }
+        const clickable = target.closest(
+          "button.integrated-dice__container, .integrated-dice__container, [class*='integrated-dice'], [class*='rollable'], [class*='dice-button'], [data-dice-notation], button, [role='button']"
+        );
+        if (!clickable) return;
 
-          const btnText = (clickable.innerText || clickable.textContent || "").replace(/\s+/g, " ").trim();
-          const clsAttr = String(clickable.getAttribute("class") || "");
-          const hasDiceCls = /dice|rollable/i.test(clsAttr) || clickable.hasAttribute("data-dice-notation");
-          const looksLikeRollText = /^[+-]\s*\d+$|^\d+d\d+|^DC\s*\d+|\broll\b/i.test(btnText);
-          if (!hasDiceCls && !looksLikeRollText) return;
-
-          const contextEl =
-            clickable.closest(
-              ".ct-spells-spell, .ddbc-combat-attack, .ct-skills__item, .ddbc-saving-throws-summary__ability, [class*='spell'], [class*='attack'], [class*='skill'], [class*='saving-throw'], [class*='initiative'], tr, [role='row'], li"
-            ) || clickable.parentElement;
-          const ctxText = ((contextEl?.innerText || contextEl?.textContent || btnText) || "")
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 200);
-          if (!ctxText) return;
-
-          const clickKind = classifyRollKind(ctxText, btnText);
-          const analyzed = rm.analyzeAboveVttRoll(
-            {
-              actor: myChar.name,
-              action: ctxText.slice(0, 48),
-              kind: clickKind === "chat" ? "roll" : clickKind,
-              total: null,
-              rawText: `${ctxText} ${btnText}`
-            },
-            myChar,
-            rollContext.party || []
-          );
-          if (analyzed?.matchedSpec) {
-            showAnalyzedRollCoach(
-              analyzed.matchedSpec,
-              clickKind === "damage" ? "damage" : "tohit",
-              null,
-              ctxText.slice(0, 48),
-              "sent"
-            );
-          }
-        } catch (_) {
-          // Never interfere with host DDB click handlers
+        const exactMatch = extractClickedDdbRollInfo(clickable);
+        if (exactMatch?.matchedSpec) {
+          suppressClickCoachUntil = Date.now() + 350;
+          showAnalyzedRollCoach(exactMatch.matchedSpec, exactMatch.part, null, "", "sent");
+          return;
         }
-      },
-      true
-    );
+
+        const btnText = (clickable.innerText || clickable.textContent || "").replace(/\s+/g, " ").trim();
+        const clsAttr = String(clickable.getAttribute("class") || "");
+        const hasDiceCls = /dice|rollable/i.test(clsAttr) || clickable.hasAttribute("data-dice-notation");
+        const looksLikeRollText = /^[+-]\s*\d+$|^\d+d\d+|^DC\s*\d+|\broll\b/i.test(btnText);
+        if (!hasDiceCls && !looksLikeRollText) return;
+
+        const contextEl =
+          clickable.closest(
+            ".ct-spells-spell, .ddbc-combat-attack, .ct-skills__item, .ddbc-saving-throws-summary__ability, [class*='spell'], [class*='attack'], [class*='skill'], [class*='saving-throw'], [class*='initiative'], tr, [role='row'], li"
+          ) || clickable.parentElement;
+        const ctxText = ((contextEl?.innerText || contextEl?.textContent || btnText) || "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 200);
+        if (!ctxText) return;
+
+        const clickKind = classifyRollKind(ctxText, btnText);
+        const analyzed = rm.analyzeAboveVttRoll(
+          {
+            actor: myChar.name,
+            action: ctxText.slice(0, 48),
+            kind: clickKind === "chat" ? "roll" : clickKind,
+            total: null,
+            rawText: `${ctxText} ${btnText}`
+          },
+          myChar,
+          rollContext.party || []
+        );
+        if (analyzed?.matchedSpec) {
+          suppressClickCoachUntil = Date.now() + 350;
+          showAnalyzedRollCoach(
+            analyzed.matchedSpec,
+            clickKind === "damage" ? "damage" : "tohit",
+            null,
+            ctxText.slice(0, 48),
+            "sent"
+          );
+        }
+      } catch (_) {
+        // Never interfere with host DDB click handlers
+      }
+    };
+
+    window.addEventListener("pointerdown", handleNativeSheetInteraction, true);
+    document.addEventListener("click", handleNativeSheetInteraction, true);
   }
 
   async function ensureRollContextLoaded(forceReg = false) {

@@ -2389,6 +2389,8 @@ test("AboveVTT slash command builder & Shadow DOM cross-frame VTT relay contract
   assert.ok(csCode.includes("getUiRightOffsetPx"));
   assert.ok(csCode.includes("Guidance (+1d4)"));
   assert.ok(csCode.includes("Bless (+1d4)"));
+  assert.ok(csCode.includes('new PointerEvent("pointerdown"'));
+  assert.ok(csCode.includes("abovevtt-pointerdown"));
   assert.ok(bgCode.includes("REGISTER_FRAME"));
   assert.ok(bgCode.includes("RELAY_TRIGGER_SHEET_ROLL"));
   assert.ok(bgCode.includes("FORWARD_ROLL_COACH_TO_TOP"));
