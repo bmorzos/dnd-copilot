@@ -1,5 +1,6 @@
 """Unit tests for Google Drive campaign archive sync & search."""
 
+import importlib.util
 from pathlib import Path
 import sys
 import tempfile
@@ -10,6 +11,10 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import gdrive_sync
+
+_LS_SPEC = importlib.util.spec_from_file_location("local_server", ROOT_DIR / "local-server.py")
+local_server_mod = importlib.util.module_from_spec(_LS_SPEC)
+_LS_SPEC.loader.exec_module(local_server_mod)
 
 
 SAMPLE_SUMMARIES_MD = """# **D&D Campaign Summaries: The B.U.G.S.**
@@ -141,6 +146,30 @@ class GdriveSyncTests(unittest.TestCase):
         self.assertGreater(hi["puzzle"]["startPct"], hi["combat"]["startPct"])
         self.assertLess(hi["social"]["startPct"], hi["combat"]["startPct"])
         self.assertIn("riddle", hi["puzzle"]["snippet"].lower())
+
+    def test_local_profile_save_load_prevents_empty_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pfile = Path(tmp) / ".copilot-profile.json"
+            real_profile = {
+                "version": 4,
+                "settings": {"geminiApiKey": "AIza_dummy"},
+                "partyGroups": {"activeGroupName": "B.U.G.S.", "groups": {"B.U.G.S.": {"characters": [{"id": "141442264", "name": "Raine"}]}}},
+                "state": {"party": [{"id": "141442264", "name": "Raine"}]}
+            }
+            empty_demo = {
+                "version": 4,
+                "state": {"party": [{"id": "demo-lyra", "name": "Lyra"}]}
+            }
+            res1 = local_server_mod.save_local_profile(real_profile, profile_path=pfile)
+            self.assertTrue(res1["ok"])
+            self.assertTrue(res1["hasRealParty"])
+
+            res2 = local_server_mod.save_local_profile(empty_demo, profile_path=pfile)
+            self.assertEqual(res2.get("skipped"), "preserved-existing-real-party")
+
+            loaded = local_server_mod.load_local_profile(profile_path=pfile)
+            self.assertTrue(local_server_mod.has_real_party(loaded))
+            self.assertEqual(loaded["state"]["party"][0]["name"], "Raine")
 
 
 if __name__ == "__main__":

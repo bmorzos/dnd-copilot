@@ -10,3 +10,5 @@ node_modules/
 .gdrive-token.json
 .gdrive-oauth.json
 .gdrive-config.json
+.copilot-profile.json
+.copilot-*.json

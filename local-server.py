@@ -4,6 +4,7 @@ from functools import partial
 import html
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -16,6 +17,11 @@ import urllib.request
 import gdrive_sync
 
 ROOT_DIR = Path(__file__).resolve().parent
+PROFILE_FILE = ROOT_DIR / ".copilot-profile.json"
+PROFILE_LOCK = threading.Lock()
+ALLOWED_CORS_ORIGIN_RE = re.compile(
+    r"^(?:https?://(?:127\.0\.0\.1|localhost)(?::\d+)?|chrome-extension://[a-z0-9]+)$"
+)
 DDB_PROXY_RE = re.compile(r"^/api/ddb-character/(\d{4,12})(?:\?.*)?$")
 TRANSCRIPT_HIGHLIGHTS_RE = re.compile(r"^/api/campaign-memory/transcript/([a-zA-Z0-9_-]+)/highlights$")
 TRANSCRIPT_GET_RE = re.compile(r"^/api/campaign-memory/transcript/([a-zA-Z0-9_-]+)$")
@@ -34,6 +40,12 @@ class CopilotRequestHandler(SimpleHTTPRequestHandler):
     """Serves static dashboard files and provides local DDB & Google Drive campaign archive APIs."""
 
     def end_headers(self):
+        origin = str(self.headers.get("Origin") or "").strip()
+        if origin and ALLOWED_CORS_ORIGIN_RE.match(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Vary", "Origin")
         if self.path.startswith("/api/"):
             self.send_header("Cache-Control", "no-store")
         elif any(
@@ -43,10 +55,21 @@ class CopilotRequestHandler(SimpleHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
+
+        if path == "/api/local-profile":
+            data = load_local_profile()
+            if data:
+                return self._send_json_obj(200, {"exists": True, "profile": data})
+            return self._send_json_obj(200, {"exists": False})
 
         match = DDB_PROXY_RE.match(self.path)
         if match:
@@ -173,6 +196,12 @@ class CopilotRequestHandler(SimpleHTTPRequestHandler):
                 res = gdrive_sync.import_archive_bundle(body)
                 return self._send_json_obj(200, {"ok": True, "status": res})
 
+            if path == "/api/local-profile":
+                force = bool(body.get("force"))
+                payload = body.get("profile") if isinstance(body.get("profile"), dict) else body
+                res = save_local_profile(payload, force=force)
+                return self._send_json_obj(200, res)
+
             return self._send_json_obj(404, {"error": f"Unknown API endpoint: {path}"})
         except Exception as exc:
             return self._send_json_obj(500, {"error": str(exc)})
@@ -293,6 +322,58 @@ class CopilotRequestHandler(SimpleHTTPRequestHandler):
             self.wfile.write(payload)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
+
+
+def has_real_party(payload: dict) -> bool:
+    """Returns True when a profile payload includes at least one non-demo character."""
+    if not isinstance(payload, dict):
+        return False
+    state_party = payload.get("state", {}).get("party") if isinstance(payload.get("state"), dict) else []
+    if isinstance(state_party, list) and any(
+        isinstance(p, dict) and p.get("id") and not str(p.get("id")).startswith("demo-")
+        for p in state_party
+    ):
+        return True
+    groups = (payload.get("partyGroups") or {}).get("groups") if isinstance(payload.get("partyGroups"), dict) else {}
+    if isinstance(groups, dict):
+        for gname, gval in groups.items():
+            if gname == "__demo__" or not isinstance(gval, dict):
+                continue
+            chars = gval.get("characters") or []
+            if any(isinstance(p, dict) and p.get("id") and not str(p.get("id")).startswith("demo-") for p in chars):
+                return True
+    return False
+
+
+def load_local_profile(profile_path: Path = PROFILE_FILE) -> dict | None:
+    """Loads saved portable profile JSON from local disk."""
+    with PROFILE_LOCK:
+        if not profile_path.exists():
+            return None
+        try:
+            data = json.loads(profile_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+
+def save_local_profile(payload: dict, profile_path: Path = PROFILE_FILE, force: bool = False) -> dict:
+    """Atomically saves profile JSON on disk while refusing accidental empty/demo overwrites."""
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid profile payload.")
+    with PROFILE_LOCK:
+        existing = None
+        if profile_path.exists():
+            try:
+                existing = json.loads(profile_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = None
+        if not force and existing and has_real_party(existing) and not has_real_party(payload):
+            return {"ok": True, "skipped": "preserved-existing-real-party", "exists": True}
+        tmp_path = profile_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp_path, profile_path)
+        return {"ok": True, "savedAt": int(time.time() * 1000), "hasRealParty": has_real_party(payload)}
 
 
 def _start_drive_auto_sync_thread():

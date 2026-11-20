@@ -28,7 +28,9 @@
     "https://*.dndbeyond.com/*",
     "https://generativelanguage.googleapis.com/*",
     "https://api.groq.com/*",
-    "https://api.deepgram.com/*"
+    "https://api.deepgram.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
   ],
   "content_scripts": [
     {

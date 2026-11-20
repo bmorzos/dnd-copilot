@@ -24,6 +24,9 @@
   let rollModalToggleState = new Map();
   let lastRollResult = null;
   let lastLiveRollCoach = null;
+  let localProfileReady = false;
+  let localProfileSyncTimer = null;
+  let lastLocalProfileHash = "";
 
   function el(id) {
     return document.getElementById(id);
@@ -1232,6 +1235,7 @@
       renderRollModal();
     }
     bridge.syncRollContextToAboveVtt?.();
+    schedulePushLocalProfile();
   }
 
   function downloadTextFile(text, filename) {
@@ -3156,9 +3160,121 @@
     }
   }
 
+  function getLocalProfileEndpoint() {
+    if (bridge.isLocalServerContext()) return "/api/local-profile";
+    if (bridge.isExtensionContext()) return "http://127.0.0.1:8765/api/local-profile";
+    return "";
+  }
+
+  function hasRealPartyInPayload(payload) {
+    if (!payload || typeof payload !== "object") return false;
+    const sp = Array.isArray(payload.state?.party) ? payload.state.party : [];
+    if (sp.some((p) => p?.id && !String(p.id).startsWith("demo-"))) return true;
+    const groups = payload.partyGroups?.groups || {};
+    for (const [gname, gval] of Object.entries(groups)) {
+      if (gname === "__demo__") continue;
+      if (Array.isArray(gval?.characters) && gval.characters.some((p) => p?.id && !String(p.id).startsWith("demo-"))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function computeLocalProfileHash(backup) {
+    return JSON.stringify({
+      myId: backup?.state?.myCharacterId || "",
+      partyIds: (backup?.state?.party || []).map((p) => `${p.id}:${p.hp?.current}:${p.inspiration}:${p.lastSyncedAt || 0}`),
+      groups: Object.keys(backup?.partyGroups?.groups || {}).map(
+        (k) => `${k}:${(backup.partyGroups.groups[k]?.characters || []).length}`
+      ),
+      title: backup?.state?.sessionTitle || "",
+      beats: (backup?.state?.sessionBeats || []).length,
+      gemini: Boolean(backup?.settings?.geminiApiKey),
+      groq: Boolean(backup?.settings?.groqApiKey),
+      dg: Boolean(backup?.settings?.deepgramApiKey)
+    });
+  }
+
+  async function pushLocalServerProfileNow(force = false) {
+    const endpoint = getLocalProfileEndpoint();
+    if (!endpoint) return;
+    const backup = store.exportPortableBackup();
+    if (!force && !hasRealPartyInPayload(backup)) return;
+    const hash = computeLocalProfileHash(backup);
+    if (!force && hash === lastLocalProfileHash) return;
+    try {
+      const resp = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ profile: backup, force })
+      });
+      if (resp.ok) {
+        lastLocalProfileHash = hash;
+      }
+    } catch (_) {
+      // Quietly ignore if local server is offline in extension mode
+    }
+  }
+
+  function schedulePushLocalProfile() {
+    if (!localProfileReady || !getLocalProfileEndpoint()) return;
+    const backup = store.exportPortableBackup();
+    if (!hasRealPartyInPayload(backup)) return;
+    if (localProfileSyncTimer) clearTimeout(localProfileSyncTimer);
+    localProfileSyncTimer = setTimeout(() => {
+      localProfileSyncTimer = null;
+      pushLocalServerProfileNow(false);
+    }, 1500);
+  }
+
+  async function syncLocalServerProfileOnStartup() {
+    const endpoint = getLocalProfileEndpoint();
+    if (!endpoint) {
+      localProfileReady = true;
+      return;
+    }
+    try {
+      const resp = await fetch(`${endpoint}?_t=${Date.now()}`, { cache: "no-store" });
+      if (resp.ok) {
+        const data = await resp.json();
+        const serverProfile = data?.exists ? data.profile : null;
+        const localBackup = store.exportPortableBackup();
+        const localHasParty = hasRealPartyInPayload(localBackup);
+        const serverHasParty = hasRealPartyInPayload(serverProfile);
+
+        const localMissingKeys =
+          (!localBackup.settings?.geminiApiKey && serverProfile?.settings?.geminiApiKey) ||
+          (!localBackup.settings?.groqApiKey && serverProfile?.settings?.groqApiKey) ||
+          (!localBackup.settings?.deepgramApiKey && serverProfile?.settings?.deepgramApiKey);
+
+        if (serverHasParty && (!localHasParty || localMissingKeys)) {
+          const preservedLocalKeys = {
+            ...(localBackup.settings?.geminiApiKey ? { geminiApiKey: localBackup.settings.geminiApiKey } : {}),
+            ...(localBackup.settings?.groqApiKey ? { groqApiKey: localBackup.settings.groqApiKey } : {}),
+            ...(localBackup.settings?.deepgramApiKey ? { deepgramApiKey: localBackup.settings.deepgramApiKey } : {})
+          };
+          store.importPortableBackup(serverProfile);
+          if (Object.keys(preservedLocalKeys).length > 0) {
+            store.updateSettings(preservedLocalKeys);
+          }
+          lastLocalProfileHash = computeLocalProfileHash(store.exportPortableBackup());
+          bridge.refreshAllPartySheets?.(true);
+          showToast("Synced your B.U.G.S. party & settings across browsers!");
+        } else if (localHasParty) {
+          await pushLocalServerProfileNow(false);
+        }
+      }
+    } catch (_) {
+      // Quietly ignore when extension runs without local server
+    } finally {
+      localProfileReady = true;
+    }
+  }
+
   store.subscribe(renderAll);
   wireEvents();
   renderAll(store.state, store.settings);
+  syncLocalServerProfileOnStartup();
   refreshDriveArchiveStatus(true);
   loadDriveMysteries();
 })(window);
