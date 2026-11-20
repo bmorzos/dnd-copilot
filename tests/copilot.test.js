@@ -1825,3 +1825,116 @@ test("LocalBrain hides Concentration is FREE, Store ingests spoken combat, and F
   assert.equal(store.state.combat.enemies[0].damageTaken, 28);
   assert.equal(store.state.advisor.concentrationWarning, "");
 });
+
+test("Groq model fallback retries on 404, Gemini retries fastModel, and LocalBrain ignores hypothetical combat filler", async () => {
+  const sb = createBrowserSandbox();
+  const store = sb.DnDCopilot.Store;
+  const gemini = sb.DnDCopilot.GeminiClient;
+  const localBrain = sb.DnDCopilot.LocalBrain;
+
+  store.resetSession();
+  store.upsertCharacter(
+    {
+      id: "141442264",
+      name: "Raine",
+      classSummary: "Wizard 6",
+      level: 6,
+      hp: { current: 48, max: 48, temp: 0 },
+      ac: 13,
+      spellSlots: [{ level: 3, max: 3, used: 0, remaining: 3, isPact: false }],
+      spells: [{ name: "Fireball", level: 3, concentration: false, castingTime: "Action", range: "150 ft", summary: "Fire blast" }]
+    },
+    { manualAdd: true }
+  );
+
+  // 1. Groq retries GROQ_CHAT_MODELS on HTTP 404 and strips markdown fences
+  store.updateSettings({ groqApiKey: "gsk_test", aiProvider: "groq" });
+  const modelsTried = [];
+  sb.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body || "{}");
+    modelsTried.push(body.model);
+    if (modelsTried.length === 1) {
+      return {
+        ok: false,
+        status: 404,
+        json: async () => ({ error: { message: "The model `openai/gpt-oss-120b` does not exist" } }),
+        text: async () => "404 model not found"
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content:
+                "```json\n" +
+                JSON.stringify({
+                  tacticalOverview: "Recovered via Qwen 3.8 27B fallback.",
+                  concentrationWarning: "",
+                  pastSessionConnection: "",
+                  recommendations: [{ rank: 1, spellOrAction: "Fire Bolt", slotInfo: "Cantrip", whyBest: "Conserve L3 slots." }],
+                  customAnswer: ""
+                }) +
+                "\n```"
+            }
+          }
+        ]
+      })
+    };
+  };
+
+  const tac = await gemini.adviseTacticsAndSpells(store, "");
+  assert.deepEqual(modelsTried, ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"]);
+  assert.equal(tac.tacticalOverview, "Recovered via Qwen 3.8 27B fallback.");
+
+  // 2. Gemini transient 503 retries fastModel before falling back to Groq
+  store.updateSettings({ geminiApiKey: "AIza_test", groqApiKey: "", aiProvider: "gemini", model: "gemini-3.8-flash", fastModel: "gemini-3.5-flash-lite" });
+  const geminiModels = [];
+  sb.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body || "{}");
+    geminiModels.push(body.model);
+    if (geminiModels.length === 1) {
+      return {
+        ok: false,
+        status: 503,
+        json: async () => ({ error: { message: "Model overloaded" } }),
+        text: async () => "503"
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        outputs: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              tacticalOverview: "Fast Lite recovery succeeded.",
+              concentrationWarning: "",
+              pastSessionConnection: "",
+              recommendations: [{ rank: 1, spellOrAction: "Fireball", slotInfo: "L3 (3/3)", whyBest: "Tight goblin cluster." }],
+              customAnswer: ""
+            })
+          }
+        ]
+      })
+    };
+  };
+  const tacGem = await gemini.adviseTacticsAndSpells(store, "");
+  assert.deepEqual(geminiModels, ["gemini-3.8-flash", "gemini-3.5-flash-lite"]);
+  assert.equal(tacGem.tacticalOverview, "Fast Lite recovery succeeded.");
+
+  // 3. LocalBrain ignores hypothetical / filler combat actors while keeping real ones
+  const localStore = sb.DnDCopilot.Store;
+  localStore.resetSession();
+  localStore.addTranscriptLine("Player", "Okay, what if they use fireball or hold person next turn?");
+  localStore.addTranscriptLine("Player", "You guys think someone might use fireball?");
+  localStore.addTranscriptLine("DM", "Okay, Raine casts Fireball at the goblin.");
+  await localBrain.analyzeTableSituation(localStore);
+  const actors = (localStore.state.combat.combatEvents || []).map((e) => e.actor);
+  assert.ok(!actors.includes("Okay"), `Should ignore Okay, got ${JSON.stringify(actors)}`);
+  assert.ok(!actors.includes("You guys"), `Should ignore You guys, got ${JSON.stringify(actors)}`);
+  assert.ok(actors.includes("Raine"), `Should capture Raine, got ${JSON.stringify(actors)}`);
+});

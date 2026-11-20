@@ -504,9 +504,12 @@
     const combatEvents = [];
     let combatCueCount = 0;
 
+    const FILLER_ACTOR_RE =
+      /^(?:okay|ok|you|your|yours|are|am|is|was|were|if|but|and|or|nor|they|them|their|because|since|while|when|where|why|how|what|which|who|whom|whose|have|has|had|do|does|did|can|could|should|would|will|shall|may|might|must|well|yeah|yes|no|nope|nah|wait|look|listen|hold|so|just|this|that|these|those|then|there|here|we|us|our|he|him|his|she|her|it|its|someone|somebody|everybody|everyone|anyone|anybody|nobody|nothing|something|maybe|actually|anyway|basically|literally|probably|hopefully|please|let)$/i;
+
     for (const entry of lines) {
       const text = String(entry?.text || "").trim();
-      if (!text || BANTER_LINE_RE.test(text)) continue;
+      if (!text || BANTER_LINE_RE.test(text) || HYPO_SKIP_RE.test(text)) continue;
 
       if (COMBAT_WORDS.test(text) || /\b(sneak attack|grapple|fireball|eldritch blast|psychic blades|uncanny dodge|smite|saves?)\b/i.test(text)) {
         combatCueCount++;
@@ -547,18 +550,27 @@
         }
       }
 
-      // Extract notable combat events for the Combat Action Feed
-      const actionVerb = text.match(
-        /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b.*?\b(casts?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?|sneak\s+attack|divine\s+smite|uncanny\s+dodge|grapple[ds]?|takes?\s+\d+\s+[a-z]*\s*damage|fireball|hold\s+person|hunter'?s\s+mark|abjure\s+enemy)\b/i
-      );
-      if (actionVerb) {
-        combatEvents.push({
-          actor: actionVerb[1],
-          target: mHit ? toTitleMonster(mHit[1]) : "",
-          action: actionVerb[2],
-          detail: text.slice(0, 140),
-          kind: /damage|took|takes/i.test(actionVerb[2]) ? "damage" : "action"
-        });
+      // Extract notable combat events for the Combat Action Feed (clause-by-clause to avoid filler subjects)
+      const clauses = text.split(/[,;.!?]+/).map((c) => c.trim()).filter(Boolean);
+      for (const clause of clauses) {
+        if (HYPO_SKIP_RE.test(clause)) continue;
+        const actionVerb = clause.match(
+          /\b([A-Za-z][a-z]+(?:\s+[A-Za-z][a-z]+)?)\b[^.?!]{0,40}?\b(casts?\s+[A-Za-z][a-z]+(?:\s+[A-Za-z][a-z]+)?|(?:casts?|casting|drops?|dropped|uses?|used|throws?|threw|hurls?|hurled)\s+(?:fireball|hold\s+person|hunter'?s\s+mark|healing\s+word|bless|shield)|sneak\s+attacks?|divine\s+smites?|uncanny\s+dodge|grapples?|grappled|hits?|hit|deals?\s+\d+[^.?!]{0,20}?damage|takes?\s+\d+[^.?!]{0,20}?damage|took\s+\d+[^.?!]{0,20}?damage|abjure\s+enemy|wild\s+shapes?|rages?)\b/i
+        );
+        if (actionVerb) {
+          const actorClean = actionVerb[1].trim();
+          const firstWord = actorClean.split(/\s+/)[0];
+          if (!FILLER_ACTOR_RE.test(actorClean) && !FILLER_ACTOR_RE.test(firstWord) && /^[A-Z]/.test(actorClean)) {
+            combatEvents.push({
+              actor: actorClean,
+              target: mHit ? toTitleMonster(mHit[1]) : "",
+              action: actionVerb[2],
+              detail: text.slice(0, 140),
+              kind: /damage|took|takes/i.test(actionVerb[2]) ? "damage" : "action"
+            });
+            break;
+          }
+        }
       }
     }
 

@@ -155,6 +155,22 @@
     return JSON.parse(cleaned || "{}");
   }
 
+  const GROQ_CHAT_MODELS = [
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant"
+  ];
+
+  function parseJsonModelContent(rawText) {
+    const cleaned = String(rawText || "{}")
+      .trim()
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/```$/i, "")
+      .trim();
+    return JSON.parse(cleaned || "{}");
+  }
+
   async function callGroqJson({ store, systemInstruction, userPrompt, schemaHint }) {
     const groqKey = (store.settings?.groqApiKey || "").trim();
     if (!groqKey) {
@@ -164,27 +180,38 @@
     const endpoint = isLocalServerContext()
       ? "/api/proxy/groq-chat"
       : GROQ_CHAT_ENDPOINT;
-    const resp = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${groqKey}`
-      },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        response_format: { type: "json_object" },
-        temperature: 0.3,
-        messages: [
-          {
-            role: "system",
-            content: `${systemInstruction || PLAYER_FAIR_SYSTEM_PROMPT}\nRespond ONLY with a valid JSON object matching this exact structure:\n${schemaHint}`
-          },
-          { role: "user", content: userPrompt }
-        ]
-      })
-    });
 
-    if (!resp.ok) {
+    let lastErr = null;
+    for (let i = 0; i < GROQ_CHAT_MODELS.length; i++) {
+      const model = GROQ_CHAT_MODELS[i];
+      const resp = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${groqKey}`
+        },
+        body: JSON.stringify({
+          model,
+          response_format: { type: "json_object" },
+          temperature: 0.3,
+          messages: [
+            {
+              role: "system",
+              content: `${systemInstruction || PLAYER_FAIR_SYSTEM_PROMPT}\nRespond ONLY with a valid JSON object matching this exact structure:\n${schemaHint}`
+            },
+            { role: "user", content: userPrompt }
+          ]
+        })
+      });
+
+      if (resp.ok) {
+        const data = await resp.json();
+        const content = data?.choices?.[0]?.message?.content || "{}";
+        store.state.usage.calls += 1;
+        store.save();
+        return parseJsonModelContent(content);
+      }
+
       let detail = "";
       try {
         const errJson = await resp.json();
@@ -192,14 +219,16 @@
       } catch (_) {
         detail = await resp.text();
       }
-      throw new Error(`Groq API HTTP ${resp.status}: ${detail.slice(0, 220)}`);
+      lastErr = new Error(`Groq API HTTP ${resp.status}: ${detail.slice(0, 220)}`);
+      const shouldTryNext =
+        resp.status === 404 ||
+        (resp.status === 400 && /model_not_found|decommissioned|not supported|does not exist/i.test(detail));
+      if (!shouldTryNext || i === GROQ_CHAT_MODELS.length - 1) {
+        throw lastErr;
+      }
     }
 
-    const data = await resp.json();
-    const content = data?.choices?.[0]?.message?.content || "{}";
-    store.state.usage.calls += 1;
-    store.save();
-    return JSON.parse(content);
+    throw lastErr || new Error("Groq API request failed.");
   }
 
   /**
@@ -709,7 +738,23 @@
         jsonSchema: geminiSchema
       });
     } catch (err) {
-      if (canFallbackToGroq(store, err)) {
+      const fastModel = store.settings?.fastModel || "gemini-3.5-flash-lite";
+      const isBudgetOrAuth = /budget cap|api key|http 401|http 403/i.test(err?.message || "");
+      let finalErr = err;
+      if (!isBudgetOrAuth && geminiModel !== fastModel) {
+        try {
+          return await callInteractionsApi({
+            store,
+            model: fastModel,
+            systemInstruction,
+            input: prompt,
+            jsonSchema: geminiSchema
+          });
+        } catch (retryErr) {
+          finalErr = retryErr;
+        }
+      }
+      if (canFallbackToGroq(store, finalErr)) {
         return await callGroqJson({
           store,
           systemInstruction,
@@ -717,7 +762,7 @@
           schemaHint: groqSchemaHint
         });
       }
-      throw err;
+      throw finalErr;
     }
   }
 
