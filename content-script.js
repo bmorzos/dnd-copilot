@@ -27,6 +27,7 @@
   let shadowUiRoot = null;
   let hasTopFrameCoach = false;
   let lastFrameRegKey = "";
+  let lastUiRightOffset = 16;
 
   function isElementVisible(el) {
     if (!el) return false;
@@ -799,6 +800,52 @@
     return shadowUiRoot && shadowUiRoot.host?.isConnected ? shadowUiRoot.getElementById(id) : null;
   }
 
+  function getUiRightOffsetPx() {
+    if (window.top !== window || window.innerWidth < 760) return 16;
+    const sidebarEl =
+      document.getElementById("chat-text")?.closest(".sidebar__pane-content, .sidebar-panel-content, .glc-game-log, .sidebar, .ct-sidebar, [class*='sidebar'], [class*='GameLog']") ||
+      document.querySelector(".sidebar__pane-content, .glc-game-log, .GameLog_GameLog__2z_HZ, #gamelog_panel, .ct-sidebar") ||
+      document.getElementById("chat-text");
+    if (!sidebarEl || !isElementVisible(sidebarEl)) return 16;
+    const rect = sidebarEl.getBoundingClientRect();
+    if (rect.width > 120 && rect.right >= window.innerWidth - 80) {
+      const occupiedRight = Math.ceil(window.innerWidth - rect.left);
+      if (occupiedRight >= 220 && occupiedRight <= Math.floor(window.innerWidth * 0.6)) {
+        return occupiedRight + 14;
+      }
+    }
+    return 16;
+  }
+
+  function applyUiRightOffset() {
+    const offset = getUiRightOffsetPx();
+    lastUiRightOffset = offset;
+    const maxAvailWidth = Math.max(260, window.innerWidth - offset - 16);
+    const pill = getShadowEl("dnd-copilot-roll-pill");
+    if (pill) pill.style.right = `${offset}px`;
+    const drawer = getShadowEl("dnd-copilot-roll-drawer");
+    if (drawer) {
+      drawer.style.right = `${offset}px`;
+      drawer.style.maxWidth = `${Math.min(410, maxAvailWidth)}px`;
+    }
+    const toast = getShadowEl("dnd-copilot-roll-toast");
+    if (toast) {
+      toast.style.right = `${offset}px`;
+      toast.style.maxWidth = `${Math.min(400, maxAvailWidth)}px`;
+    }
+    return offset;
+  }
+
+  async function waitForNativeRollButton(rollSpec, part, maxMs = 420) {
+    const deadline = Date.now() + maxMs;
+    while (Date.now() <= deadline) {
+      const btn = findVisibleNativeDdbRollButton(rollSpec, part);
+      if (btn) return btn;
+      await new Promise((r) => setTimeout(r, 60));
+    }
+    return findVisibleNativeDdbRollButton(rollSpec, part);
+  }
+
   async function triggerNativeDdbRollLocal(rollSpec, part = "tohit") {
     let btn = findVisibleNativeDdbRollButton(rollSpec, part);
     if (!btn && (rollSpec.isSpell || rollSpec.kind === "weapon_attack" || rollSpec.kind === "spell_attack" || rollSpec.kind === "spell_save")) {
@@ -806,15 +853,13 @@
       let tabBtn = document.querySelector(`button[data-testid='${desiredTestId}']`);
       if (tabBtn && tabBtn.getAttribute("aria-checked") !== "true") {
         tabBtn.click();
-        await new Promise((r) => setTimeout(r, 170));
-        btn = findVisibleNativeDdbRollButton(rollSpec, part);
+        btn = await waitForNativeRollButton(rollSpec, part, 420);
       }
       if (!btn && rollSpec.isSpell) {
         tabBtn = document.querySelector("button[data-testid='ACTIONS']");
         if (tabBtn && tabBtn.getAttribute("aria-checked") !== "true") {
           tabBtn.click();
-          await new Promise((r) => setTimeout(r, 170));
-          btn = findVisibleNativeDdbRollButton(rollSpec, part);
+          btn = await waitForNativeRollButton(rollSpec, part, 420);
         }
       }
     }
@@ -920,6 +965,19 @@
       root.appendChild(card);
     }
     card.textContent = "";
+    applyUiRightOffset();
+
+    const effectiveSayScript = st.matchedSpec
+      ? [
+          ...(st.baseSayLines || []),
+          ...(st.addons || [])
+            .filter((a) => st.appliedAddonIds?.has(a.id) && a.sayThis)
+            .map((a) => a.sayThis)
+        ]
+          .filter(Boolean)
+          .slice(0, 3)
+          .join(" ")
+      : st.sayScript || "";
 
     const header = document.createElement("div");
     header.className = "dc-head";
@@ -936,14 +994,14 @@
     const actionBtns = document.createElement("div");
     actionBtns.className = "dc-actions";
 
-    if (st.sayScript) {
+    if (effectiveSayScript) {
       const copyBtn = document.createElement("button");
       copyBtn.type = "button";
       copyBtn.className = "dc-icon-btn";
       copyBtn.textContent = "📋";
       copyBtn.title = "Copy Say-Aloud script";
       copyBtn.addEventListener("click", () => {
-        navigator.clipboard?.writeText(st.sayScript).catch(() => {});
+        navigator.clipboard?.writeText(effectiveSayScript).catch(() => {});
         copyBtn.textContent = "✓";
         setTimeout(() => {
           copyBtn.textContent = "📋";
@@ -991,10 +1049,10 @@
       card.appendChild(stBox);
     }
 
-    if (st.sayScript) {
+    if (effectiveSayScript) {
       const sayBox = document.createElement("div");
       sayBox.className = "dc-say-box";
-      sayBox.textContent = `🗣️ Say: “${st.sayScript}”`;
+      sayBox.textContent = `🗣️ Say: “${effectiveSayScript}”`;
       card.appendChild(sayBox);
     }
 
@@ -1077,19 +1135,35 @@
     }, 20000);
   }
 
+  function formatCoachAddonLabel(m) {
+    if (m.id === "party_guidance") return "Guidance (+1d4)";
+    if (m.id === "party_bless") return "Bless (+1d4)";
+    if (m.id === "paladin_aura") return `Aura (+${m.flatBonus})`;
+    if (m.id === "artificers_lore") return `Artificer's Lore (+${m.flatBonus})`;
+    if (m.id === "stonecunning") return `Stonecunning (+${m.flatBonus})`;
+    const baseName = String(m.title || "").split("(")[0].trim().slice(0, 18);
+    const bonusTxt = m.badge || (m.flatBonus ? `+${m.flatBonus}` : m.diceBonus ? `+${m.diceBonus}` : "");
+    return bonusTxt ? `${baseName} (${bonusTxt})` : baseName;
+  }
+
   function renderAnalyzedRollCoachLocal(matchedSpec, part = "tohit", rolledTotal = null, rawActionLabel = "", vttStatus = "") {
     const rm = window.DnDCopilot?.RollMaximizer;
     const myChar = rollContext?.myChar;
     if (!rm || !myChar || !matchedSpec) return;
 
     const analysis = rm.analyzeRollPotential(matchedSpec, myChar, rollContext.party || []);
-    const activeMods = (analysis.modifiers || []).filter((m) => m.sayThis || m.flatBonus || m.diceBonus || m.grantsAdvantage || m.minDieValue);
-    const sayLines = activeMods
-      .filter((m) => m.defaultOn || m.flatBonus || m.diceBonus || m.id === "gnome_cunning")
+    const activeMods = (analysis.modifiers || []).filter(
+      (m) => m.sayThis || m.flatBonus || m.diceBonus || m.grantsAdvantage || m.minDieValue
+    );
+    const baseSayLines = activeMods
+      .filter((m) => (m.defaultOn || m.id === "gnome_cunning") && m.sayThis)
       .map((m) => m.sayThis)
-      .filter(Boolean)
       .slice(0, 3);
-    const bullets = activeMods.slice(0, 4).map((m) => {
+
+    const compactMods = activeMods.filter(
+      (m) => m.id !== "help_advantage" && (m.id !== "heroic_inspiration" || Boolean(myChar.inspiration))
+    );
+    const bullets = compactMods.slice(0, 4).map((m) => {
       const note = m.flatBonus && rolledTotal != null ? `${rolledTotal} → ${rolledTotal + m.flatBonus} (${m.badge})` : m.badge;
       return `${m.title}${note ? ` — ${note}` : ""}`;
     });
@@ -1098,9 +1172,10 @@
       .filter((m) => m.flatBonus || m.diceBonus)
       .map((m) => ({
         id: m.id,
-        shortLabel: m.badge || m.title.slice(0, 18),
+        shortLabel: formatCoachAddonLabel(m),
         flatBonus: m.flatBonus || 0,
-        diceBonus: m.diceBonus || ""
+        diceBonus: m.diceBonus || "",
+        sayThis: m.sayThis || ""
       }));
 
     activeCoachState = {
@@ -1110,7 +1185,8 @@
       vttStatus,
       updatedAt: Date.now(),
       title: `${myChar.name} · ${matchedSpec.name || rawActionLabel || "Roll"}${part === "damage" ? " Damage" : ""}`,
-      sayScript: sayLines.join(" "),
+      baseSayLines,
+      sayScript: baseSayLines.join(" "),
       bullets,
       hasAdvantageFeature: activeMods.some((m) => m.grantsAdvantage),
       addons,
@@ -1264,6 +1340,7 @@
     let drawer = getShadowEl("dnd-copilot-roll-drawer");
     if (!coachDrawerOpen) {
       if (drawer) drawer.style.display = "none";
+      applyUiRightOffset();
       return;
     }
 
@@ -1275,6 +1352,7 @@
     }
     drawer.style.display = "block";
     drawer.textContent = "";
+    applyUiRightOffset();
 
     const rm = window.DnDCopilot?.RollMaximizer;
     const myChar = rollContext?.myChar;
@@ -1428,6 +1506,10 @@
 
   function pushUpdatesIfChanged() {
     try {
+      const nextRightOffset = getUiRightOffsetPx();
+      if (nextRightOffset !== lastUiRightOffset) {
+        applyUiRightOffset();
+      }
       const newRolls = collectVisibleGameLog(true);
       if (newRolls.length > 0) {
         chrome.runtime.sendMessage({ type: "GAMELOG_ROLLS", rolls: newRolls }).catch(() => {});
@@ -1787,7 +1869,10 @@
   ensureRollContextLoaded(true);
   initSheetRollClickListener();
   setInterval(() => ensureRollContextLoaded(true), 60000);
-  window.addEventListener("resize", () => renderFloatingRollDrawer());
+  window.addEventListener("resize", () => {
+    renderFloatingRollDrawer();
+    applyUiRightOffset();
+  });
 
   // Observe DOM updates cleanly with debounce
   let mutationTimer = null;
