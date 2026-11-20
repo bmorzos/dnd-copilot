@@ -33,10 +33,11 @@
       </button>
       <input id="audioFileInput" type="file" accept="audio/*,video/*" class="hidden" />
 
-      <!-- 1-CLICK CHROME <-> GROQ SWITCH -->
+      <!-- 1-CLICK CHROME <-> GROQ <-> DEEPGRAM SWITCH -->
       <div class="engine-switch" role="group" aria-label="Speech Engine">
         <button id="btnEngineChrome" class="engine-opt active" type="button">Chrome</button>
         <button id="btnEngineGroq" class="engine-opt" type="button">Groq</button>
+        <button id="btnEngineDeepgram" class="engine-opt" type="button" title="Deepgram Nova-3 Live Streaming + Speaker Diarization">Deepgram</button>
       </div>
 
       <div class="vu-wrap" title="Live audio level">
@@ -66,8 +67,8 @@
   <div id="recordingPlayerBar" class="recording-bar hidden">
     <span id="recordingFileName" class="recording-name">Recording</span>
     <audio id="sessionAudioPlayer" controls class="recording-audio"></audio>
-    <button id="btnFastTranscribeFile" class="btn btn-primary" title="Send the whole audio file (<25MB) to Groq Whisper for instant transcription">
-      ⚡ Fast Transcribe (Groq)
+    <button id="btnFastTranscribeFile" class="btn btn-primary" title="Transcribe any audio file (automatically uses Deepgram diarization or chunked Groq Whisper for files over 25MB)">
+      ⚡ Fast Transcribe
     </button>
     <button id="btnCloseRecording" class="btn btn-quiet">✕</button>
   </div>
@@ -122,24 +123,30 @@
       </details>
     </section>
 
-    <!-- COLUMN 2: ONE FOCUS AT A TIME (BEST MOVE | PUZZLE | COMBAT) -->
+    <!-- COLUMN 2: ONE FOCUS AT A TIME (LIVE IDEAS | PUZZLE | COMBAT) -->
     <section class="panel col-focus">
       <div class="focus-tabs" role="tablist">
-        <button class="focus-tab active" data-tab="advisor" type="button">🪄 Best Move</button>
+        <button class="focus-tab active" data-tab="advisor" type="button">💡 Live Ideas</button>
         <button class="focus-tab" data-tab="puzzle" type="button">🧩 Puzzle</button>
         <button class="focus-tab" data-tab="combat" type="button">⚔️ Combat</button>
       </div>
 
-      <!-- TAB 1: BEST MOVE / SPELL SUGGESTIONS -->
+      <!-- TAB 1: CONTINUOUS LIVE IDEAS, SPELLS & THINGS TO TRY -->
       <div id="viewAdvisor" class="focus-body">
         <div class="sub-bar">
           <span id="playingAsLabel" class="muted-label">Select ★ Me on your sheet →</span>
-          <button id="btnRunAdvisor" class="btn btn-primary">⚡ Suggest Best Move</button>
+          <div class="simple-row">
+            <button id="btnOpenPastSessions" type="button" class="btn btn-quiet" title="Import or manage past sessions for Live Ideas">
+              📚 Past (<span id="pastSessionCount">0</span>)
+            </button>
+            <button id="btnRunAdvisor" type="button" class="btn btn-primary">↻ Ideas Now</button>
+          </div>
         </div>
 
         <div id="concentrationAlert" class="alert-box hidden"></div>
+        <div id="pastSessionTieInBox" class="past-tiein-box hidden"></div>
         <p id="advisorOverview" class="lead-text">
-          Mark your character with <strong>★ Me</strong> on the right, then click <strong>Suggest Best Move</strong>.
+          Listening for table talk — live ideas, spells, and things to try will update here automatically as you play.
         </p>
         <div id="advisorCustomAnswer" class="answer-box hidden"></div>
 
@@ -150,7 +157,7 @@
             id="advisorQuestionInput"
             type="text"
             class="input"
-            placeholder="Ask a tactical question (e.g. Best AoE right now?)..."
+            placeholder="Ask for an idea (e.g. What should I ask the NPC? Best AoE?)..."
           />
           <button type="submit" class="btn btn-action">Ask</button>
         </form>
@@ -277,20 +284,57 @@
     </div>
   </div>
 
-  <!-- MODAL 2: SAVED TRANSCRIPTS & AUDIO RECORDINGS -->
+  <!-- MODAL 2: SAVED & PAST SESSIONS -->
   <div id="savedModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
     <div class="modal-card">
       <div class="modal-header">
-        <h2>Saved Transcripts &amp; Audio Recordings</h2>
+        <h2>Saved &amp; Past Sessions</h2>
         <button class="btn-close" data-close-modal="savedModal">✕</button>
       </div>
       <div class="modal-body">
         <div class="info-block">
+          <strong>📚 Past Sessions (Campaign Memory)</strong>
+          <p class="muted-p">
+            Import past session transcripts or recaps (.txt / .md) so <strong>Live Ideas</strong> automatically connects returning NPCs, clues, and quests to what is happening now.
+          </p>
+          <div class="simple-row" style="margin-top:8px;">
+            <button id="btnImportPastSessionFiles" type="button" class="btn btn-primary">
+              📂 Import Past Recap / Transcript (.txt, .md)
+            </button>
+            <input id="pastSessionFileInput" type="file" accept=".txt,.md,.markdown,.log" multiple class="hidden" />
+          </div>
+          <details class="raw-details" style="margin-top:10px;">
+            <summary>Or paste a past session recap</summary>
+            <input
+              id="pastSessionTitleInput"
+              type="text"
+              class="input"
+              style="margin-top:8px;"
+              placeholder="Title (e.g. Session 14 — The Sunken Crypt)"
+            />
+            <textarea
+              id="pastSessionTextInput"
+              class="textarea"
+              rows="4"
+              style="margin-top:8px;"
+              placeholder="Paste recap notes, NPCs met, promises made, or transcript..."
+            ></textarea>
+            <button id="btnAddPastSessionText" type="button" class="btn btn-action" style="margin-top:8px;">
+              + Save to Campaign Memory
+            </button>
+          </details>
+          <div id="campaignMemoryList" class="stack-list" style="margin-top:10px;"></div>
+        </div>
+
+        <div class="info-block">
           <strong>Current Live Session Transcript (<span id="savedCurrentLineCount">0</span> lines)</strong>
           <p class="muted-p">Auto-saved continuously inside the extension.</p>
-          <div class="simple-row" style="margin-top:10px;">
+          <div class="simple-row" style="margin-top:10px;flex-wrap:wrap;">
             <button id="btnDownloadCurrentTranscript" type="button" class="btn btn-primary">
               ⬇ Download Transcript (.txt)
+            </button>
+            <button id="btnSummarizeFullSession" type="button" class="btn btn-quiet" title="Generate a chronological full-session summary from all scenes &amp; transcript">
+              📝 Full-Session Summary
             </button>
             <button id="btnArchiveCurrentTranscript" type="button" class="btn btn-action">
               📌 Save Snapshot to Archive
@@ -320,6 +364,44 @@
         <button class="btn-close" data-close-modal="settingsModal">✕</button>
       </div>
       <div class="modal-body">
+        <div class="field">
+          <span class="field-label">Microphone Input</span>
+          <div class="simple-row">
+            <select id="settingMicDevice" class="select">
+              <option value="">System Default Microphone</option>
+            </select>
+            <button id="btnRefreshMics" type="button" class="btn btn-quiet" title="Refresh audio input devices">↻</button>
+          </div>
+          <span class="field-hint">Pick your center-table USB mic so Windows/Chrome cannot fall back to a laptop pinhole mic.</span>
+        </div>
+
+        <label class="checkbox-row">
+          <input id="settingRawRoomAudio" type="checkbox" checked />
+          <span>
+            <strong>Raw Room Table Audio (Recommended)</strong><br />
+            <span class="field-hint">Disables Zoom-style noise suppression &amp; AGC so quieter/farther players aren't muted, using a gentle room high-pass &amp; leveler instead.</span>
+          </span>
+        </label>
+
+        <div class="settings-grid">
+          <label class="field">
+            <span class="field-label">Backup Recording Bitrate</span>
+            <select id="settingRecordingBitrate" class="select">
+              <option value="64000">64 kbps (~29 MB/hr)</option>
+              <option value="96000">96 kbps (~43 MB/hr — Recommended)</option>
+              <option value="128000">128 kbps (~58 MB/hr)</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Groq Whisper Model</span>
+            <select id="settingGroqWhisperModel" class="select">
+              <option value="whisper-large-v3">whisper-large-v3 (Best Accuracy)</option>
+              <option value="whisper-large-v3-turbo">whisper-large-v3-turbo (Faster)</option>
+            </select>
+          </label>
+        </div>
+
         <label class="field">
           <span class="field-label">Groq API Key (Recommended — Free Tier at console.groq.com/keys)</span>
           <input
@@ -329,6 +411,28 @@
             placeholder="gsk_... (powers Groq Whisper speech + fast AI advice)"
             autocomplete="off"
           />
+        </label>
+
+        <label class="field">
+          <span class="field-label">Deepgram API Key (Optional — Live &amp; Post-Session Speaker Diarization)</span>
+          <input
+            id="settingDeepgramKey"
+            type="password"
+            class="input"
+            placeholder="dg_... (powers Nova-3 Speaker 1 / Speaker 2 labels &amp; keyterms)"
+            autocomplete="off"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field-label">Campaign Vocabulary / Glossary (Comma or newline separated)</span>
+          <textarea
+            id="settingCampaignGlossary"
+            class="textarea"
+            rows="2"
+            placeholder="Phandalin, Zorzula's Rest, Ruxithid, Duergar, Moradin, Gond, B.U.G.S., Gonloar, Munder, Patty, Rain..."
+          ></textarea>
+          <span class="field-hint">Seeded automatically into Groq Whisper &amp; Deepgram Nova-3 alongside your synced party sheets &amp; NPCs.</span>
         </label>
 
         <label class="field">
@@ -367,6 +471,7 @@
   </div>
 
   <script defer src="js/ddb-parser.js"></script>
+  <script defer src="js/audio-utils.js"></script>
   <script defer src="js/state.js"></script>
   <script defer src="js/local-brain.js"></script>
   <script defer src="js/gemini-client.js"></script>

@@ -378,6 +378,103 @@
     }
   }
 
+  const SKILL_SLUGS = {
+    acrobatics: "Acrobatics",
+    "animal-handling": "Animal Handling",
+    arcana: "Arcana",
+    athletics: "Athletics",
+    deception: "Deception",
+    history: "History",
+    insight: "Insight",
+    intimidation: "Intimidation",
+    investigation: "Investigation",
+    medicine: "Medicine",
+    nature: "Nature",
+    perception: "Perception",
+    performance: "Performance",
+    persuasion: "Persuasion",
+    religion: "Religion",
+    "sleight-of-hand": "Sleight of Hand",
+    stealth: "Stealth",
+    survival: "Survival"
+  };
+
+  function extractNotableItems(data) {
+    const inv = Array.isArray(data.inventory) ? data.inventory : [];
+    const seen = new Set();
+    const magicOrPriority = [];
+    const fallbackEquipped = [];
+
+    for (const item of inv) {
+      const def = item?.definition || {};
+      const name = String(def.name || "").trim();
+      if (!name || seen.has(name.toLowerCase())) continue;
+
+      const isMagic = Boolean(def.magic);
+      const isAttuned = Boolean(item?.isAttuned);
+      const isEquipped = Boolean(item?.equipped);
+      if (!isMagic && !isAttuned && !isEquipped) continue;
+
+      seen.add(name.toLowerCase());
+      const entry = {
+        name,
+        equipped: isEquipped,
+        attuned: isAttuned,
+        snippet: stripHtml(def.snippet || def.description || "").slice(0, 120)
+      };
+      if (isMagic || isAttuned) {
+        magicOrPriority.push(entry);
+      } else {
+        fallbackEquipped.push(entry);
+      }
+    }
+
+    return [...magicOrPriority, ...fallbackEquipped].slice(0, 10);
+  }
+
+  function extractNotableFeatures(data, classes) {
+    const names = [];
+    const seen = new Set();
+    const pushName = (raw) => {
+      const clean = String(raw || "").trim();
+      if (!clean) return;
+      const low = clean.toLowerCase();
+      if (seen.has(low)) return;
+      seen.add(low);
+      names.push(clean);
+    };
+
+    for (const feat of Array.isArray(data.feats) ? data.feats : []) {
+      pushName(feat?.definition?.name || feat?.name);
+    }
+    for (const cls of classes) {
+      const lvl = Number(cls?.level || 0);
+      for (const cf of Array.isArray(cls?.classFeatures) ? cls.classFeatures : []) {
+        const def = cf?.definition || {};
+        if (def.hideInSheet) continue;
+        if (def.requiredLevel != null && Number(def.requiredLevel) > lvl) continue;
+        pushName(def.name);
+      }
+    }
+    return names.slice(0, 12);
+  }
+
+  function extractProficientSkills(modifiers) {
+    const skillStates = new Map();
+    for (const mod of modifiers) {
+      const label = SKILL_SLUGS[mod?.subType];
+      if (!label) continue;
+      if (mod.type === "expertise") {
+        skillStates.set(label, "expertise");
+      } else if (mod.type === "proficiency" && skillStates.get(label) !== "expertise") {
+        skillStates.set(label, "proficiency");
+      }
+    }
+    return Array.from(skillStates.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([label, tier]) => (tier === "expertise" ? `${label} (Exp)` : label));
+  }
+
   function extractPreparedSpells(data) {
     const classes = Array.isArray(data.classes) ? data.classes : [];
     const classById = new Map();
@@ -541,13 +638,17 @@
     }
 
     const rawUrl = String(data.readonlyUrl || "").trim();
-    const sheetUrl = rawUrl.startsWith("http")
+    const sheetUrl = /^https?:\/\//i.test(rawUrl)
       ? rawUrl
       : rawUrl.startsWith("/")
       ? `https://www.dndbeyond.com${rawUrl}`
       : data.id
       ? `https://www.dndbeyond.com/characters/${data.id}`
       : "";
+
+    const notableItems = extractNotableItems(data);
+    const notableFeatures = extractNotableFeatures(data, classes);
+    const proficientSkills = extractProficientSkills(modifiers);
 
     return {
       id: String(data.id || Date.now()),
@@ -577,6 +678,9 @@
       concentratingOn: "",
       spellSlots,
       spells,
+      notableItems,
+      notableFeatures,
+      proficientSkills,
       deathSaves: {
         successes: Number(data.deathSaves?.successCount || 0),
         failures: Number(data.deathSaves?.failCount || 0)

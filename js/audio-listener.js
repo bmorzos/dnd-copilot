@@ -1,5 +1,6 @@
 /**
- * Clean 2-Way Speech Listener: Switch anytime between Chrome (Built-in) and Groq (Whisper Large v3 Turbo).
+ * 3-Way Speech Listener: Switch anytime between Chrome (Built-in), Groq Whisper (VAD + PCM WAV),
+ * and Deepgram Nova-3 (Live WebSocket Streaming + Speaker Diarization).
  * Supports 3 Audio Inputs:
  *   1. "mic"    — Room / headset microphone (live in-person D&D table)
  *   2. "system" — Tab or Windows/Mac System Audio (playing a recording in YouTube, Drive, VLC, Media Player, even on headphones!)
@@ -40,6 +41,20 @@
       this.peakRmsInWindow = 0;
       this.rmsSamplesInWindow = 0;
 
+      this._pcmGroqActive = false;
+      this.pcmChunks = [];
+      this.pcmSampleCount = 0;
+      this.pcmHasSpeech = false;
+      this.pcmSilenceMs = 0;
+      this.pcmIsFirstClip = true;
+      this.pcmCarryoverSamples = null;
+      this.lastGroqFinalText = "";
+
+      this.dgSocket = null;
+      this.dgKeepAliveTimer = null;
+      this.dgReconnectTimer = null;
+      this.dgReconnectAttempts = 0;
+
       this.pendingClips = [];
       this.isDrainingClips = false;
       this.hadHealthFailure = false;
@@ -71,17 +86,38 @@
       if (this.isListening) {
         this.stop();
       }
+      const constraints = global.DnDCopilot?.AudioUtils?.buildMicConstraints
+        ? global.DnDCopilot.AudioUtils.buildMicConstraints(this.store.settings)
+        : {
+            audio: {
+              echoCancellation: false,
+              noiseSuppression: false,
+              autoGainControl: false
+            }
+          };
+
       try {
-        this.mediaStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: false,
-            noiseSuppression: true,
-            autoGainControl: true
-          }
-        });
+        this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
       } catch (err) {
-        this.onError("Allow microphone access in Chrome's address bar.");
-        throw err;
+        if (
+          constraints.audio?.deviceId &&
+          (err?.name === "OverconstrainedError" || err?.name === "NotFoundError")
+        ) {
+          try {
+            const fallbackAudio = { ...constraints.audio };
+            delete fallbackAudio.deviceId;
+            this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: fallbackAudio });
+            this.onInterimText(
+              "⚠️ Selected microphone not found — fell back to system default mic."
+            );
+          } catch (fallbackErr) {
+            this.onError("Allow microphone access in Chrome's address bar.");
+            throw fallbackErr;
+          }
+        } else {
+          this.onError("Allow microphone access in Chrome's address bar.");
+          throw err;
+        }
       }
 
       this.activeSourceType = "mic";
@@ -101,6 +137,10 @@
           );
         }
       }, 6000);
+    }
+
+    getRawMicStream() {
+      return this.mediaStream;
     }
 
     /**
@@ -230,10 +270,11 @@
     }
 
     /**
-     * Hot-swaps between "chrome" and "groq" even while actively listening!
+     * Hot-swaps between "chrome", "groq", and "deepgram" even while actively listening!
      */
     switchSpeechEngine(nextMode) {
-      const normalized = nextMode === "groq" ? "groq" : "chrome";
+      const normalized =
+        nextMode === "groq" ? "groq" : nextMode === "deepgram" ? "deepgram" : "chrome";
       this.store.updateSettings({ speechMode: normalized });
 
       if (!this.isListening) return;
@@ -302,10 +343,37 @@
       return "Microphone";
     }
 
-    #startTranscriberOnly() {
-      const mode = this.store.settings.speechMode === "groq" ? "groq" : "chrome";
+    #normalizedEngineMode() {
+      const m = this.store.settings.speechMode;
+      if (m === "groq" || m === "deepgram") return m;
+      return "chrome";
+    }
 
-      if (mode === "groq") {
+    #speakerLabelForSource() {
+      return this.activeSourceType === "file" || this.activeSourceType === "system"
+        ? "Recording"
+        : "Table";
+    }
+
+    #startTranscriberOnly() {
+      const mode = this.#normalizedEngineMode();
+
+      if (mode === "deepgram") {
+        const hasDgKey = Boolean((this.store.settings.deepgramApiKey || "").trim());
+        if (!hasDgKey) {
+          const fallback = (this.store.settings.groqApiKey || "").trim() ? "groq" : "chrome";
+          this.onError(
+            `Paste your Deepgram API key in Settings first (using ${
+              fallback === "groq" ? "Groq Whisper" : "Chrome Speech"
+            } for now).`
+          );
+          this.store.updateSettings({ speechMode: fallback });
+          this.#startTranscriberOnly();
+          return;
+        }
+        this.#startDeepgramStreaming();
+        this.onStatusChange({ listening: true, source: this.activeSourceType, engine: "deepgram" });
+      } else if (mode === "groq") {
         const hasGroqKey = Boolean((this.store.settings.groqApiKey || "").trim());
         if (!hasGroqKey) {
           this.onError(
@@ -325,6 +393,20 @@
     }
 
     #stopTranscriberOnly() {
+      if (this._pcmGroqActive) {
+        if (this.pcmHasSpeech && this.pcmSampleCount >= 8000) {
+          this.#flushGroqPcmBuffer(false);
+        }
+        this._pcmGroqActive = false;
+        this.pcmChunks = [];
+        this.pcmSampleCount = 0;
+        this.pcmHasSpeech = false;
+        this.pcmSilenceMs = 0;
+        this.pcmCarryoverSamples = null;
+      }
+
+      this.#stopDeepgramStreaming();
+
       if (this.recognition) {
         try {
           this.recognition.onend = null;
@@ -395,7 +477,7 @@
       this.onStatusChange({
         listening: false,
         source: "idle",
-        engine: this.store.settings.speechMode === "groq" ? "groq" : "chrome"
+        engine: this.#normalizedEngineMode()
       });
     }
 
@@ -438,6 +520,31 @@
         }
         const audioOnlyStream = new MediaStream(audioTracks);
         const source = this.audioCtx.createMediaStreamSource(audioOnlyStream);
+
+        let processedNode = source;
+        if (
+          this.activeSourceType === "mic" &&
+          this.store.settings.rawRoomAudio !== false &&
+          typeof this.audioCtx.createBiquadFilter === "function" &&
+          typeof this.audioCtx.createDynamicsCompressor === "function"
+        ) {
+          const highpass = this.audioCtx.createBiquadFilter();
+          highpass.type = "highpass";
+          highpass.frequency.value = 80;
+          highpass.Q.value = 0.7;
+
+          const compressor = this.audioCtx.createDynamicsCompressor();
+          compressor.threshold.value = -24;
+          compressor.knee.value = 18;
+          compressor.ratio.value = 3;
+          compressor.attack.value = 0.01;
+          compressor.release.value = 0.2;
+
+          source.connect(highpass);
+          highpass.connect(compressor);
+          processedNode = compressor;
+        }
+
         this.analyser = this.audioCtx.createAnalyser();
         this.analyser.fftSize = 512;
 
@@ -445,26 +552,45 @@
         // from HTMLMediaElement.captureStream() without doubling speaker playback!
         const silentSink = this.audioCtx.createGain();
         silentSink.gain.value = 0;
-        source.connect(this.analyser);
+        processedNode.connect(this.analyser);
         this.analyser.connect(silentSink);
         silentSink.connect(this.audioCtx.destination);
 
-        // Un-throttled audio-thread RMS metering (runs even when tab is in the background for hours!)
+        // Un-throttled audio-thread RMS metering & PCM streaming (runs even when tab is in the background!)
         if (typeof this.audioCtx.createScriptProcessor === "function") {
           this.scriptProc = this.audioCtx.createScriptProcessor(4096, 1, 1);
           this.scriptProc.onaudioprocess = (ev) => {
             if (!this.isListening) return;
             const ch = ev.inputBuffer.getChannelData(0);
             let sum = 0;
+            let samplesChecked = 0;
             for (let i = 0; i < ch.length; i += 4) {
               sum += ch[i] * ch[i];
+              samplesChecked += 1;
             }
-            const rms = Math.sqrt(sum / Math.max(1, Math.ceil(ch.length / 4)));
+            const rms = Math.sqrt(sum / Math.max(1, samplesChecked));
             if (rms > this.peakRmsInWindow) this.peakRmsInWindow = rms;
             if (rms > this.maxRmsSinceStart) this.maxRmsSinceStart = rms;
             this.rmsSamplesInWindow += 1;
+
+            const inRate = this.audioCtx?.sampleRate || 48000;
+            if (this._pcmGroqActive && this.store.settings.speechMode === "groq") {
+              this.#handlePcmBufferForGroq(ch, inRate, rms);
+            } else if (
+              this.store.settings.speechMode === "deepgram" &&
+              this.dgSocket?.readyState === 1 &&
+              global.DnDCopilot?.AudioUtils
+            ) {
+              const downsampled = global.DnDCopilot.AudioUtils.downsampleFloat32(ch, inRate, 16000);
+              if (downsampled.length > 0) {
+                const pcm = global.DnDCopilot.AudioUtils.float32ToInt16Pcm(downsampled);
+                try {
+                  this.dgSocket.send(pcm.buffer);
+                } catch (_) {}
+              }
+            }
           };
-          source.connect(this.scriptProc);
+          processedNode.connect(this.scriptProc);
           this.scriptProc.connect(silentSink);
         }
 
@@ -472,7 +598,7 @@
         // identically on .mp3/.m4a/.wav/.webm files, PC/Tab audio, and Microphones!
         if (typeof this.audioCtx.createMediaStreamDestination === "function") {
           this.mediaStreamDest = this.audioCtx.createMediaStreamDestination();
-          source.connect(this.mediaStreamDest);
+          processedNode.connect(this.mediaStreamDest);
         }
 
         const buf = new Float32Array(this.analyser.fftSize);
@@ -513,20 +639,24 @@
       this.onInterimText(`🎧 Listening via Chrome Speech (${this.#sourceLabel()})...`);
 
       rec.onresult = (event) => {
+        const sanitize = (s) =>
+          String(s || "")
+            .replace(/<\/?s>/gi, " ")
+            .replace(/\s+/g, " ")
+            .trim();
         let interim = "";
         let latestFinal = "";
         for (let i = event.resultIndex; i < event.results.length; i++) {
           const res = event.results[i];
-          const text = res[0]?.transcript || "";
+          const text = sanitize(res[0]?.transcript || "");
           if (res.isFinal) {
-            const clean = text.trim();
-            if (clean.length > 1) {
-              latestFinal = clean;
-              this.store.addTranscriptLine(speakerLabel, clean, false);
-              this.#checkAutoAnalyzeTrigger(clean.length);
+            if (text.length > 1) {
+              latestFinal = text;
+              this.store.addTranscriptLine(speakerLabel, text, false);
+              this.#checkAutoAnalyzeTrigger(text.length);
             }
-          } else {
-            interim += text;
+          } else if (text) {
+            interim = interim ? `${interim} ${text}` : text;
           }
         }
         if (interim.trim()) {
@@ -652,7 +782,8 @@
           );
           const text = await global.DnDCopilot.GeminiClient.transcribeWithGroq(
             item.blob,
-            this.store
+            this.store,
+            item.isOverlapped ? "table-vad.wav" : ""
           );
           this.pendingClips.shift();
 
@@ -662,9 +793,23 @@
           }
 
           if (text) {
-            this.store.addTranscriptLine(item.speakerLabel, text, false);
-            this.onInterimText(`💬 Heard: "${text}"`);
-            this.#checkAutoAnalyzeTrigger(text.length);
+            let finalOut = text;
+            if (
+              item.isOverlapped &&
+              this.lastGroqFinalText &&
+              global.DnDCopilot?.AudioUtils?.dedupeOverlapText
+            ) {
+              finalOut = global.DnDCopilot.AudioUtils.dedupeOverlapText(
+                this.lastGroqFinalText,
+                text
+              );
+            }
+            this.lastGroqFinalText = text;
+            if (finalOut) {
+              this.store.addTranscriptLine(item.speakerLabel, finalOut, false);
+              this.onInterimText(`💬 Heard: "${finalOut}"`);
+              this.#checkAutoAnalyzeTrigger(finalOut.length);
+            }
           }
         } catch (err) {
           const msg = err?.message || String(err);
@@ -692,7 +837,90 @@
       this.isDrainingClips = false;
     }
 
+    #handlePcmBufferForGroq(samples, sampleRate, rms) {
+      const AudioUtils = global.DnDCopilot?.AudioUtils;
+      if (!AudioUtils) return;
+
+      const downsampled = AudioUtils.downsampleFloat32(samples, sampleRate, 16000);
+      if (downsampled.length > 0) {
+        this.pcmChunks.push(downsampled);
+        this.pcmSampleCount += downsampled.length;
+      }
+
+      const bufMs = (samples.length / (Number(sampleRate) || 48000)) * 1000;
+      if (rms >= 0.0035) {
+        this.pcmHasSpeech = true;
+        this.pcmSilenceMs = 0;
+      } else {
+        this.pcmSilenceMs += bufMs;
+      }
+
+      const minSec = this.pcmIsFirstClip ? 6 : 16;
+      const maxSec = 32;
+      const elapsedSec = this.pcmSampleCount / 16000;
+
+      if ((elapsedSec >= minSec && this.pcmSilenceMs >= 450) || elapsedSec >= maxSec) {
+        this.#flushGroqPcmBuffer(true);
+      }
+    }
+
+    #flushGroqPcmBuffer(keepCarryover = true) {
+      const AudioUtils = global.DnDCopilot?.AudioUtils;
+      if (!AudioUtils) return;
+
+      const parts = this.pcmCarryoverSamples
+        ? [this.pcmCarryoverSamples, ...this.pcmChunks]
+        : [...this.pcmChunks];
+      const full = AudioUtils.concatFloat32Chunks(parts);
+      const hadSpeech = this.pcmHasSpeech;
+      const speakerLabel = this.#speakerLabelForSource();
+
+      this.pcmChunks = [];
+      this.pcmSampleCount = 0;
+      this.pcmHasSpeech = false;
+      this.pcmSilenceMs = 0;
+      this.pcmIsFirstClip = false;
+
+      if (keepCarryover && full.length > 0) {
+        const keepSamples = Math.min(full.length, Math.round(16000 * 1.2));
+        this.pcmCarryoverSamples = full.slice(full.length - keepSamples);
+      } else {
+        this.pcmCarryoverSamples = null;
+      }
+
+      if (this.activeSourceType === "mic" && !hadSpeech) {
+        if (this.isListening && !this.isDrainingClips) {
+          this.onInterimText("🔇 Listening (room is quiet)...");
+        }
+        return;
+      }
+
+      if (full.length < 1600) return;
+
+      const blob = AudioUtils.encodeWavBlob(full, 16000);
+      this.pendingClips.push({ blob, speakerLabel, isOverlapped: true });
+      this.#drainGroqQueue();
+    }
+
     #startGroqWhisperChunker() {
+      // Prefer continuous 16 kHz PCM VAD chunking with 1.2s overlap when WebAudio scriptProc is live
+      if (this.audioCtx && this.scriptProc && global.DnDCopilot?.AudioUtils) {
+        this._pcmGroqActive = true;
+        this.pcmChunks = [];
+        this.pcmSampleCount = 0;
+        this.pcmHasSpeech = false;
+        this.pcmSilenceMs = 0;
+        this.pcmIsFirstClip = true;
+        this.pcmCarryoverSamples = null;
+        this.lastGroqFinalText = "";
+        if (!this.isDrainingClips) {
+          this.onInterimText(
+            `🎧 Groq Whisper VAD active (${this.#sourceLabel()}) — gapless 16 kHz PCM`
+          );
+        }
+        return;
+      }
+
       if (!this.mediaStream || typeof MediaRecorder === "undefined") {
         this.onError("MediaRecorder is not supported in this browser.");
         return;
@@ -712,11 +940,7 @@
         ? "audio/mp4"
         : "";
 
-      const speakerLabel =
-        this.activeSourceType === "file" || this.activeSourceType === "system"
-          ? "Recording"
-          : "Table";
-
+      const speakerLabel = this.#speakerLabelForSource();
       let isFirstClip = true;
 
       const recordNextClip = () => {
@@ -727,7 +951,6 @@
           return;
         }
 
-        // 6s first clip for quick feedback, then 12s clips (5 req/min = well-formed full sentences + 6+ hr quota!)
         const clipDurationMs = isFirstClip ? 6000 : 12000;
         isFirstClip = false;
 
@@ -741,7 +964,7 @@
           recorder = preferredMime
             ? new MediaRecorder(audioOnlyStream, {
                 mimeType: preferredMime,
-                audioBitsPerSecond: 32000
+                audioBitsPerSecond: 64000
               })
             : new MediaRecorder(audioOnlyStream);
         } catch (err) {
@@ -762,7 +985,6 @@
           );
         };
 
-        // Driven by C++ MediaRecorder 1000ms timeslices — NEVER throttled in background tabs!
         recorder.ondataavailable = (e) => {
           if (e.data && e.data.size > 0) {
             chunks.push(e.data);
@@ -783,14 +1005,12 @@
             this.chunkTimeout = null;
           }
 
-          // Start next clip immediately so zero syllables are missed between chunks!
           if (this.isListening && this.store.settings.speechMode === "groq") {
             recordNextClip();
           }
 
           if (chunks.length === 0) return;
 
-          // Only skip dead silence if audio-thread metering actually measured >= 5 buffers and all were silent
           if (this.activeSourceType === "mic") {
             if (this.rmsSamplesInWindow >= 5 && this.peakRmsInWindow < 0.001) {
               if (this.isListening && !this.isDrainingClips) {
@@ -803,13 +1023,12 @@
           const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
           if (blob.size < 600) return;
 
-          this.pendingClips.push({ blob, speakerLabel });
+          this.pendingClips.push({ blob, speakerLabel, isOverlapped: false });
           this.#drainGroqQueue();
         };
 
         recorder.start(1000);
 
-        // Safety fallback timer only if C++ timeslice hasn't rotated yet
         this.chunkTimeout = setTimeout(() => {
           if (recorder.state === "recording") {
             try {
@@ -820,6 +1039,203 @@
       };
 
       recordNextClip();
+    }
+
+    static groupDeepgramWordsBySpeaker(words, fallbackTranscript = "", fallbackSpeaker = "Table") {
+      const cleanFallback = String(fallbackTranscript || "").trim();
+      if (!Array.isArray(words) || words.length === 0) {
+        return cleanFallback ? [{ speaker: fallbackSpeaker, text: cleanFallback }] : [];
+      }
+
+      const hasSpeakerIds = words.some(
+        (w) => w && w.speaker !== undefined && w.speaker !== null && Number.isFinite(Number(w.speaker))
+      );
+      if (!hasSpeakerIds) {
+        return cleanFallback ? [{ speaker: fallbackSpeaker, text: cleanFallback }] : [];
+      }
+
+      const turns = [];
+      let currentLabel = null;
+      let buf = [];
+
+      for (const w of words) {
+        const token = String(w?.punctuated_word || w?.word || "").trim();
+        if (!token) continue;
+        const hasId =
+          w?.speaker !== undefined && w?.speaker !== null && Number.isFinite(Number(w.speaker));
+        const label = hasId ? `Speaker ${Number(w.speaker) + 1}` : currentLabel || fallbackSpeaker;
+
+        if (currentLabel !== null && label !== currentLabel && buf.length > 0) {
+          turns.push({ speaker: currentLabel, text: buf.join(" ").trim() });
+          buf = [];
+        }
+        currentLabel = label;
+        buf.push(token);
+      }
+
+      if (buf.length > 0 && currentLabel) {
+        turns.push({ speaker: currentLabel, text: buf.join(" ").trim() });
+      }
+      return turns.filter((t) => t.text.length > 0);
+    }
+
+    #stopDeepgramStreaming() {
+      if (this.dgKeepAliveTimer) {
+        clearInterval(this.dgKeepAliveTimer);
+        this.dgKeepAliveTimer = null;
+      }
+      if (this.dgReconnectTimer) {
+        clearTimeout(this.dgReconnectTimer);
+        this.dgReconnectTimer = null;
+      }
+      if (this.dgSocket) {
+        const sock = this.dgSocket;
+        this.dgSocket = null;
+        try {
+          sock.onopen = null;
+          sock.onmessage = null;
+          sock.onerror = null;
+          sock.onclose = null;
+          if (sock.readyState === 1) {
+            sock.send(JSON.stringify({ type: "CloseStream" }));
+          }
+          sock.close();
+        } catch (_) {}
+      }
+    }
+
+    #startDeepgramStreaming() {
+      this.#stopDeepgramStreaming();
+
+      const WS = global.WebSocket;
+      if (typeof WS !== "function") {
+        this.onError("WebSocket streaming is unavailable in this browser.");
+        return;
+      }
+
+      const deepgramApiKey = String(this.store.settings.deepgramApiKey || "").trim();
+      if (!deepgramApiKey) {
+        this.onError("Add your Deepgram API Key in Settings first.");
+        return;
+      }
+
+      const params = new URLSearchParams({
+        model: "nova-3",
+        language: "en",
+        encoding: "linear16",
+        sample_rate: "16000",
+        channels: "1",
+        smart_format: "true",
+        punctuate: "true",
+        interim_results: "true",
+        endpointing: "400",
+        diarize_model: "latest"
+      });
+
+      const vocabTerms =
+        typeof this.store.getVocabularyTerms === "function"
+          ? this.store.getVocabularyTerms().slice(0, 40)
+          : [];
+      for (const term of vocabTerms) {
+        params.append("keyterm", term);
+      }
+
+      const wsUrl = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
+      const socket = new WS(wsUrl, ["token", deepgramApiKey]);
+      socket.binaryType = "arraybuffer";
+      this.dgSocket = socket;
+
+      const fallbackSpeaker = this.#speakerLabelForSource();
+      this.onInterimText(`🔌 Connecting to Deepgram Nova-3 (${this.#sourceLabel()})...`);
+
+      socket.onopen = () => {
+        if (this.dgSocket !== socket) return;
+        this.dgReconnectAttempts = 0;
+        if (this.hadHealthFailure) {
+          this.hadHealthFailure = false;
+          this.onHealthRecovered();
+        }
+        this.onInterimText(
+          `🎧 Deepgram Nova-3 active (${this.#sourceLabel()}) — live speaker diarization on`
+        );
+
+        this.dgKeepAliveTimer = setInterval(() => {
+          if (this.dgSocket === socket && socket.readyState === 1) {
+            try {
+              socket.send(JSON.stringify({ type: "KeepAlive" }));
+            } catch (_) {}
+          }
+        }, 8000);
+      };
+
+      socket.onmessage = (event) => {
+        if (this.dgSocket !== socket) return;
+        let data;
+        try {
+          data = JSON.parse(event.data);
+        } catch (_) {
+          return;
+        }
+        const alt = data?.channel?.alternatives?.[0];
+        const rawText = String(alt?.transcript || "").trim();
+        if (!rawText) return;
+
+        if (!data?.is_final) {
+          this.onInterimText(`🎙️ ${rawText}`);
+          return;
+        }
+
+        const turns = TableAudioListener.groupDeepgramWordsBySpeaker(
+          alt?.words,
+          rawText,
+          fallbackSpeaker
+        );
+        for (const turn of turns) {
+          this.store.addTranscriptLine(turn.speaker, turn.text, false);
+          this.onInterimText(`💬 ${turn.speaker}: "${turn.text}"`);
+          this.#checkAutoAnalyzeTrigger(turn.text.length);
+        }
+      };
+
+      socket.onerror = () => {
+        if (this.dgSocket !== socket) return;
+        this.onInterimText("⚠️ Deepgram streaming connection error...");
+      };
+
+      socket.onclose = (event) => {
+        if (this.dgKeepAliveTimer) {
+          clearInterval(this.dgKeepAliveTimer);
+          this.dgKeepAliveTimer = null;
+        }
+        if (
+          !this.isListening ||
+          this.store.settings.speechMode !== "deepgram" ||
+          this.dgSocket !== socket
+        ) {
+          return;
+        }
+        this.dgSocket = null;
+        if (this.activeSourceType === "file" && this.boundAudioEl?.paused) {
+          return;
+        }
+
+        this.hadHealthFailure = true;
+        const attempt = this.dgReconnectAttempts;
+        this.dgReconnectAttempts += 1;
+        const delayMs = Math.min(15000, 2000 * Math.pow(2, attempt));
+        const reason = event?.code ? `code ${event.code}` : "connection closed";
+        this.onHealthAlert(
+          `⚠️ Deepgram stream interrupted (${reason}) — reconnecting in ${Math.round(
+            delayMs / 1000
+          )}s...`
+        );
+        this.dgReconnectTimer = setTimeout(() => {
+          this.dgReconnectTimer = null;
+          if (this.isListening && this.store.settings.speechMode === "deepgram") {
+            this.#startDeepgramStreaming();
+          }
+        }, delayMs);
+      };
     }
 
     #checkAutoAnalyzeTrigger(addedChars) {

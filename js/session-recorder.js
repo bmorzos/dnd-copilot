@@ -96,31 +96,57 @@
       });
     }
 
-    async start(existingStream = null, partyGroupLabel = "B.U.G.S.") {
+    async start(existingStream = null, partyGroupLabel = "B.U.G.S.", options = {}) {
       if (this.isRecording) return;
 
       try {
         await global.navigator?.storage?.persist?.();
       } catch (_) {}
 
-      this.stream =
-        existingStream ||
-        (await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: false,
-            noiseSuppression: true,
-            autoGainControl: true
+      if (existingStream) {
+        const srcTrack = existingStream.getAudioTracks?.()?.[0];
+        if (srcTrack && typeof srcTrack.clone === "function" && typeof MediaStream !== "undefined") {
+          this.stream = new MediaStream([srcTrack.clone()]);
+          this.ownsStream = true;
+        } else {
+          this.stream = existingStream;
+          this.ownsStream = false;
+        }
+      } else {
+        const settings = options?.settings || {};
+        const constraints = global.DnDCopilot?.AudioUtils?.buildMicConstraints
+          ? global.DnDCopilot.AudioUtils.buildMicConstraints(settings)
+          : {
+              audio: {
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false
+              }
+            };
+        try {
+          this.stream = await navigator.mediaDevices.getUserMedia(constraints);
+        } catch (err) {
+          if (
+            constraints.audio?.deviceId &&
+            (err?.name === "OverconstrainedError" || err?.name === "NotFoundError")
+          ) {
+            const fallbackAudio = { ...constraints.audio };
+            delete fallbackAudio.deviceId;
+            this.stream = await navigator.mediaDevices.getUserMedia({ audio: fallbackAudio });
+          } else {
+            throw err;
           }
-        }));
-
-      this.ownsStream = !existingStream;
+        }
+        this.ownsStream = true;
+      }
 
       const audioTracks = this.stream.getAudioTracks();
       if (audioTracks.length === 0) {
         throw new Error("No audio track available to record.");
       }
 
-      const audioOnly = new MediaStream(audioTracks);
+      const audioOnly =
+        typeof MediaStream !== "undefined" ? new MediaStream(audioTracks) : this.stream;
       this.mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
         : "audio/webm";
@@ -137,18 +163,23 @@
       this.activeSessionId = `rec-${Date.now()}`;
       this.startedAt = Date.now();
 
-      await this.#upsertSessionMeta({
+      const meta = {
         id: this.activeSessionId,
         title: `${partyGroupLabel} Audio — ${stamp}`,
         startedAt: this.startedAt,
         durationSec: 0,
         bytes: 0,
         mimeType: "audio/webm"
-      });
+      };
+      await this.#upsertSessionMeta(meta);
+      await this.refreshSavedList();
 
+      const targetBitrate = Number(
+        options?.bitrate || options?.settings?.recordingBitrate || 96000
+      );
       this.recorder = new MediaRecorder(audioOnly, {
         mimeType: this.mimeType,
-        audioBitsPerSecond: 48000 // ~21 MB per hour, crisp voice quality
+        audioBitsPerSecond: targetBitrate
       });
 
       const currentId = this.activeSessionId;
@@ -181,7 +212,15 @@
           try {
             await this.#appendChunk(currentId, e.data);
             this.lastChunkSavedAt = Date.now();
-            await this.refreshSavedList();
+            const entry = this.savedSessions.find((s) => s.id === currentId);
+            if (entry) {
+              entry.bytes = (entry.bytes || 0) + e.data.size;
+              entry.durationSec = Math.max(
+                1,
+                Math.round((Date.now() - (entry.startedAt || Date.now())) / 1000)
+              );
+            }
+            this.onUpdate(this.getStatus());
           } catch (dbErr) {
             this.onAlert(
               `⚠️ Could not save backup audio chunk to disk (${dbErr?.message || dbErr})!`
@@ -198,7 +237,7 @@
         this.onUpdate(this.getStatus());
       }, 1000);
 
-      await this.refreshSavedList();
+      this.onUpdate(this.getStatus());
     }
 
     stop() {
@@ -221,14 +260,23 @@
       setTimeout(() => this.refreshSavedList(), 350);
     }
 
-    async downloadRecording(sessionId = null) {
+    async getRecordingBlob(sessionId = null) {
       const db = await openDb();
       const targetId = sessionId || this.savedSessions[0]?.id;
       if (!targetId) {
         throw new Error("No recorded session audio found yet.");
       }
 
-      const meta = this.savedSessions.find((s) => s.id === targetId);
+      let meta = this.savedSessions.find((s) => s.id === targetId);
+      if (!meta) {
+        meta = await new Promise((resolve, reject) => {
+          const tx = db.transaction(SESSIONS_STORE, "readonly");
+          const req = tx.objectStore(SESSIONS_STORE).get(targetId);
+          req.onsuccess = () => resolve(req.result || null);
+          req.onerror = () => reject(req.error);
+        });
+      }
+
       const rows = await new Promise((resolve, reject) => {
         const tx = db.transaction(CHUNKS_STORE, "readonly");
         const idx = tx.objectStore(CHUNKS_STORE).index("bySession");
@@ -242,8 +290,14 @@
       }
 
       const blobs = rows.map((r) => r.blob);
-      const fullBlob = new Blob(blobs, { type: "audio/webm" });
-      const url = URL.createObjectURL(fullBlob);
+      const blob = new Blob(blobs, { type: meta?.mimeType || "audio/webm" });
+      return { blob, meta: meta || { id: targetId } };
+    }
+
+    async downloadRecording(sessionId = null) {
+      const { blob, meta } = await this.getRecordingBlob(sessionId);
+      const targetId = meta?.id || sessionId || "recording";
+      const url = URL.createObjectURL(blob);
       const safeName = String(meta?.title || `dnd-session-${targetId}`)
         .replace(/[^a-z0-9._-]+/gi, "-")
         .replace(/^-+|-+$/g, "")

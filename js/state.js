@@ -7,10 +7,32 @@
   const SETTINGS_KEY = "dnd_copilot_settings_v1";
   const PARTY_GROUPS_KEY = "dnd_copilot_party_groups_v1";
   const SAVED_TRANSCRIPTS_KEY = "dnd_copilot_saved_transcripts_v1";
+  const CAMPAIGN_MEMORY_KEY = "dnd_copilot_campaign_memory_v1";
   const DEFAULT_PARTY_GROUP = "B.U.G.S.";
 
   function isDemoCharId(id) {
     return String(id || "").startsWith("demo-");
+  }
+
+  function normalizeCharacterRecord(pc) {
+    if (!pc || typeof pc !== "object") return pc;
+    const rawUrl = String(pc.sheetUrl || pc.readonlyUrl || "").trim();
+    const idStr = String(pc.id || "").trim();
+    let sheetUrl = "";
+    if (/^https?:\/\//i.test(rawUrl)) {
+      sheetUrl = rawUrl;
+    } else if (rawUrl.startsWith("/")) {
+      sheetUrl = `https://www.dndbeyond.com${rawUrl}`;
+    } else if (/^\d{4,12}$/.test(idStr)) {
+      sheetUrl = `https://www.dndbeyond.com/characters/${idStr}`;
+    }
+    return {
+      ...pc,
+      sheetUrl,
+      notableItems: Array.isArray(pc.notableItems) ? pc.notableItems : [],
+      notableFeatures: Array.isArray(pc.notableFeatures) ? pc.notableFeatures : [],
+      proficientSkills: Array.isArray(pc.proficientSkills) ? pc.proficientSkills : []
+    };
   }
 
   const DEFAULT_SETTINGS = {
@@ -19,11 +41,18 @@
     geminiApiKey: "",
     fastModel: "gemini-3.5-flash-lite",
     advisorModel: "gemini-3.8-flash",
-    speechMode: "chrome", // "chrome" ($0 Web Speech API) | "groq" (Groq whisper-large-v3-turbo)
+    speechMode: "chrome", // "chrome" ($0 Web Speech API) | "groq" (Groq Whisper) | "deepgram" (Nova-3 Diarize)
+    groqWhisperModel: "whisper-large-v3",
+    deepgramApiKey: "",
+    micDeviceId: "",
+    rawRoomAudio: true,
+    recordingBitrate: 96000,
+    campaignGlossary: "",
     autoAnalyzeSeconds: 25,
     budgetCapUsd: 1.0,
     isFreeTierKey: false,
-    autoSyncPartySheets: true
+    autoSyncPartySheets: true,
+    autoUpdateIdeas: true
   };
 
   function createFreshSession() {
@@ -48,6 +77,8 @@
         notableNpcs: [],
         lastUpdatedAt: null
       },
+      sessionBeats: [],
+      sessionSummary: null,
       transcript: [],
       puzzle: {
         isActive: false,
@@ -71,6 +102,7 @@
         recommendations: [],
         tacticalOverview: "",
         concentrationWarning: "",
+        pastSessionConnection: "",
         customAnswer: "",
         lastAdvisedAt: null
       },
@@ -574,6 +606,7 @@
       this.state = this.#loadSession();
       this.partyGroups = this.#loadPartyGroups();
       this.savedTranscripts = this.#loadSavedTranscripts();
+      this.campaignMemory = this.#loadCampaignMemory();
       this.#bootstrapBugsPartyGroup();
       this.#hydrateFromExtensionStorage();
     }
@@ -617,6 +650,17 @@
     #loadSavedTranscripts() {
       try {
         const raw = localStorage.getItem(SAVED_TRANSCRIPTS_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) return parsed;
+        }
+      } catch (_) {}
+      return [];
+    }
+
+    #loadCampaignMemory() {
+      try {
+        const raw = localStorage.getItem(CAMPAIGN_MEMORY_KEY);
         if (raw) {
           const parsed = JSON.parse(raw);
           if (Array.isArray(parsed)) return parsed;
@@ -688,8 +732,20 @@
       return modified;
     }
 
+    #normalizeAllCharacterRecords() {
+      if (Array.isArray(this.state.party)) {
+        this.state.party = this.state.party.map(normalizeCharacterRecord);
+      }
+      for (const grp of Object.values(this.partyGroups.groups || {})) {
+        if (grp && Array.isArray(grp.characters)) {
+          grp.characters = grp.characters.map(normalizeCharacterRecord);
+        }
+      }
+    }
+
     #bootstrapBugsPartyGroup() {
       this.#purgeExcludedFromGroupAndState();
+      this.#normalizeAllCharacterRecords();
       const realCurrent = (this.state.party || []).filter((p) => !isDemoCharId(p.id));
       const bugsGroup = this.partyGroups.groups[DEFAULT_PARTY_GROUP];
 
@@ -722,44 +778,59 @@
       const extStorage = global.chrome?.storage?.local;
       if (!extStorage || typeof extStorage.get !== "function") return;
 
-      extStorage.get([PARTY_GROUPS_KEY, SAVED_TRANSCRIPTS_KEY, STORAGE_KEY], (res) => {
-        if (!res) return;
-        let changed = false;
+      extStorage.get(
+        [PARTY_GROUPS_KEY, SAVED_TRANSCRIPTS_KEY, CAMPAIGN_MEMORY_KEY, STORAGE_KEY],
+        (res) => {
+          if (!res) return;
+          let changed = false;
 
-        if (res[PARTY_GROUPS_KEY]?.groups) {
-          const extGroups = res[PARTY_GROUPS_KEY];
-          for (const [gName, gVal] of Object.entries(extGroups.groups)) {
-            const localGroup = this.partyGroups.groups[gName];
-            if (
-              !localGroup ||
-              ((gVal.updatedAt || 0) > (localGroup.updatedAt || 0) &&
-                (localGroup.characters?.length || 0) === 0)
-            ) {
-              this.partyGroups.groups[gName] = gVal;
+          if (res[PARTY_GROUPS_KEY]?.groups) {
+            const extGroups = res[PARTY_GROUPS_KEY];
+            for (const [gName, gVal] of Object.entries(extGroups.groups)) {
+              const localGroup = this.partyGroups.groups[gName];
+              if (
+                !localGroup ||
+                ((gVal.updatedAt || 0) > (localGroup.updatedAt || 0) &&
+                  (localGroup.characters?.length || 0) === 0)
+              ) {
+                this.partyGroups.groups[gName] = gVal;
+                changed = true;
+              }
+            }
+            if (this.#purgeExcludedFromGroupAndState()) {
               changed = true;
             }
+            this.#normalizeAllCharacterRecords();
+            const active = this.partyGroups.groups[this.partyGroups.activeGroupName];
+            if (this.state.party.length === 0 && active?.characters?.length > 0) {
+              this.state.party = JSON.parse(JSON.stringify(active.characters));
+              this.state.myCharacterId = active.myCharacterId || this.state.party[0]?.id || null;
+              changed = true;
+            }
+            this.#persistPartyGroups();
+          } else {
+            this.#persistPartyGroups();
           }
-          if (this.#purgeExcludedFromGroupAndState()) {
+
+          if (
+            Array.isArray(res[SAVED_TRANSCRIPTS_KEY]) &&
+            res[SAVED_TRANSCRIPTS_KEY].length > this.savedTranscripts.length
+          ) {
+            this.savedTranscripts = res[SAVED_TRANSCRIPTS_KEY];
             changed = true;
           }
-          const active = this.partyGroups.groups[this.partyGroups.activeGroupName];
-          if (this.state.party.length === 0 && active?.characters?.length > 0) {
-            this.state.party = JSON.parse(JSON.stringify(active.characters));
-            this.state.myCharacterId = active.myCharacterId || this.state.party[0]?.id || null;
+
+          if (
+            Array.isArray(res[CAMPAIGN_MEMORY_KEY]) &&
+            res[CAMPAIGN_MEMORY_KEY].length > this.campaignMemory.length
+          ) {
+            this.campaignMemory = res[CAMPAIGN_MEMORY_KEY];
             changed = true;
           }
-          this.#persistPartyGroups();
-        } else {
-          this.#persistPartyGroups();
-        }
 
-        if (Array.isArray(res[SAVED_TRANSCRIPTS_KEY]) && res[SAVED_TRANSCRIPTS_KEY].length > this.savedTranscripts.length) {
-          this.savedTranscripts = res[SAVED_TRANSCRIPTS_KEY];
-          changed = true;
+          if (changed) this.save();
         }
-
-        if (changed) this.save();
-      });
+      );
     }
 
     #persistPartyGroups() {
@@ -780,11 +851,22 @@
       } catch (_) {}
     }
 
+    #persistCampaignMemory() {
+      try {
+        localStorage.setItem(CAMPAIGN_MEMORY_KEY, JSON.stringify(this.campaignMemory));
+      } catch (_) {}
+      try {
+        global.chrome?.storage?.local?.set({ [CAMPAIGN_MEMORY_KEY]: this.campaignMemory });
+      } catch (_) {}
+    }
+
     #syncActivePartyGroup() {
       const gName = this.partyGroups.activeGroupName;
       if (!gName || gName === "__demo__") return;
       const prev = this.partyGroups.groups[gName] || {};
-      const realChars = (this.state.party || []).filter((p) => !isDemoCharId(p.id));
+      const realChars = (this.state.party || [])
+        .filter((p) => !isDemoCharId(p.id))
+        .map(normalizeCharacterRecord);
       this.partyGroups.groups[gName] = {
         name: gName,
         myCharacterId: !isDemoCharId(this.state.myCharacterId)
@@ -819,6 +901,11 @@
             ...parsed,
             bridgeStatus: { ...fresh.bridgeStatus, ...(parsed.bridgeStatus || {}) },
             situation: { ...fresh.situation, ...(parsed.situation || {}) },
+            sessionBeats: Array.isArray(parsed.sessionBeats) ? parsed.sessionBeats : [],
+            sessionSummary:
+              parsed.sessionSummary && typeof parsed.sessionSummary === "object"
+                ? parsed.sessionSummary
+                : null,
             puzzle: { ...fresh.puzzle, ...(parsed.puzzle || {}) },
             combat: { ...fresh.combat, ...(parsed.combat || {}) },
             advisor: { ...fresh.advisor, ...(parsed.advisor || {}) },
@@ -934,6 +1021,136 @@
       this.save();
     }
 
+    getVocabularyTerms() {
+      const seen = new Set();
+      const terms = [];
+      const addTerm = (raw) => {
+        const clean = String(raw || "").trim();
+        if (!clean || /^unidentified\s+foe/i.test(clean)) return;
+        const key = clean.toLowerCase();
+        if (seen.has(key)) return;
+        seen.add(key);
+        terms.push(clean);
+      };
+
+      const glossaryRaw = String(this.settings?.campaignGlossary || "");
+      for (const part of glossaryRaw.split(/[,\n;]+/)) {
+        addTerm(part);
+      }
+      for (const pc of this.state.party || []) {
+        addTerm(pc?.name);
+      }
+      for (const npc of this.state.situation?.notableNpcs || []) {
+        addTerm(npc);
+      }
+      for (const enemy of this.state.combat?.enemies || []) {
+        addTerm(enemy?.name);
+      }
+      return terms;
+    }
+
+    recordSessionBeat(situation) {
+      const sit = situation || this.state.situation;
+      const headline = String(sit?.headline || "").trim();
+      if (
+        !headline ||
+        /^waiting for table conversation/i.test(headline) ||
+        /^listening for table conversation/i.test(headline)
+      ) {
+        return false;
+      }
+
+      if (!Array.isArray(this.state.sessionBeats)) {
+        this.state.sessionBeats = [];
+      }
+
+      const sceneMode = String(sit?.sceneMode || "Exploration");
+      const summary = Array.isArray(sit?.summaryBullets)
+        ? sit.summaryBullets.filter(Boolean).join(" ").trim()
+        : "";
+      const now = Date.now();
+      const last = this.state.sessionBeats[this.state.sessionBeats.length - 1];
+
+      if (last && last.headline === headline) {
+        return false;
+      }
+
+      const elapsed = last ? now - (last.timestamp || 0) : Infinity;
+      const shouldAppend =
+        !last ||
+        last.sceneMode !== sceneMode ||
+        elapsed >= 10 * 60 * 1000 ||
+        (elapsed >= 4 * 60 * 1000 && last.headline !== headline);
+
+      if (!shouldAppend) return false;
+
+      this.state.sessionBeats.push({
+        timestamp: now,
+        sceneMode,
+        headline,
+        summary
+      });
+
+      if (this.state.sessionBeats.length > 60) {
+        this.state.sessionBeats = this.state.sessionBeats.slice(-60);
+      }
+      return true;
+    }
+
+    setSessionSummary(summaryObj) {
+      if (!summaryObj || typeof summaryObj !== "object") return null;
+      const clean = {
+        headline: String(summaryObj.headline || "").trim(),
+        bullets: Array.isArray(summaryObj.bullets)
+          ? summaryObj.bullets.map((b) => String(b || "").trim()).filter(Boolean)
+          : [],
+        generatedAt: Date.now()
+      };
+      this.state.sessionSummary = clean;
+      this.save();
+      return clean;
+    }
+
+    replaceTranscriptLines(newLines) {
+      const arr = Array.isArray(newLines) ? newLines : [];
+      const base = Date.now();
+      const mapped = [];
+      for (let i = 0; i < arr.length; i++) {
+        const item = arr[i];
+        const cleanText = String(item?.text || "").trim();
+        if (!cleanText) continue;
+        mapped.push({
+          id: `tr-${base}-${i}-${Math.random().toString(36).slice(2, 6)}`,
+          timestamp: Number(item?.timestamp) || base + i * 1000,
+          speaker: String(item?.speaker || "Recording").trim() || "Recording",
+          text: cleanText,
+          pinnedAsClue: Boolean(item?.pinnedAsClue)
+        });
+      }
+      this.state.transcript = mapped.slice(-20000);
+      this.save();
+      return this.state.transcript;
+    }
+
+    hasStaleTranscriptGap(thresholdMs = 2 * 60 * 60 * 1000) {
+      const lines = this.state.transcript || [];
+      if (lines.length === 0) {
+        return { isStale: false, gapMinutes: 0, lineCount: 0, lastTimestamp: null };
+      }
+      const last = lines[lines.length - 1];
+      const lastTs = Number(last?.timestamp || 0);
+      if (!lastTs) {
+        return { isStale: false, gapMinutes: 0, lineCount: lines.length, lastTimestamp: null };
+      }
+      const gapMs = Math.max(0, Date.now() - lastTs);
+      return {
+        isStale: gapMs >= thresholdMs,
+        gapMinutes: Math.round(gapMs / 60000),
+        lineCount: lines.length,
+        lastTimestamp: lastTs
+      };
+    }
+
     addTranscriptLine(speaker, text, pinnedAsClue = false) {
       const clean = String(text || "").trim();
       if (!clean) return null;
@@ -980,6 +1197,10 @@
         partyGroup: partyName,
         headline: this.state.situation?.headline || "",
         summaryBullets: [...(this.state.situation?.summaryBullets || [])],
+        sessionBeats: JSON.parse(JSON.stringify(this.state.sessionBeats || [])),
+        sessionSummary: this.state.sessionSummary
+          ? JSON.parse(JSON.stringify(this.state.sessionSummary))
+          : null,
         clues: [...(this.state.puzzle?.clues || [])],
         lines: JSON.parse(JSON.stringify(this.state.transcript))
       };
@@ -993,12 +1214,15 @@
     }
 
     exportPortableBackup() {
+      this.#normalizeAllCharacterRecords();
+      this.#syncActivePartyGroup();
       return {
-        version: 3,
+        version: 4,
         exportedAt: Date.now(),
         settings: this.settings,
         partyGroups: this.partyGroups,
         savedTranscripts: this.savedTranscripts,
+        campaignMemory: this.campaignMemory,
         state: this.state
       };
     }
@@ -1016,6 +1240,9 @@
       if (Array.isArray(payload.savedTranscripts)) {
         this.savedTranscripts = payload.savedTranscripts;
       }
+      if (Array.isArray(payload.campaignMemory)) {
+        this.campaignMemory = payload.campaignMemory;
+      }
       const incomingState = payload.state || (payload.party ? payload : null);
       if (incomingState) {
         const fresh = createFreshSession();
@@ -1024,15 +1251,195 @@
           ...incomingState,
           bridgeStatus: { ...fresh.bridgeStatus, ...(incomingState.bridgeStatus || {}) },
           situation: { ...fresh.situation, ...(incomingState.situation || {}) },
+          sessionBeats: Array.isArray(incomingState.sessionBeats) ? incomingState.sessionBeats : [],
+          sessionSummary:
+            incomingState.sessionSummary && typeof incomingState.sessionSummary === "object"
+              ? incomingState.sessionSummary
+              : null,
           puzzle: { ...fresh.puzzle, ...(incomingState.puzzle || {}) },
           combat: { ...fresh.combat, ...(incomingState.combat || {}) },
           advisor: { ...fresh.advisor, ...(incomingState.advisor || {}) }
         };
       }
       this.#purgeExcludedFromGroupAndState();
+      this.#normalizeAllCharacterRecords();
+
+      // If imported state.party is empty or demo-only while active group has real sheets, hydrate from active group
+      const activeName =
+        this.partyGroups.activeGroupName === "__demo__"
+          ? DEFAULT_PARTY_GROUP
+          : this.partyGroups.activeGroupName || DEFAULT_PARTY_GROUP;
+      const activeGroup = this.partyGroups.groups?.[activeName];
+      const hasOnlyDemoOrEmpty =
+        !Array.isArray(this.state.party) ||
+        this.state.party.length === 0 ||
+        this.state.party.every((p) => isDemoCharId(p.id));
+      if (hasOnlyDemoOrEmpty && activeGroup?.characters?.length > 0) {
+        this.partyGroups.activeGroupName = activeName;
+        this.state.party = JSON.parse(JSON.stringify(activeGroup.characters));
+        this.state.myCharacterId = activeGroup.myCharacterId || this.state.party[0]?.id || null;
+      }
+
       this.#syncActivePartyGroup();
       this.#persistSavedTranscripts();
+      this.#persistCampaignMemory();
       this.save();
+    }
+
+    addCampaignMemoryEntry({
+      title,
+      summary = "",
+      keyNpcs = [],
+      openQuests = [],
+      clues = [],
+      rawText = "",
+      dateLabel = ""
+    }) {
+      const cleanTitle = String(title || "").trim() || `Session Note (${new Date().toLocaleDateString()})`;
+      const entry = {
+        id: `mem-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        title: cleanTitle,
+        dateLabel: String(dateLabel || "").trim() || new Date().toLocaleDateString(),
+        summary: String(summary || "").trim(),
+        keyNpcs: Array.isArray(keyNpcs) ? keyNpcs.map((x) => String(x || "").trim()).filter(Boolean) : [],
+        openQuests: Array.isArray(openQuests) ? openQuests.map((x) => String(x || "").trim()).filter(Boolean) : [],
+        clues: Array.isArray(clues) ? clues.map((x) => String(x || "").trim()).filter(Boolean) : [],
+        rawText: String(rawText || "").slice(0, 60000),
+        enabled: true,
+        createdAt: Date.now()
+      };
+      this.campaignMemory = this.campaignMemory.filter(
+        (m) => m.title.toLowerCase() !== cleanTitle.toLowerCase()
+      );
+      this.campaignMemory.unshift(entry);
+      if (this.campaignMemory.length > 40) {
+        this.campaignMemory = this.campaignMemory.slice(0, 40);
+      }
+      this.#persistCampaignMemory();
+      this.notify();
+      return entry;
+    }
+
+    toggleCampaignMemoryEntry(id) {
+      const found = this.campaignMemory.find((m) => m.id === id);
+      if (!found) return;
+      found.enabled = !found.enabled;
+      this.#persistCampaignMemory();
+      this.notify();
+    }
+
+    deleteCampaignMemoryEntry(id) {
+      this.campaignMemory = this.campaignMemory.filter((m) => m.id !== id);
+      this.#persistCampaignMemory();
+      this.notify();
+    }
+
+    updateCharacterSheetUrl(charId, newUrl) {
+      const pc = this.state.party.find((p) => String(p.id) === String(charId));
+      if (!pc) return null;
+      const raw = String(newUrl || "").trim();
+      const idMatch = raw.match(/characters\/(\d{4,12})/i) || raw.match(/^(\d{4,12})$/);
+      const resolvedUrl = idMatch
+        ? `https://www.dndbeyond.com/characters/${idMatch[1]}`
+        : /^https?:\/\//i.test(raw)
+        ? raw
+        : raw.startsWith("/")
+        ? `https://www.dndbeyond.com${raw}`
+        : "";
+      if (!resolvedUrl) return null;
+
+      pc.sheetUrl = resolvedUrl;
+      if (idMatch && !/^\d{4,12}$/.test(String(pc.id))) {
+        const oldId = pc.id;
+        pc.id = idMatch[1];
+        if (String(this.state.myCharacterId) === String(oldId)) {
+          this.state.myCharacterId = pc.id;
+        }
+      }
+      this.#syncActivePartyGroup();
+      this.save();
+      return pc;
+    }
+
+    getRelevantPastContext(recentTranscriptLines = []) {
+      const lines = Array.isArray(recentTranscriptLines)
+        ? recentTranscriptLines
+        : this.state.transcript.slice(-12);
+      const recentText = lines.map((l) => (typeof l === "string" ? l : l?.text || "")).join(" ");
+
+      const enabledMemories = (this.campaignMemory || []).filter((m) => m.enabled !== false);
+      const seenTitles = new Set(enabledMemories.map((m) => String(m.title || "").toLowerCase()));
+
+      const recentSaved = (this.savedTranscripts || [])
+        .filter((s) => s && !seenTitles.has(String(s.title || "").toLowerCase()))
+        .slice(0, 6)
+        .map((s) => ({
+          title: s.title,
+          summary:
+            s.sessionSummary?.headline ||
+            (s.sessionSummary?.bullets || []).slice(0, 2).join(" ") ||
+            s.headline ||
+            (s.summaryBullets || []).slice(0, 2).join(" "),
+          keyNpcs: [],
+          openQuests: [],
+          clues: s.clues || [],
+          rawText: (s.lines || []).map((l) => `${l.speaker}: ${l.text}`).join("\n")
+        }));
+
+      const combined = [...enabledMemories, ...recentSaved];
+      if (combined.length === 0) return "";
+
+      const summaryBlocks = combined.slice(0, 10).map((m) => {
+        const parts = [`[Past Session: ${m.title}]`];
+        if (m.summary) parts.push(`Summary: ${m.summary}`);
+        if (m.keyNpcs?.length) parts.push(`NPCs: ${m.keyNpcs.slice(0, 8).join(", ")}`);
+        if (m.openQuests?.length) parts.push(`Open Quests: ${m.openQuests.slice(0, 5).join("; ")}`);
+        if (m.clues?.length) parts.push(`Clues: ${m.clues.slice(0, 5).join("; ")}`);
+        return parts.join(" | ");
+      });
+
+      // Extract candidate keywords (capitalized words / >=5 char words) from live scene to match history
+      const stopWords = new Set([
+        "about", "after", "again", "against", "around", "because", "before", "being", "between",
+        "could", "should", "would", "there", "these", "those", "their", "where", "which", "while",
+        "going", "table", "recording", "check", "damage", "attack", "spell", "magic", "level",
+        "rolled", "initiative", "saving", "throw", "action", "bonus"
+      ]);
+      const keywords = new Set();
+      const capMatches = recentText.match(/\b[A-Z][a-z]{2,20}\b/g) || [];
+      for (const w of capMatches) {
+        const low = w.toLowerCase();
+        if (!stopWords.has(low)) keywords.add(low);
+      }
+      const longWords = recentText.toLowerCase().match(/\b[a-z]{5,20}\b/g) || [];
+      for (const w of longWords) {
+        if (!stopWords.has(w)) keywords.add(w);
+      }
+
+      const quoteSnippets = [];
+      if (keywords.size > 0) {
+        const kwList = Array.from(keywords).slice(0, 35);
+        for (const m of combined) {
+          const raw = String(m.rawText || "").trim();
+          if (!raw) continue;
+          const sentences = raw.split(/\n+|(?<=[.!?])\s+/);
+          for (const sent of sentences) {
+            const cleanSent = sent.trim();
+            if (cleanSent.length < 18 || cleanSent.length > 260) continue;
+            const lowSent = cleanSent.toLowerCase();
+            if (kwList.some((kw) => lowSent.includes(kw))) {
+              quoteSnippets.push(`[Past: ${m.title}] "${cleanSent}"`);
+              if (quoteSnippets.length >= 6) break;
+            }
+          }
+          if (quoteSnippets.length >= 6) break;
+        }
+      }
+
+      return [
+        ...summaryBlocks,
+        ...(quoteSnippets.length > 0 ? ["Relevant Past Session Details:", ...quoteSnippets] : [])
+      ].join("\n");
     }
 
     deleteSavedTranscript(id) {
@@ -1055,11 +1462,43 @@
       const bullets = archivedItem
         ? archivedItem.summaryBullets || []
         : this.state.situation?.summaryBullets || [];
+      const sessionSummary = archivedItem
+        ? archivedItem.sessionSummary || null
+        : this.state.sessionSummary || null;
+      const sessionBeats = archivedItem
+        ? archivedItem.sessionBeats || []
+        : this.state.sessionBeats || [];
       const clues = archivedItem ? archivedItem.clues || [] : this.state.puzzle?.clues || [];
       const lines = archivedItem ? archivedItem.lines || [] : this.state.transcript || [];
 
       const out = [`# ${title}`, ""];
-      if (headline) {
+      if (sessionSummary && (sessionSummary.headline || (sessionSummary.bullets || []).length > 0)) {
+        out.push(`## Session Summary: ${sessionSummary.headline || headline || title}`);
+        for (const b of sessionSummary.bullets || []) out.push(`- ${b}`);
+        out.push("");
+      } else if (Array.isArray(sessionBeats) && sessionBeats.length > 1) {
+        out.push("## Session Timeline");
+        for (const beat of sessionBeats) {
+          const bTime = beat.timestamp
+            ? new Date(beat.timestamp).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit"
+              })
+            : "";
+          const modeLabel = beat.sceneMode ? ` (${beat.sceneMode})` : "";
+          const prefix = bTime ? `[${bTime}]${modeLabel} ` : modeLabel ? `${modeLabel.trim()} ` : "";
+          out.push(`- ${prefix}${beat.headline}`);
+          if (beat.summary && beat.summary !== beat.headline) {
+            out.push(`  - ${beat.summary}`);
+          }
+        }
+        if (bullets.length > 0) {
+          out.push("");
+          out.push("### Latest Scene Notes");
+          for (const b of bullets) out.push(`- ${b}`);
+        }
+        out.push("");
+      } else if (headline) {
         out.push(`## Summary: ${headline}`);
         for (const b of bullets) out.push(`- ${b}`);
         out.push("");
@@ -1111,7 +1550,8 @@
       this.save();
     }
 
-    upsertCharacter(charObj, options = {}) {
+    upsertCharacter(rawCharObj, options = {}) {
+      const charObj = normalizeCharacterRecord(rawCharObj);
       const manualAdd = Boolean(options.manualAdd);
 
       // If user was viewing Demo and imports a real sheet, switch straight into B.U.G.S.!

@@ -121,6 +121,7 @@
         notableNpcs: extractProperNouns(recentLines.map((l) => l.text)),
         lastUpdatedAt: Date.now()
       };
+      store.recordSessionBeat?.(st.situation);
       store.save();
       return st.situation;
     }
@@ -214,8 +215,65 @@
       lastUpdatedAt: Date.now()
     };
 
+    store.recordSessionBeat?.(st.situation);
     store.save();
     return st.situation;
+  }
+
+  async function summarizeFullSession(store) {
+    const st = store.state;
+    const beats = Array.isArray(st.sessionBeats) ? st.sessionBeats : [];
+    const lines = Array.isArray(st.transcript) ? st.transcript : [];
+
+    if (beats.length === 0 && lines.length === 0) {
+      return store.setSessionSummary({
+        headline: "No session transcript captured yet.",
+        bullets: []
+      });
+    }
+
+    const bullets = [];
+    let headline = "";
+
+    if (beats.length > 0) {
+      const first = beats[0];
+      const last = beats[beats.length - 1];
+      headline =
+        beats.length === 1
+          ? first.headline
+          : `Full Session (${beats.length} scenes): ${first.sceneMode} → ${last.sceneMode}`;
+
+      const maxBullets = 6;
+      const step = beats.length <= maxBullets ? 1 : (beats.length - 1) / (maxBullets - 1);
+      const pickedIndexes = new Set();
+      for (let i = 0; i < Math.min(beats.length, maxBullets); i++) {
+        pickedIndexes.add(Math.min(beats.length - 1, Math.round(i * step)));
+      }
+      for (const idx of Array.from(pickedIndexes).sort((a, b) => a - b)) {
+        const b = beats[idx];
+        const tStr = b.timestamp
+          ? new Date(b.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+          : "";
+        const prefix = tStr ? `[${tStr}] (${b.sceneMode}) ` : `(${b.sceneMode}) `;
+        bullets.push(`${prefix}${b.headline}`);
+      }
+    } else {
+      const meaningful = lines.filter((l) => String(l.text || "").split(/\s+/).length >= 4);
+      const source = meaningful.length > 0 ? meaningful : lines;
+      const maxBullets = 5;
+      const step = source.length <= maxBullets ? 1 : (source.length - 1) / (maxBullets - 1);
+      const picked = new Set();
+      for (let i = 0; i < Math.min(source.length, maxBullets); i++) {
+        picked.add(Math.min(source.length - 1, Math.round(i * step)));
+      }
+      for (const idx of Array.from(picked).sort((a, b) => a - b)) {
+        const item = source[idx];
+        bullets.push(`${item.speaker}: "${item.text.slice(0, 140)}${item.text.length > 140 ? "..." : ""}"`);
+      }
+      headline = `Session Summary (${lines.length} transcript lines)`;
+    }
+
+    return store.setSessionSummary({ headline, bullets });
   }
 
   async function solvePuzzle(store, extraUserNote = "") {
@@ -279,22 +337,76 @@
     return st.puzzle;
   }
 
+  async function summarizePastSession(_store, title, rawText) {
+    const cleanTitle = String(title || "").trim() || `Session (${new Date().toLocaleDateString()})`;
+    const cleanText = String(rawText || "").trim();
+    const lines = cleanText
+      .split(/\n+/)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 14);
+
+    const npcs = extractProperNouns(lines.slice(0, 120));
+    const clues = [];
+    const quests = [];
+    for (const l of lines) {
+      if (PUZZLE_WORDS.test(l) || /\b(key|secret|cipher|clue|letter|symbol|ring|Artifact)\b/i.test(l)) {
+        if (clues.length < 4) clues.push(l.slice(0, 160));
+      }
+      if (/\b(quest|promise|deliver|find|rescue|return|meet|owe|mission)\b/i.test(l)) {
+        if (quests.length < 4) quests.push(l.slice(0, 160));
+      }
+    }
+
+    const summarySentences = lines
+      .filter((l) => !/^#/.test(l))
+      .slice(0, 3)
+      .map((l) => l.slice(0, 160));
+
+    return {
+      title: cleanTitle,
+      summary: summarySentences.join(" ") || cleanText.slice(0, 320),
+      keyNpcs: npcs,
+      openQuests: quests,
+      clues
+    };
+  }
+
   async function adviseTacticsAndSpells(store, customQuestion = "") {
     const st = store.state;
     const myChar =
       st.party.find((p) => String(p.id) === String(st.myCharacterId)) || st.party[0] || null;
 
+    // Extract optional tie-in from campaign memory / saved transcripts
+    let pastSessionConnection = "";
+    const pastContext = store.getRelevantPastContext
+      ? store.getRelevantPastContext(st.transcript.slice(-10))
+      : "";
+    if (pastContext) {
+      const relevantLines = pastContext
+        .split("\n")
+        .filter((l) => l.startsWith("[Past: "));
+      if (relevantLines.length > 0) {
+        pastSessionConnection = relevantLines.slice(0, 2).join(" · ");
+      } else {
+        const firstSessionLine = pastContext.split("\n")[0];
+        if (firstSessionLine) {
+          pastSessionConnection = firstSessionLine.slice(0, 220);
+        }
+      }
+    }
+
     if (!myChar) {
       st.advisor = {
         tacticalOverview:
-          "No character sheet loaded yet—click '+ Party Sheets' (or '✨ Demo' in the top bar) so the tactical engine knows your spells and slots!",
+          "No character sheet loaded yet—click '+ Hero' above the Party column so Live Ideas knows your spells, skills, and gear!",
         concentrationWarning: "",
+        pastSessionConnection,
         recommendations: [
           {
             rank: 1,
-            spellOrAction: "Dodge / Take Cover / Ready an Action",
-            slotInfo: "Action · Zero Resources",
-            whyBest: "Add your D&D Beyond character sheet on the right to get spell-specific recommendations."
+            spellOrAction: "Help / Ask the DM for a Skill Check",
+            slotInfo: "Exploration / Social · Zero Cost",
+            whyBest: "Add your D&D Beyond character sheet on the right to get character-specific ideas as the table talks."
           }
         ],
         customAnswer: "",
@@ -308,7 +420,104 @@
     const enemyCount = activeEnemies.length;
     const bloodiedEnemy = activeEnemies.find((e) => e.isBloodied);
     const criticalAllies = st.party.filter((p) => p.hp.current <= p.hp.max * 0.35);
+    const sceneMode = st.situation?.sceneMode || (st.combat.inCombat ? "Combat" : "Exploration");
+    const isConcentrating = Boolean(myChar.concentratingOn);
 
+    // Out-of-Combat / Exploration / Social / Puzzle proactive idea generator ($0 local)
+    const isNonCombatQuestion =
+      customQuestion && /\b(ask|say|check|search|investigate|persuade|negotiate|door|room|npc|clue|puzzle)\b/i.test(customQuestion);
+    if ((sceneMode !== "Combat" && enemyCount === 0) || isNonCombatQuestion) {
+      const ideas = [];
+      const topSkills = (myChar.proficientSkills || []).slice(0, 3);
+      const utilitySpells = (myChar.spells || []).filter((s) =>
+        s.ritual ||
+        s.level <= 2 &&
+          /detect|identify|mage hand|minor illusion|prestidigitation|thaumaturgy|comprehend|guidance|enhance|speak|disguise|charm|suggestion|invisibility|find|knock|light|pass|misty/i.test(
+            s.name
+          )
+      );
+
+      if (sceneMode === "Social") {
+        ideas.push({
+          rank: ideas.length + 1,
+          spellOrAction: "Read Intentions or Press for Details (Insight / Persuasion)",
+          slotInfo: "Social Check · Ask the DM",
+          whyBest: `Ask the DM what their body language or motive looks like${
+            topSkills.length ? ` (your top skills: ${topSkills.join(", ")})` : ""
+          } before committing the party.`
+        });
+      } else if (sceneMode === "Puzzle" || st.puzzle.isActive) {
+        ideas.push({
+          rank: ideas.length + 1,
+          spellOrAction: "Inspect Wear Marks & Test Safely from 30 ft",
+          slotInfo: "Puzzle Investigation · No Resources",
+          whyBest:
+            "Ask the DM for scorch marks, dust gaps, or magic auras on the mechanism, then probe from 30 ft back before touching directly."
+        });
+      } else {
+        ideas.push({
+          rank: ideas.length + 1,
+          spellOrAction:
+            topSkills.length > 0
+              ? `Lead with ${topSkills[0]} Check`
+              : "Scout Ahead / Check Passive Perception",
+          slotInfo: `Skill Check · Passive Perception ${myChar.passivePerception || 10}`,
+          whyBest:
+            topSkills.length > 0
+              ? `Lean on ${myChar.name}'s strengths (${topSkills.join(", ")}) to check for traps, tracks, hidden compartments, or lore.`
+              : "Ask the DM what stands out in the room—lighting, exits, tracks, and anything out of place."
+        });
+      }
+
+      for (const sp of utilitySpells.slice(0, 2)) {
+        ideas.push({
+          rank: ideas.length + 1,
+          spellOrAction: `${sp.name}${sp.ritual ? " (Ritual)" : sp.level === 0 ? " (Cantrip)" : ` (L${sp.level})`}`,
+          slotInfo: sp.ritual ? "0 Slots (Ritual, 10 min)" : sp.level === 0 ? "Cantrip (Free)" : `Level ${sp.level} · ${sp.castingTime}`,
+          whyBest: sp.summary || "Practical utility spell for this scene."
+        });
+      }
+
+      if ((myChar.notableItems || []).length > 0) {
+        const it = myChar.notableItems[0];
+        ideas.push({
+          rank: ideas.length + 1,
+          spellOrAction: `Check Magic Gear: ${it.name}`,
+          slotInfo: it.attuned ? "Attuned Item" : "Equipped Gear",
+          whyBest:
+            it.snippet ||
+            "Keep your attuned/magic item charges and passive bonuses ready if the scene escalates."
+        });
+      }
+
+      if (ideas.length < 3) {
+        ideas.push({
+          rank: ideas.length + 1,
+          spellOrAction: "Coordinate Help Action or Watch Rear",
+          slotInfo: "Team Play · Free",
+          whyBest: "Offer the Help action to give an ally Advantage on their next crucial skill check."
+        });
+      }
+
+      st.advisor = {
+        tacticalOverview: `${sceneMode} Ideas for ${myChar.name} (${myChar.classSummary})${
+          pastSessionConnection ? " — linked with past session memory" : ""
+        }.`,
+        concentrationWarning: isConcentrating
+          ? `Currently concentrating on ${myChar.concentratingOn}.`
+          : "",
+        pastSessionConnection,
+        recommendations: ideas.slice(0, 4).map((x, idx) => ({ ...x, rank: idx + 1 })),
+        customAnswer: customQuestion
+          ? `Exploration/Social ideas for "${customQuestion}" using ${myChar.name}'s skills, utility spells, and gear ($0 local).`
+          : "",
+        lastAdvisedAt: Date.now()
+      };
+      store.save();
+      return st.advisor;
+    }
+
+    // Combat Mode scoring (existing tactical spell scorer + pastSessionConnection!)
     // Check highest observed AC & suspected resistances
     const highAcObserved = activeEnemies.some(
       (e) => (e.lowestHitRoll && e.lowestHitRoll >= 17) || (e.highestMissRoll && e.highestMissRoll >= 16)
@@ -326,7 +535,6 @@
       (myChar.spellSlots || []).filter((s) => s.remaining > 0).map((s) => s.level)
     );
     const highestSlot = availableSlotLevels.size > 0 ? Math.max(...availableSlotLevels) : 0;
-    const isConcentrating = Boolean(myChar.concentratingOn);
 
     const qLower = (customQuestion || "").toLowerCase();
     const wantsSaveSlots = /\b(save\s+slots?|cantrip|conserve|frugal|no\s+slots?)\b/.test(qLower);
@@ -471,6 +679,7 @@
       concentrationWarning: isConcentrating
         ? `⚠️ ${myChar.name} is concentrating on ${myChar.concentratingOn}—avoid casting another Concentration spell unless upgrading.`
         : `Concentration is FREE on ${myChar.name}.`,
+      pastSessionConnection,
       recommendations: top3,
       customAnswer: customQuestion
         ? `Filtered "${customQuestion}" locally across ${myChar.name}'s ${myChar.spells?.length || 0} prepared spells and remaining slots ($0.00 cost).`
@@ -486,6 +695,8 @@
   global.DnDCopilot.LocalBrain = {
     analyzeTableSituation,
     solvePuzzle,
-    adviseTacticsAndSpells
+    adviseTacticsAndSpells,
+    summarizePastSession,
+    summarizeFullSession
   };
 })(window);

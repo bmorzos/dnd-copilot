@@ -20,6 +20,19 @@
 
       this.#initExtensionListeners();
       this.#initPostMessageListeners();
+
+      // Periodic character sheet refresh every 30s in BOTH Extension and Bookmarklet modes
+      setInterval(() => {
+        const canRefresh =
+          this.isExtensionContext() || (this.remoteWindow && !this.remoteWindow.closed);
+        if (
+          canRefresh &&
+          this.store.settings.autoSyncPartySheets &&
+          this.store.state.party.length > 0
+        ) {
+          this.refreshAllPartySheets(true);
+        }
+      }, 30000);
     }
 
     isExtensionContext() {
@@ -44,13 +57,6 @@
 
       // Request immediate snapshot on startup
       this.requestAboveVttSync();
-
-      // Periodic character sheet refresh every 30s when autoSyncPartySheets is on
-      setInterval(() => {
-        if (this.store.settings.autoSyncPartySheets && this.store.state.party.length > 0) {
-          this.refreshAllPartySheets(true);
-        }
-      }, 30000);
     }
 
     #initPostMessageListeners() {
@@ -166,9 +172,12 @@
 
       // 3. Direct browser fetch (works if CORS permits or via local proxy)
       if (!rawJson) {
-        const url = `https://character-service.dndbeyond.com/character/v5/character/${charId}?includeCustomItems=true`;
+        const url = `https://character-service.dndbeyond.com/character/v5/character/${charId}?includeCustomItems=true&_t=${Date.now()}`;
         try {
-          const directResp = await fetch(url, { headers: { Accept: "application/json" } });
+          const directResp = await fetch(url, {
+            cache: "no-store",
+            headers: { Accept: "application/json" }
+          });
           if (directResp.ok) {
             rawJson = await directResp.json();
           } else {
@@ -176,7 +185,7 @@
           }
         } catch (err) {
           throw new Error(
-            `Browser blocked direct D&D Beyond fetch (${err.message}). Click the 1-Click Bookmarklet on your D&D Beyond tab (or paste the character JSON) so it uses your open DDB tab!`
+            `Browser blocked direct D&D Beyond fetch (${err.message}). Click the 1-Click Bookmarklet on your D&D Beyond tab (or keep a logged-in D&D Beyond tab open)!`
           );
         }
       }
@@ -193,14 +202,56 @@
     }
 
     async refreshAllPartySheets(silent = true) {
-      const ids = this.store.state.party
-        .map((p) => p.id)
-        .filter((id) => /^\d{4,12}$/.test(String(id)));
+      await this.requestAboveVttSync().catch(() => false);
+
+      const seenIds = new Set();
+      const ids = [];
+      for (const p of this.store.state.party || []) {
+        if (String(p?.id || "").startsWith("demo-")) continue;
+        const cid = this.extractCharacterId(p.sheetUrl) || this.extractCharacterId(p.id);
+        if (cid && !seenIds.has(cid)) {
+          seenIds.add(cid);
+          ids.push(cid);
+        }
+      }
+
+      if (ids.length === 0) {
+        if (!silent) {
+          this.onToast(
+            "No D&D Beyond character links found on your party cards — click + Hero or 🔗 Link on a character first."
+          );
+        }
+        return { updated: 0, total: 0, error: "No character IDs" };
+      }
+
+      let updated = 0;
+      let lastError = "";
       for (const id of ids) {
         try {
-          await this.syncCharacterById(id, silent);
-        } catch (_) {}
+          const res = await this.syncCharacterById(id, true, false);
+          if (res) updated += 1;
+        } catch (err) {
+          lastError = err?.message || String(err);
+        }
       }
+
+      if (!silent) {
+        if (updated > 0) {
+          this.onToast(`Updated ${updated}/${ids.length} character sheet(s) from D&D Beyond!`);
+        } else if (!this.isExtensionContext() && (!this.remoteWindow || this.remoteWindow.closed)) {
+          this.onToast(
+            "To update sheets in web mode, click your ⚔️ Sync AboveVTT bookmarklet on your D&D Beyond tab once!"
+          );
+        } else {
+          this.onToast(
+            `Could not refresh sheets: ${
+              lastError || "Keep a logged-in D&D Beyond tab open and reload it once."
+            }`
+          );
+        }
+      }
+
+      return { updated, total: ids.length, error: lastError };
     }
 
     #fetchViaBookmarkletBridge(charId) {
@@ -398,7 +449,7 @@
                 var tokRes=await fetch('https://auth-service.dndbeyond.com/v1/cobalt-token',{method:'POST',credentials:'include'}).catch(function(){return null;});
                 var tok=tokRes&&tokRes.ok?(await tokRes.json()).token:null;
                 var hdrs={Accept:'application/json'};if(tok)hdrs.Authorization='Bearer '+tok;
-                var r=await fetch('https://character-service.dndbeyond.com/character/v5/character/'+d.characterId+'?includeCustomItems=true',{headers:hdrs});
+                var r=await fetch('https://character-service.dndbeyond.com/character/v5/character/'+d.characterId+'?includeCustomItems=true&_t='+Date.now(),{headers:hdrs,cache:'no-store'});
                 var j=await r.json();
                 win.postMessage({source:'dnd-copilot-bookmarklet',type:'CHARACTER_JSON_RESPONSE',requestId:d.requestId,ok:r.ok,json:j},'*');
               }catch(e){

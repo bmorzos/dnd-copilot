@@ -11,6 +11,8 @@
   let toastTimeout = null;
   let currentRecordingObjectUrl = null;
   let currentLoadedAudioFile = null;
+  let isUpdatingIdeas = false;
+  let lastCustomAdvisorQuestionAt = 0;
 
   function el(id) {
     return document.getElementById(id);
@@ -155,11 +157,28 @@
     onSpeechBatchReady: async () => {
       try {
         await gemini.analyzeTableSituation(store);
+        await refreshLiveIdeasSilently();
       } catch (err) {
         showToast(err.message || String(err), true);
       }
     }
   });
+
+  async function refreshLiveIdeasSilently() {
+    if (isUpdatingIdeas || store.settings?.autoUpdateIdeas === false) return;
+    if (Date.now() - lastCustomAdvisorQuestionAt < 15000) return;
+    isUpdatingIdeas = true;
+    try {
+      await gemini.adviseTacticsAndSpells(store, "");
+      if (store.state.puzzle?.isActive || store.state.situation?.sceneMode === "Puzzle") {
+        await gemini.solvePuzzle(store);
+      }
+    } catch (_) {
+      // Keep quiet during background continuous updates
+    } finally {
+      isUpdatingIdeas = false;
+    }
+  }
 
   /* ---------------- RENDERING ---------------- */
 
@@ -170,9 +189,15 @@
     bridgeBtn.classList.toggle("connected", isConnected);
     bridgeTxt.textContent = isConnected ? "AboveVTT Live" : "AboveVTT";
 
-    const isGroq = settings.speechMode === "groq";
-    el("btnEngineChrome").classList.toggle("active", !isGroq);
-    el("btnEngineGroq").classList.toggle("active", isGroq);
+    const mode =
+      settings.speechMode === "groq"
+        ? "groq"
+        : settings.speechMode === "deepgram"
+        ? "deepgram"
+        : "chrome";
+    el("btnEngineChrome").classList.toggle("active", mode === "chrome");
+    el("btnEngineGroq").classList.toggle("active", mode === "groq");
+    el("btnEngineDeepgram")?.classList.toggle("active", mode === "deepgram");
   }
 
   function renderWhatsGoingOn(state) {
@@ -233,12 +258,24 @@
       btn.classList.toggle("active", btn.getAttribute("data-tab") === activeTab);
     });
 
-    // 1. Best Move / Spell Advisor
+    // 1. Live Ideas & Best Moves
+    const enabledMem = (store.campaignMemory || []).filter((m) => m.enabled !== false);
+    const seenMemTitles = new Set(enabledMem.map((m) => String(m.title || "").toLowerCase()));
+    const extraArchivedCount = (store.savedTranscripts || []).filter(
+      (s) => s && !seenMemTitles.has(String(s.title || "").toLowerCase())
+    ).length;
+    const pastBadge = el("pastSessionCount");
+    if (pastBadge) pastBadge.textContent = String(enabledMem.length + extraArchivedCount);
+
     const myChar =
       state.party.find((p) => String(p.id) === String(state.myCharacterId)) || state.party[0] || null;
-    el("playingAsLabel").textContent = myChar
-      ? `Playing as ★ ${myChar.name}`
-      : "Select ★ Me on your hero →";
+    if (myChar) {
+      el("playingAsLabel").textContent = state.advisor?.lastAdvisedAt
+        ? `★ ${myChar.name} · Updated ${formatTime(state.advisor.lastAdvisedAt)}`
+        : `★ ${myChar.name} · Auto-updating`;
+    } else {
+      el("playingAsLabel").textContent = "Select ★ Me on your hero →";
+    }
 
     const concAlert = el("concentrationAlert");
     const concText =
@@ -251,6 +288,16 @@
       concAlert.classList.remove("hidden");
     } else {
       concAlert.classList.add("hidden");
+    }
+
+    const tieInBox = el("pastSessionTieInBox");
+    if (tieInBox) {
+      if (state.advisor?.pastSessionConnection) {
+        tieInBox.textContent = `🕰️ From Past Sessions: ${state.advisor.pastSessionConnection}`;
+        tieInBox.classList.remove("hidden");
+      } else {
+        tieInBox.classList.add("hidden");
+      }
     }
 
     if (state.advisor.tacticalOverview) {
@@ -533,7 +580,12 @@
           ? `<a class="btn btn-quiet" style="padding:5px 10px;font-size:14px;" href="${escapeHtml(
               sheetUrl
             )}" target="_blank" rel="noopener noreferrer" title="Open D&amp;D Beyond Character Sheet">Sheet ↗</a>`
+          : !String(pc.id || "").startsWith("demo-")
+          ? `<button type="button" class="btn btn-quiet" style="padding:5px 10px;font-size:14px;" data-link-pc="${escapeHtml(
+              pc.id
+            )}" title="Link D&amp;D Beyond sheet URL so stats auto-update">🔗 Link</button>`
           : "";
+        const syncNote = pc.lastSyncedAt ? ` · Synced ${formatTime(pc.lastSyncedAt)}` : "";
 
         return `
           <div class="hero-card ${isMe ? "is-me" : ""}">
@@ -542,7 +594,7 @@
                 <div class="hero-name">${nameHtml}</div>
                 <div class="hero-class">${escapeHtml(pc.classSummary)} · AC ${pc.ac}${
           pc.concentratingOn ? ` · 🔮 ${escapeHtml(pc.concentratingOn)}` : ""
-        }</div>
+        }${escapeHtml(syncNote)}</div>
               </div>
               <div class="simple-row">
                 ${sheetBtnHtml}
@@ -608,6 +660,46 @@
   function renderSavedModal() {
     el("savedCurrentLineCount").textContent = String(store.state.transcript.length);
 
+    // 0. Past Sessions (Campaign Memory)
+    const memBox = el("campaignMemoryList");
+    if (memBox) {
+      const memories = store.campaignMemory || [];
+      if (memories.length === 0) {
+        memBox.innerHTML = `<p class="muted-p">No past sessions imported yet—import a <code>.txt</code>/<code>.md</code> recap or promote an archived transcript below.</p>`;
+      } else {
+        memBox.innerHTML = memories
+          .map((m) => {
+            const npcs = m.keyNpcs?.length ? `NPCs: ${m.keyNpcs.slice(0, 5).join(", ")}` : "";
+            const quests = m.openQuests?.length
+              ? `Quests: ${m.openQuests.slice(0, 2).join("; ")}`
+              : "";
+            const metaLine = [npcs, quests].filter(Boolean).join(" · ");
+            return `
+              <div class="big-card">
+                <div class="big-card-top">
+                  <span class="big-card-title">${escapeHtml(m.title)}</span>
+                  <span class="big-card-meta">${escapeHtml(m.dateLabel || "")}</span>
+                </div>
+                ${m.summary ? `<p class="big-card-desc" style="font-size:15px;">${escapeHtml(m.summary)}</p>` : ""}
+                ${metaLine ? `<p class="muted-p" style="margin:6px 0 0 0;">${escapeHtml(metaLine)}</p>` : ""}
+                <div class="simple-row" style="margin-top:8px;justify-content:space-between;">
+                  <label class="memory-toggle-row">
+                    <input type="checkbox" data-toggle-memory="${escapeHtml(m.id)}" ${
+              m.enabled !== false ? "checked" : ""
+            } />
+                    Active in Live Ideas
+                  </label>
+                  <button type="button" class="btn btn-danger" style="padding:5px 10px;font-size:13.5px;" data-del-memory="${escapeHtml(
+                    m.id
+                  )}">Delete</button>
+                </div>
+              </div>
+            `;
+          })
+          .join("");
+      }
+    }
+
     // 1. Saved Audio Recordings (IndexedDB)
     const audioBox = el("savedAudioList");
     const recs = sessionRecorder.getStatus().savedSessions || [];
@@ -624,9 +716,14 @@
                 <span class="big-card-title">${escapeHtml(r.title)}</span>
                 <span class="big-card-meta">${mins}:${secs} · ${formatMegabytes(r.bytes)}</span>
               </div>
-              <div class="simple-row" style="margin-top:8px;">
+              <div class="simple-row" style="margin-top:8px;flex-wrap:wrap;">
                 <button type="button" class="btn btn-primary" data-dl-audio="${escapeHtml(r.id)}">
                   ⬇ Download Audio (.webm)
+                </button>
+                <button type="button" class="btn btn-action" data-transcribe-audio="${escapeHtml(
+                  r.id
+                )}" title="Re-transcribe this saved audio with Deepgram diarization or chunked Groq Whisper v3">
+                  ✨ Re-Transcribe
                 </button>
                 <button type="button" class="btn btn-danger" data-del-audio="${escapeHtml(r.id)}">
                   Delete
@@ -652,7 +749,10 @@
               <span class="big-card-title">${escapeHtml(a.title)}</span>
               <span class="big-card-meta">${(a.lines || []).length} lines</span>
             </div>
-            <div class="simple-row" style="margin-top:8px;">
+            <div class="simple-row" style="margin-top:8px;flex-wrap:wrap;">
+              <button type="button" class="btn btn-primary" data-promote-transcript="${escapeHtml(a.id)}">
+                📚 Use in Live Ideas
+              </button>
               <button type="button" class="btn btn-action" data-dl-transcript="${escapeHtml(a.id)}">
                 ⬇ Download (.txt)
               </button>
@@ -691,11 +791,74 @@
     el("savedModal").classList.remove("hidden");
   }
 
+  async function populateMicrophoneList() {
+    const sel = el("settingMicDevice");
+    if (!sel) return;
+    const savedId = store.settings.micDeviceId || "";
+    const options = [`<option value="">System Default Microphone</option>`];
+    try {
+      if (navigator.mediaDevices?.enumerateDevices) {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const mics = devices.filter((d) => d.kind === "audioinput");
+        let unnamedIdx = 1;
+        for (const mic of mics) {
+          if (!mic.deviceId) continue;
+          const label = mic.label || `Microphone ${unnamedIdx++} (allow mic to see name)`;
+          options.push(
+            `<option value="${escapeHtml(mic.deviceId)}" ${
+              mic.deviceId === savedId ? "selected" : ""
+            }>${escapeHtml(label)}</option>`
+          );
+        }
+      }
+    } catch (_) {}
+    sel.innerHTML = options.join("");
+    if (savedId && !Array.from(sel.options).some((o) => o.value === savedId)) {
+      const missingOpt = document.createElement("option");
+      missingOpt.value = savedId;
+      missingOpt.textContent = "Previously Selected Mic (disconnected)";
+      missingOpt.selected = true;
+      sel.appendChild(missingOpt);
+    }
+  }
+
   function openSettingsModal() {
     el("settingGroqKey").value = store.settings.groqApiKey || "";
+    if (el("settingGroqWhisperModel")) {
+      el("settingGroqWhisperModel").value = store.settings.groqWhisperModel || "whisper-large-v3";
+    }
+    if (el("settingDeepgramKey")) {
+      el("settingDeepgramKey").value = store.settings.deepgramApiKey || "";
+    }
+    if (el("settingRawRoomAudio")) {
+      el("settingRawRoomAudio").checked = store.settings.rawRoomAudio !== false;
+    }
+    if (el("settingRecordingBitrate")) {
+      el("settingRecordingBitrate").value = String(store.settings.recordingBitrate || 96000);
+    }
+    if (el("settingCampaignGlossary")) {
+      el("settingCampaignGlossary").value = store.settings.campaignGlossary || "";
+    }
     el("settingApiKey").value = store.settings.geminiApiKey || "";
     el("settingAiProvider").value = store.settings.aiProvider || "auto";
+    populateMicrophoneList();
     el("settingsModal").classList.remove("hidden");
+  }
+
+  function maybeHandleStaleTranscriptBeforeLiveStart() {
+    const gap = store.hasStaleTranscriptGap?.();
+    if (!gap?.isStale) return;
+    const hrs = Math.max(2, Math.round(gap.gapMinutes / 60));
+    const shouldArchive = window.confirm(
+      `Your current transcript has ${gap.lineCount} line(s) from ~${hrs} hour(s) ago. Archive and start a fresh session transcript first so older tests don't mix into tonight's game?`
+    );
+    if (shouldArchive) {
+      try {
+        store.archiveCurrentTranscript();
+      } catch (_) {}
+      store.resetSession();
+      showToast("Previous transcript archived — starting fresh session!");
+    }
   }
 
   function wireEvents() {
@@ -704,6 +867,7 @@
       if (audioListener.isListening && audioListener.activeSourceType === "mic") {
         audioListener.stop();
       } else {
+        maybeHandleStaleTranscriptBeforeLiveStart();
         try {
           await audioListener.start();
         } catch (_) {}
@@ -719,7 +883,7 @@
       }
     });
 
-    // 1-Click Chrome <-> Groq Switch
+    // 1-Click Chrome <-> Groq <-> Deepgram Switch
     el("btnEngineChrome").addEventListener("click", () => {
       audioListener.switchSpeechEngine("chrome");
       showToast("Switched speech to Chrome (Built-in)");
@@ -735,9 +899,24 @@
       showToast("Switched speech to Groq Whisper!");
     });
 
+    el("btnEngineDeepgram")?.addEventListener("click", () => {
+      if (!(store.settings.deepgramApiKey || "").trim()) {
+        openSettingsModal();
+        showToast("Paste your Deepgram API Key once to enable Nova-3 Diarization!");
+        return;
+      }
+      audioListener.switchSpeechEngine("deepgram");
+      showToast("Switched speech to Deepgram Nova-3 (Live Diarization)!");
+    });
+
+    el("btnRefreshMics")?.addEventListener("click", async () => {
+      await populateMicrophoneList();
+      showToast("Microphone list refreshed.");
+    });
+
     el("btnDismissHealthAlert").addEventListener("click", clearHealthWarning);
 
-    // Session Recorder (Crash-safe IndexedDB — opens an independent mic stream when recording room audio so switching engines never interrupts backup audio!)
+    // Session Recorder (Crash-safe IndexedDB — clones the active mic track when live so switching speech engines never interrupts backup audio or opens duplicate mic handles!)
     el("btnToggleRecord").addEventListener("click", async () => {
       if (sessionRecorder.isRecording) {
         sessionRecorder.stop();
@@ -752,19 +931,22 @@
             Notification.requestPermission().catch(() => {});
           }
           if (!audioListener.isListening) {
+            maybeHandleStaleTranscriptBeforeLiveStart();
             await audioListener.start();
           }
           const partyName =
             store.getActivePartyGroupName() === "__demo__"
               ? "B.U.G.S."
               : store.getActivePartyGroupName();
-          // Use independent mic stream for live room recording so toggling speech engine never touches backup audio
           const sharedStream =
             audioListener.activeSourceType === "system" || audioListener.activeSourceType === "file"
               ? audioListener.getRecordableStream()
-              : null;
-          await sessionRecorder.start(sharedStream, partyName);
-          showToast("Recording independent audio backup + live transcript!");
+              : audioListener.getRawMicStream();
+          await sessionRecorder.start(sharedStream, partyName, {
+            settings: store.settings,
+            bitrate: store.settings.recordingBitrate
+          });
+          showToast("Recording clean audio backup + live transcript!");
         } catch (_) {
           showToast("Allow microphone access to record.", true);
         }
@@ -795,25 +977,17 @@
       fileInput.value = "";
     });
 
-    // 1-Click Whole-File Fast Transcription via Groq Whisper
+    // 1-Click Whole-File Transcription (any size — Deepgram diarized or chunked Groq Whisper)
     el("btnFastTranscribeFile").addEventListener("click", async () => {
       if (!currentLoadedAudioFile) {
         showToast("Load an audio file first.", true);
         return;
       }
-      if (!(store.settings.groqApiKey || "").trim()) {
+      const hasDg = Boolean((store.settings.deepgramApiKey || "").trim());
+      const hasGroq = Boolean((store.settings.groqApiKey || "").trim());
+      if (!hasDg && !hasGroq) {
         openSettingsModal();
-        showToast("Paste your free Groq API Key once to use Fast Transcribe!");
-        return;
-      }
-      if (currentLoadedAudioFile.size > 25 * 1024 * 1024) {
-        showToast(
-          "File is over 25 MB — just press Play and Groq will transcribe it live in chunks!",
-          false
-        );
-        if (store.settings.speechMode !== "groq") {
-          audioListener.switchSpeechEngine("groq");
-        }
+        showToast("Paste a Groq or Deepgram API Key once to use Fast Transcribe!");
         return;
       }
 
@@ -821,26 +995,21 @@
       btn.disabled = true;
       btn.textContent = "⚡ Transcribing...";
       try {
-        const fullText = await gemini.transcribeWithGroq(
-          currentLoadedAudioFile,
-          store,
-          currentLoadedAudioFile.name
-        );
-        if (fullText) {
-          const sentences = fullText.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [fullText];
-          let chunkBuf = "";
-          for (const s of sentences) {
-            chunkBuf = (chunkBuf + " " + s.trim()).trim();
-            if (chunkBuf.length >= 160) {
-              store.addTranscriptLine("Recording", chunkBuf, false);
-              chunkBuf = "";
-            }
+        const lines = await gemini.transcribeLongAudioBlob(currentLoadedAudioFile, store, {
+          filename: currentLoadedAudioFile.name,
+          preferDiarization: true,
+          onProgress: (msg) => {
+            btn.textContent = `⚡ ${msg.slice(0, 26)}`;
           }
-          if (chunkBuf) {
-            store.addTranscriptLine("Recording", chunkBuf, false);
+        });
+        if (lines.length > 0) {
+          for (const l of lines) {
+            store.addTranscriptLine(l.speaker, l.text, false);
           }
           await gemini.analyzeTableSituation(store);
-          showToast("Whole file transcribed & summarized!");
+          await refreshLiveIdeasSilently();
+          await gemini.summarizeFullSession(store);
+          showToast(`Transcribed ${lines.length} lines & summarized!`);
         } else {
           showToast("No speech detected in audio file.");
         }
@@ -848,7 +1017,7 @@
         showToast(err.message || String(err), true);
       } finally {
         btn.disabled = false;
-        btn.textContent = "⚡ Fast Transcribe (Groq)";
+        btn.textContent = "⚡ Fast Transcribe";
       }
     });
 
@@ -886,6 +1055,7 @@
     el("btnOpenBridgeModal").addEventListener("click", openBridgeModal);
     el("btnOpenSheetsModal").addEventListener("click", openBridgeModal);
     el("btnOpenSavedModal").addEventListener("click", openSavedModal);
+    el("btnOpenPastSessions").addEventListener("click", openSavedModal);
     el("btnOpenSettings").addEventListener("click", openSettingsModal);
 
     // Party Group (B.U.G.S.) controls
@@ -922,6 +1092,26 @@
     el("btnDownloadTranscriptQuick").addEventListener("click", downloadCurrentTranscriptTxt);
     el("btnDownloadCurrentTranscript").addEventListener("click", downloadCurrentTranscriptTxt);
 
+    el("btnSummarizeFullSession")?.addEventListener("click", async () => {
+      if (store.state.transcript.length === 0 && (store.state.sessionBeats || []).length === 0) {
+        showToast("No transcript lines yet to summarize.", true);
+        return;
+      }
+      const btn = el("btnSummarizeFullSession");
+      const orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "📝 Summarizing...";
+      try {
+        const sum = await gemini.summarizeFullSession(store);
+        showToast(`Full-session summary updated: ${sum?.headline || "Ready"}`);
+      } catch (err) {
+        showToast(err.message || String(err), true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    });
+
     el("btnArchiveCurrentTranscript").addEventListener("click", () => {
       try {
         const saved = store.archiveCurrentTranscript();
@@ -942,6 +1132,50 @@
         }
         return;
       }
+      const trBtn = e.target.closest("[data-transcribe-audio]");
+      if (trBtn) {
+        const hasDg = Boolean((store.settings.deepgramApiKey || "").trim());
+        const hasGroq = Boolean((store.settings.groqApiKey || "").trim());
+        if (!hasDg && !hasGroq) {
+          openSettingsModal();
+          showToast("Add a Deepgram or Groq API Key in Settings to re-transcribe recordings.");
+          return;
+        }
+        const recId = trBtn.getAttribute("data-transcribe-audio");
+        const origText = trBtn.textContent;
+        trBtn.disabled = true;
+        trBtn.textContent = "⏳ Loading audio...";
+        try {
+          const { blob, meta } = await sessionRecorder.getRecordingBlob(recId);
+          if (store.state.transcript.length > 0) {
+            try {
+              store.archiveCurrentTranscript();
+            } catch (_) {}
+          }
+          const lines = await gemini.transcribeLongAudioBlob(blob, store, {
+            filename: `${meta?.title || "recording"}.webm`,
+            preferDiarization: true,
+            baseTimestamp: meta?.startedAt || Date.now(),
+            onProgress: (msg) => {
+              trBtn.textContent = `⏳ ${msg.slice(0, 26)}`;
+            }
+          });
+          if (lines.length === 0) {
+            showToast("No speech detected in recording.");
+          } else {
+            store.replaceTranscriptLines(lines);
+            await gemini.summarizeFullSession(store);
+            renderSavedModal();
+            showToast(`Re-transcribed ${lines.length} lines & generated full-session summary!`);
+          }
+        } catch (err) {
+          showToast(err.message || String(err), true);
+        } finally {
+          trBtn.disabled = false;
+          trBtn.textContent = origText;
+        }
+        return;
+      }
       const del = e.target.closest("[data-del-audio]");
       if (del && window.confirm("Delete this saved audio recording?")) {
         await sessionRecorder.deleteRecording(del.getAttribute("data-del-audio"));
@@ -949,7 +1183,109 @@
       }
     });
 
-    el("savedTranscriptArchiveList").addEventListener("click", (e) => {
+    // Past Sessions (Campaign Memory) Controls
+    const pastFileInput = el("pastSessionFileInput");
+    el("btnImportPastSessionFiles").addEventListener("click", () => pastFileInput.click());
+    pastFileInput.addEventListener("change", async () => {
+      const files = Array.from(pastFileInput.files || []);
+      if (files.length === 0) return;
+      const btn = el("btnImportPastSessionFiles");
+      const origText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "📂 Importing...";
+      let imported = 0;
+      try {
+        for (const f of files) {
+          const text = await f.text();
+          if (!text.trim()) continue;
+          const cleanTitle = f.name.replace(/\.[^.]+$/, "");
+          const sum = await gemini.summarizePastSession(store, cleanTitle, text);
+          store.addCampaignMemoryEntry({ ...sum, rawText: text });
+          imported++;
+        }
+        renderSavedModal();
+        if (imported > 0) {
+          refreshLiveIdeasSilently();
+          showToast(`Added ${imported} past session(s) to Campaign Memory!`);
+        }
+      } catch (err) {
+        showToast(err.message || String(err), true);
+      } finally {
+        pastFileInput.value = "";
+        btn.disabled = false;
+        btn.textContent = origText;
+      }
+    });
+
+    el("btnAddPastSessionText").addEventListener("click", async () => {
+      const textEl = el("pastSessionTextInput");
+      const titleEl = el("pastSessionTitleInput");
+      const rawText = (textEl.value || "").trim();
+      if (!rawText) {
+        showToast("Paste some past session notes or transcript first.", true);
+        return;
+      }
+      const btn = el("btnAddPastSessionText");
+      const origText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Saving...";
+      try {
+        const title = (titleEl.value || "").trim() || `Past Recap (${new Date().toLocaleDateString()})`;
+        const sum = await gemini.summarizePastSession(store, title, rawText);
+        store.addCampaignMemoryEntry({ ...sum, rawText });
+        titleEl.value = "";
+        textEl.value = "";
+        renderSavedModal();
+        refreshLiveIdeasSilently();
+        showToast(`Saved "${sum.title}" to Campaign Memory!`);
+      } catch (err) {
+        showToast(err.message || String(err), true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = origText;
+      }
+    });
+
+    el("campaignMemoryList").addEventListener("change", (e) => {
+      const tog = e.target.closest("[data-toggle-memory]");
+      if (tog) {
+        store.toggleCampaignMemoryEntry(tog.getAttribute("data-toggle-memory"));
+        refreshLiveIdeasSilently();
+      }
+    });
+
+    el("campaignMemoryList").addEventListener("click", (e) => {
+      const del = e.target.closest("[data-del-memory]");
+      if (del && window.confirm("Remove this past session from Campaign Memory?")) {
+        store.deleteCampaignMemoryEntry(del.getAttribute("data-del-memory"));
+        renderSavedModal();
+      }
+    });
+
+    el("savedTranscriptArchiveList").addEventListener("click", async (e) => {
+      const promote = e.target.closest("[data-promote-transcript]");
+      if (promote) {
+        const id = promote.getAttribute("data-promote-transcript");
+        const found = (store.savedTranscripts || []).find((t) => t.id === id);
+        if (found) {
+          const orig = promote.textContent;
+          promote.disabled = true;
+          promote.textContent = "Adding...";
+          try {
+            const txt = store.formatTranscriptText(found);
+            const sum = await gemini.summarizePastSession(store, found.title, txt);
+            store.addCampaignMemoryEntry({ ...sum, rawText: txt });
+            renderSavedModal();
+            refreshLiveIdeasSilently();
+            showToast(`Added "${found.title}" to Live Ideas memory!`);
+          } catch (err) {
+            showToast(err.message || String(err), true);
+            promote.disabled = false;
+            promote.textContent = orig;
+          }
+        }
+        return;
+      }
       const dl = e.target.closest("[data-dl-transcript]");
       if (dl) {
         const id = dl.getAttribute("data-dl-transcript");
@@ -986,6 +1322,7 @@
       btn.textContent = "Updating...";
       try {
         await gemini.analyzeTableSituation(store);
+        await refreshLiveIdeasSilently();
       } catch (err) {
         showToast(err.message || String(err), true);
       } finally {
@@ -1016,18 +1353,19 @@
       });
     });
 
-    // Best Move Advisor
+    // Live Ideas Advisor
     async function runAdvisor(question = "") {
       const btn = el("btnRunAdvisor");
       btn.disabled = true;
       btn.textContent = "Thinking...";
+      if (question) lastCustomAdvisorQuestionAt = Date.now();
       try {
         await gemini.adviseTacticsAndSpells(store, question);
       } catch (err) {
         showToast(err.message || String(err), true);
       } finally {
         btn.disabled = false;
-        btn.textContent = "⚡ Suggest Best Move";
+        btn.textContent = "↻ Ideas Now";
       }
     }
 
@@ -1133,12 +1471,41 @@
     });
 
     // Party
-    el("btnRefreshParty").addEventListener("click", () => bridge.refreshAllPartySheets(false));
+    el("btnRefreshParty").addEventListener("click", async () => {
+      const btn = el("btnRefreshParty");
+      btn.disabled = true;
+      btn.textContent = "...";
+      try {
+        await bridge.refreshAllPartySheets(false);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "↻";
+      }
+    });
 
     el("partyList").addEventListener("click", (e) => {
+      const linkBtn = e.target.closest("[data-link-pc]");
+      if (linkBtn) {
+        const pcId = linkBtn.getAttribute("data-link-pc");
+        const urlInput = window.prompt("Paste this hero's D&D Beyond character URL or ID:");
+        if (urlInput && urlInput.trim()) {
+          const updated = store.updateCharacterSheetUrl(pcId, urlInput.trim());
+          if (updated) {
+            bridge
+              .syncCharacterById(updated.sheetUrl || updated.id, false, true)
+              .catch((err) => showToast(err.message || String(err), true));
+          } else {
+            showToast("Enter a valid D&D Beyond character URL or numeric ID.", true);
+          }
+        }
+        return;
+      }
       const me = e.target.closest("[data-set-me]");
       if (me) {
         store.setMyCharacter(me.getAttribute("data-set-me"));
+        if (store.state.transcript.length > 0 || store.state.combat.enemies.length > 0) {
+          refreshLiveIdeasSilently();
+        }
         return;
       }
       const rm = e.target.closest("[data-remove-pc]");
@@ -1223,28 +1590,64 @@
     });
 
     // Settings Modal
-    el("btnSaveSettings").addEventListener("click", () => {
+    el("btnSaveSettings").addEventListener("click", async () => {
       const hadGroqKey = Boolean((store.settings.groqApiKey || "").trim());
+      const hadDgKey = Boolean((store.settings.deepgramApiKey || "").trim());
+      const prevSpeechMode = store.settings.speechMode || "chrome";
+      const prevMic = store.settings.micDeviceId || "";
+      const prevRaw = store.settings.rawRoomAudio !== false;
+
       const groqKey = el("settingGroqKey").value.trim();
-      const nextSpeech =
-        groqKey && !hadGroqKey
-          ? "groq"
-          : !groqKey
-          ? "chrome"
-          : store.settings.speechMode;
+      const deepgramKey = el("settingDeepgramKey") ? el("settingDeepgramKey").value.trim() : "";
+      const groqWhisperModel = el("settingGroqWhisperModel")?.value || "whisper-large-v3";
+      const micDeviceId = el("settingMicDevice")?.value || "";
+      const rawRoomAudio = el("settingRawRoomAudio") ? el("settingRawRoomAudio").checked : true;
+      const recordingBitrate = Number(el("settingRecordingBitrate")?.value) || 96000;
+      const campaignGlossary = el("settingCampaignGlossary")
+        ? el("settingCampaignGlossary").value.trim()
+        : "";
+
+      let nextSpeech = prevSpeechMode;
+      if (deepgramKey && !hadDgKey) {
+        nextSpeech = "deepgram";
+      } else if (groqKey && !hadGroqKey) {
+        nextSpeech = "groq";
+      } else if (prevSpeechMode === "deepgram" && !deepgramKey) {
+        nextSpeech = groqKey ? "groq" : "chrome";
+      } else if (prevSpeechMode === "groq" && !groqKey) {
+        nextSpeech = deepgramKey ? "deepgram" : "chrome";
+      }
 
       store.updateSettings({
         groqApiKey: groqKey,
+        groqWhisperModel,
+        deepgramApiKey: deepgramKey,
+        micDeviceId,
+        rawRoomAudio,
+        recordingBitrate,
+        campaignGlossary,
         geminiApiKey: el("settingApiKey").value.trim(),
         aiProvider: el("settingAiProvider").value,
         speechMode: nextSpeech
       });
+
+      const micChanged = prevMic !== micDeviceId || prevRaw !== rawRoomAudio;
       if (audioListener.isListening) {
-        audioListener.switchSpeechEngine(nextSpeech);
+        if (micChanged && audioListener.activeSourceType === "mic") {
+          try {
+            await audioListener.start();
+          } catch (_) {}
+        } else if (nextSpeech !== prevSpeechMode) {
+          audioListener.switchSpeechEngine(nextSpeech);
+        }
       }
       el("settingsModal").classList.add("hidden");
       showToast(
-        nextSpeech === "groq" ? "Settings saved — Groq Whisper active!" : "Settings saved!"
+        nextSpeech === "deepgram"
+          ? "Settings saved — Deepgram Nova-3 active!"
+          : nextSpeech === "groq"
+          ? "Settings saved — Groq Whisper active!"
+          : "Settings saved!"
       );
     });
 

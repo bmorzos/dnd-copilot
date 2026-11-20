@@ -197,9 +197,10 @@
   }
 
   /**
-   * Transcribes an audio Blob or File using Groq whisper-large-v3-turbo ($0 free tier / $0.04 per hr).
+   * Transcribes an audio Blob or File using Groq Whisper (defaults to whisper-large-v3)
+   * with campaign glossary prompting and verbose_json hallucination filtering.
    */
-  async function transcribeWithGroq(audioBlob, store, customFilename = "") {
+  async function transcribeWithGroq(audioBlob, store, customFilename = "", options = {}) {
     const groqKey = (store.settings?.groqApiKey || "").trim();
     if (!groqKey) {
       throw new Error("Add your Groq API Key in Settings (console.groq.com/keys) or switch to Chrome Speech.");
@@ -230,25 +231,34 @@
       type: cleanMime
     });
 
-    const partyNames = store.state.party.map((p) => p.name).join(", ");
-    const prevLine =
-      store.state.transcript.length > 0
-        ? store.state.transcript[store.state.transcript.length - 1].text.slice(-160)
+    const model =
+      options?.model || store.settings?.groqWhisperModel || "whisper-large-v3";
+    const terms =
+      typeof store.getVocabularyTerms === "function"
+        ? store.getVocabularyTerms()
+        : (store.state.party || []).map((p) => p.name);
+    const glossaryPart =
+      terms.length > 0 ? `Glossary: ${terms.slice(0, 35).join(", ")}.` : "";
+    const rawPrev =
+      options?.prevText !== undefined
+        ? String(options.prevText || "")
+        : store.state.transcript.length > 0
+        ? store.state.transcript[store.state.transcript.length - 1].text
         : "";
-    const vocabPrompt = [
-      `D&D 5e tabletop session.${partyNames ? ` Party: ${partyNames}.` : ""}`,
-      prevLine
-    ]
+    const prevLine = rawPrev.trim().slice(-160);
+    const basePrefix = ["D&D 5e tabletop session.", glossaryPart]
       .filter(Boolean)
-      .join(" ");
+      .join(" ")
+      .slice(0, 600);
+    const vocabPrompt = [basePrefix, prevLine].filter(Boolean).join(" ").slice(0, 780);
 
     let lastErr = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       const form = new FormData();
       form.append("file", file);
-      form.append("model", "whisper-large-v3-turbo");
+      form.append("model", model);
       form.append("language", "en");
-      form.append("response_format", "json");
+      form.append("response_format", "verbose_json");
       form.append("temperature", "0");
       form.append("prompt", vocabPrompt);
 
@@ -263,7 +273,27 @@
 
         if (resp.ok) {
           const data = await resp.json();
-          const text = String(data?.text || "").replace(/\s+/g, " ").trim();
+          let rawText = "";
+          if (Array.isArray(data?.segments) && data.segments.length > 0) {
+            const kept = [];
+            for (const seg of data.segments) {
+              const segText = String(seg?.text || "").replace(/\s+/g, " ").trim();
+              if (!segText) continue;
+              if (WHISPER_HALLUCINATIONS.has(segText.toLowerCase())) continue;
+              const noSpeech = Number(seg?.no_speech_prob ?? 0);
+              const avgLogprob = Number(seg?.avg_logprob ?? 0);
+              const compRatio = Number(seg?.compression_ratio ?? 0);
+              if (noSpeech > 0.85) continue;
+              if (noSpeech > 0.65 && avgLogprob < -0.85) continue;
+              if (compRatio > 2.6) continue;
+              kept.push(segText);
+            }
+            rawText = kept.join(" ").trim();
+          } else {
+            rawText = String(data?.text || "").replace(/\s+/g, " ").trim();
+          }
+
+          const text = rawText.replace(/\s+/g, " ").trim();
           if (!text || WHISPER_HALLUCINATIONS.has(text.toLowerCase())) {
             return "";
           }
@@ -305,6 +335,213 @@
     }
 
     throw lastErr || new Error("Groq transcription failed after 3 attempts.");
+  }
+
+  /**
+   * Transcribes & diarizes a full audio Blob/File via Deepgram Nova-3 pre-recorded API.
+   */
+  async function transcribeWithDeepgramPrerecorded(audioBlob, store) {
+    const deepgramKey = String(store.settings?.deepgramApiKey || "").trim();
+    if (!deepgramKey) {
+      throw new Error("Add your Deepgram API Key in Settings first.");
+    }
+
+    const params = new URLSearchParams({
+      model: "nova-3",
+      language: "en",
+      smart_format: "true",
+      punctuate: "true",
+      utterances: "true",
+      diarize_model: "latest"
+    });
+
+    const terms =
+      typeof store.getVocabularyTerms === "function"
+        ? store.getVocabularyTerms().slice(0, 40)
+        : [];
+    for (const term of terms) {
+      params.append("keyterm", term);
+    }
+
+    const url = `https://api.deepgram.com/v1/listen?${params.toString()}`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Token ${deepgramKey}`,
+        "Content-Type": audioBlob?.type || "audio/webm"
+      },
+      body: audioBlob
+    });
+
+    if (!resp.ok) {
+      let detail = "";
+      try {
+        const errJson = await resp.json();
+        detail = errJson?.err_msg || errJson?.message || JSON.stringify(errJson);
+      } catch (_) {
+        detail = await resp.text();
+      }
+      throw new Error(`Deepgram API HTTP ${resp.status}: ${detail.slice(0, 220)}`);
+    }
+
+    const data = await resp.json();
+    const utterances = data?.results?.utterances;
+    if (Array.isArray(utterances) && utterances.length > 0) {
+      return utterances
+        .map((u) => {
+          const txt = String(u?.transcript || "").replace(/\s+/g, " ").trim();
+          if (!txt) return null;
+          const hasSpk =
+            u?.speaker !== undefined && u?.speaker !== null && Number.isFinite(Number(u.speaker));
+          return {
+            speaker: hasSpk ? `Speaker ${Number(u.speaker) + 1}` : "Recording",
+            text: txt,
+            startSec: Number(u?.start || 0),
+            endSec: Number(u?.end || 0)
+          };
+        })
+        .filter(Boolean);
+    }
+
+    const alt = data?.results?.channels?.[0]?.alternatives?.[0];
+    const fallbackText = String(alt?.transcript || "").replace(/\s+/g, " ").trim();
+    if (
+      Array.isArray(alt?.words) &&
+      alt.words.length > 0 &&
+      global.DnDCopilot?.TableAudioListener?.groupDeepgramWordsBySpeaker
+    ) {
+      const turns = global.DnDCopilot.TableAudioListener.groupDeepgramWordsBySpeaker(
+        alt.words,
+        fallbackText,
+        "Recording"
+      );
+      return turns.map((t) => ({ speaker: t.speaker, text: t.text, startSec: 0, endSec: 0 }));
+    }
+
+    return fallbackText ? [{ speaker: "Recording", text: fallbackText, startSec: 0, endSec: 0 }] : [];
+  }
+
+  function groupSentencesToTranscriptLines(
+    fullText,
+    speaker = "Recording",
+    baseTimestamp = Date.now(),
+    offsetSec = 0
+  ) {
+    const clean = String(fullText || "").trim();
+    if (!clean) return [];
+    const sentences = clean.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [clean];
+    const lines = [];
+    let chunkBuf = "";
+    for (const s of sentences) {
+      chunkBuf = (chunkBuf + " " + s.trim()).trim();
+      if (chunkBuf.length >= 180) {
+        lines.push({
+          speaker,
+          text: chunkBuf,
+          timestamp: baseTimestamp + Math.round((offsetSec + lines.length * 4) * 1000)
+        });
+        chunkBuf = "";
+      }
+    }
+    if (chunkBuf) {
+      lines.push({
+        speaker,
+        text: chunkBuf,
+        timestamp: baseTimestamp + Math.round((offsetSec + lines.length * 4) * 1000)
+      });
+    }
+    return lines;
+  }
+
+  /**
+   * Transcribes an audio file/recording of any size: uses Deepgram Nova-3 (diarized) when available,
+   * or automatically decodes and chunks >24 MB recordings into 16 kHz WAV parts for Groq Whisper.
+   */
+  async function transcribeLongAudioBlob(audioBlob, store, options = {}) {
+    const filename = options?.filename || "";
+    const preferDiarization = options?.preferDiarization !== false;
+    const baseTimestamp = Number(options?.baseTimestamp) || Date.now();
+    const onProgress = typeof options?.onProgress === "function" ? options.onProgress : () => {};
+
+    const hasDg = Boolean(String(store.settings?.deepgramApiKey || "").trim());
+    const hasGroq = Boolean(String(store.settings?.groqApiKey || "").trim());
+
+    if (preferDiarization && hasDg) {
+      onProgress("Transcribing & diarizing with Deepgram Nova-3...");
+      try {
+        const utterances = await transcribeWithDeepgramPrerecorded(audioBlob, store);
+        return utterances.map((u) => ({
+          speaker: u.speaker || "Recording",
+          text: u.text,
+          timestamp: baseTimestamp + Math.round((Number(u.startSec) || 0) * 1000)
+        }));
+      } catch (dgErr) {
+        const msg = String(dgErr?.message || dgErr || "");
+        const looksLikeCorsOrNet =
+          dgErr?.name === "TypeError" || /failed to fetch|cors|network/i.test(msg);
+        if (looksLikeCorsOrNet && hasGroq) {
+          onProgress(
+            "Deepgram REST blocked in browser mode — falling back to chunked Groq Whisper v3..."
+          );
+        } else {
+          throw dgErr;
+        }
+      }
+    }
+
+    if (!hasGroq) {
+      throw new Error(
+        "Add your Groq or Deepgram API Key in Settings to transcribe recordings."
+      );
+    }
+
+    if (audioBlob.size <= 24 * 1024 * 1024) {
+      onProgress("Transcribing audio via Groq Whisper...");
+      const fullText = await transcribeWithGroq(audioBlob, store, filename, { prevText: "" });
+      return groupSentencesToTranscriptLines(fullText, "Recording", baseTimestamp, 0);
+    }
+
+    const AudioCtx = global.AudioContext || global.webkitAudioContext;
+    const AudioUtils = global.DnDCopilot?.AudioUtils;
+    if (!AudioCtx || !AudioUtils) {
+      throw new Error("Audio decoding is unavailable in this browser environment.");
+    }
+
+    onProgress("Decoding long recording into 16 kHz chunks...");
+    const arrayBuffer = await audioBlob.arrayBuffer();
+    const ctx = new AudioCtx({ sampleRate: 16000 });
+    let decoded;
+    try {
+      decoded = await ctx.decodeAudioData(arrayBuffer);
+    } finally {
+      await ctx.close().catch(() => {});
+    }
+
+    const chunks = AudioUtils.sliceAudioBufferToWavChunks(decoded, 480, 2);
+    if (chunks.length === 0) return [];
+
+    const allLines = [];
+    let lastRawChunkText = "";
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      onProgress(`Transcribing part ${i + 1}/${chunks.length} via Groq Whisper...`);
+      const chunkText = await transcribeWithGroq(chunk.blob, store, `part-${i + 1}.wav`, {
+        prevText: lastRawChunkText
+      });
+      if (!chunkText) continue;
+
+      const cleanText =
+        i > 0 && lastRawChunkText
+          ? AudioUtils.dedupeOverlapText(lastRawChunkText, chunkText)
+          : chunkText;
+      lastRawChunkText = chunkText;
+      if (cleanText) {
+        allLines.push(
+          ...groupSentencesToTranscriptLines(cleanText, "Recording", baseTimestamp, chunk.startSec)
+        );
+      }
+    }
+    return allLines;
   }
 
   function buildCompactSessionContext(store) {
@@ -359,7 +596,34 @@
           .join("\n")
       : "  (No character spells synced yet)";
 
-    return { myChar, recentTranscript, recentRolls, enemiesText, partyText, mySpellsText };
+    const itemLines = (myChar?.notableItems || []).map(
+      (it) =>
+        `  * ${it.name}${it.attuned ? " [Attuned]" : it.equipped ? " [Equipped]" : ""}${
+          it.snippet ? `: ${it.snippet}` : ""
+        }`
+    );
+    const featureLine = myChar?.notableFeatures?.length
+      ? `  Features/Feats: ${myChar.notableFeatures.join(", ")}`
+      : "";
+    const skillLine = myChar?.proficientSkills?.length
+      ? `  Proficient Skills: ${myChar.proficientSkills.join(", ")}`
+      : "";
+    const myItemsAndSkills = [featureLine, skillLine, ...itemLines].filter(Boolean).join("\n");
+
+    const pastSessionsText = store.getRelevantPastContext
+      ? store.getRelevantPastContext(st.transcript.slice(-12))
+      : "";
+
+    return {
+      myChar,
+      recentTranscript,
+      recentRolls,
+      enemiesText,
+      partyText,
+      mySpellsText,
+      myItemsAndSkills,
+      pastSessionsText
+    };
   }
 
   async function analyzeTableSituation(store) {
@@ -381,9 +645,12 @@
       ctx.enemiesText || "None",
       "--- RECENT ROLLS ---",
       ctx.recentRolls || "None",
+      ...(ctx.pastSessionsText
+        ? ["--- PAST SESSIONS / CAMPAIGN MEMORY ---", ctx.pastSessionsText]
+        : []),
       "--- RECENT TABLE CONVERSATION ---",
       ctx.recentTranscript || "None",
-      "Keep summaryBullets to 3 short, crisp sentences (filter out casual off-topic banter)."
+      "Keep summaryBullets to 3 short, crisp sentences (filter out casual off-topic banter). Note any returning NPCs or quests from Past Sessions if mentioned."
     ].join("\n");
 
     let res;
@@ -454,6 +721,8 @@
       notableNpcs: Array.isArray(res.notableNpcs) ? res.notableNpcs.slice(0, 4) : [],
       lastUpdatedAt: Date.now()
     };
+
+    store.recordSessionBeat?.(store.state.situation);
 
     if (res.puzzleDetected || (Array.isArray(res.newPuzzleClues) && res.newPuzzleClues.length > 0)) {
       store.state.puzzle.isActive = true;
@@ -568,20 +837,29 @@
     }
 
     const ctx = buildCompactSessionContext(store);
+    const sceneMode = store.state.situation?.sceneMode || (store.state.combat.inCombat ? "Combat" : "Exploration");
     const prompt = [
-      "Give top 3 best D&D 5e spells/actions right now for my character in short, easy-to-scan sentences.",
-      "Only suggest spells I actually have prepared AND have remaining slots for, and warn before breaking active Concentration.",
+      `Current Scene Mode: ${sceneMode}.`,
+      "Give 3 to 4 crisp, practical IDEAS of things I should DO, TRY, ASK THE DM, CHECK, or CAST right now.",
+      "Always adapt to the current moment: in Exploration/Social/Puzzle scenes, suggest clever questions to ask the DM, skill checks I'm strong at, magic item/utility spell uses, and past-session callbacks—NOT just combat attacks. In Combat, suggest best spells/actions using only prepared spells with remaining slots, and warn before breaking Concentration.",
       `--- PLAYING AS: ${ctx.myChar ? `${ctx.myChar.name} (${ctx.myChar.classSummary}, Save DC ${ctx.myChar.spellSaveDc})` : "Party Member"} ---`,
+      ctx.myItemsAndSkills ? `--- MY SKILLS, FEATURES & MAGIC ITEMS ---\n${ctx.myItemsAndSkills}` : "",
       "Prepared Spells:",
       ctx.mySpellsText,
       "--- PARTY ---",
       ctx.partyText || "None synced",
       `--- ENEMIES (Round ${store.state.combat.round || 1}) ---`,
       ctx.enemiesText || "No active enemies listed.",
-      "--- RECENT CONVERSATION ---",
+      ...(ctx.pastSessionsText
+        ? ["--- PAST SESSIONS / CAMPAIGN MEMORY ---", ctx.pastSessionsText]
+        : []),
+      "--- CURRENT SCENE & RECENT CONVERSATION ---",
+      store.state.situation?.headline ? `Scene Headline: ${store.state.situation.headline}` : "",
       ctx.recentTranscript || "None",
-      customQuestion ? `--- QUESTION: ${customQuestion} ---` : ""
-    ].join("\n");
+      customQuestion ? `--- USER QUESTION: ${customQuestion} ---` : ""
+    ]
+      .filter(Boolean)
+      .join("\n");
 
     let res;
     if (backend === "groq") {
@@ -589,14 +867,15 @@
         store,
         userPrompt: prompt,
         schemaHint: JSON.stringify({
-          tacticalOverview: "1-sentence summary of the turn",
+          tacticalOverview: "1-sentence read on the moment and our best angle",
           concentrationWarning: "",
+          pastSessionConnection: "1-2 sentence tie-in to a past session NPC/clue/quest if relevant right now, otherwise empty string",
           recommendations: [
             {
               rank: 1,
-              spellOrAction: "Spell Name",
-              slotInfo: "2nd-level slot · Action",
-              whyBest: "Short reason why"
+              spellOrAction: "Action, Spell, Check, or Question to Try",
+              slotInfo: "Category / Slot Cost / Skill (e.g. L2 Slot · Action OR Investigation Check OR Ask DM)",
+              whyBest: "1-2 clear sentences explaining why to try this now"
             }
           ],
           customAnswer: ""
@@ -608,6 +887,7 @@
         properties: {
           tacticalOverview: { type: "string" },
           concentrationWarning: { type: "string" },
+          pastSessionConnection: { type: "string" },
           recommendations: {
             type: "array",
             items: {
@@ -623,7 +903,13 @@
           },
           customAnswer: { type: "string" }
         },
-        required: ["tacticalOverview", "concentrationWarning", "recommendations", "customAnswer"]
+        required: [
+          "tacticalOverview",
+          "concentrationWarning",
+          "pastSessionConnection",
+          "recommendations",
+          "customAnswer"
+        ]
       };
       res = await callInteractionsApi({
         store,
@@ -637,12 +923,85 @@
     store.state.advisor = {
       tacticalOverview: res.tacticalOverview || "",
       concentrationWarning: res.concentrationWarning || "",
-      recommendations: Array.isArray(res.recommendations) ? res.recommendations.slice(0, 3) : [],
+      pastSessionConnection: res.pastSessionConnection || "",
+      recommendations: Array.isArray(res.recommendations) ? res.recommendations.slice(0, 4) : [],
       customAnswer: customQuestion ? res.customAnswer || "" : "",
       lastAdvisedAt: Date.now()
     };
     store.save();
     return res;
+  }
+
+  function sampleLargeText(rawText, maxChars = 18000) {
+    const clean = String(rawText || "").trim();
+    if (clean.length <= maxChars) return clean;
+    const part = Math.floor(maxChars / 3);
+    return [
+      clean.slice(0, part),
+      "\n... [middle excerpt] ...\n",
+      clean.slice(Math.floor(clean.length / 2 - part / 2), Math.floor(clean.length / 2 + part / 2)),
+      "\n... [ending excerpt] ...\n",
+      clean.slice(-part)
+    ].join("");
+  }
+
+  async function summarizePastSession(store, title, rawText) {
+    const cleanTitle = String(title || "").trim() || `Session (${new Date().toLocaleDateString()})`;
+    const excerpt = sampleLargeText(rawText, 18000);
+    const backend = resolveBrainBackend(store);
+
+    if (backend === "local" && global.DnDCopilot?.LocalBrain?.summarizePastSession) {
+      return await global.DnDCopilot.LocalBrain.summarizePastSession(store, cleanTitle, excerpt);
+    }
+
+    const prompt = [
+      `Distill this past D&D session notes/transcript titled "${cleanTitle}" into structured campaign memory for future sessions.`,
+      "Extract key events, recurring NPCs/factions/locations, unresolved quests/promises, and mystery/puzzle clues.",
+      "--- PAST SESSION TEXT ---",
+      excerpt
+    ].join("\n");
+
+    let res;
+    if (backend === "groq") {
+      res = await callGroqJson({
+        store,
+        userPrompt: prompt,
+        schemaHint: JSON.stringify({
+          title: cleanTitle,
+          summary: "3-4 sentence recap of key events and cliffhangers",
+          keyNpcs: ["NPC Name (brief role)"],
+          openQuests: ["Unresolved thread or promise"],
+          clues: ["Important clue, lore item, or secret"]
+        })
+      });
+    } else {
+      const schema = {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          summary: { type: "string" },
+          keyNpcs: { type: "array", items: { type: "string" } },
+          openQuests: { type: "array", items: { type: "string" } },
+          clues: { type: "array", items: { type: "string" } }
+        },
+        required: ["title", "summary", "keyNpcs", "openQuests", "clues"]
+      };
+      res = await callInteractionsApi({
+        store,
+        model: store.settings.fastModel || "gemini-3.5-flash-lite",
+        systemInstruction: PLAYER_FAIR_SYSTEM_PROMPT,
+        input: prompt,
+        jsonSchema: schema
+      });
+    }
+
+    return {
+      title: res.title || cleanTitle,
+      summary: res.summary || "",
+      keyNpcs: Array.isArray(res.keyNpcs) ? res.keyNpcs : [],
+      openQuests: Array.isArray(res.openQuests) ? res.openQuests : [],
+      clues: Array.isArray(res.clues) ? res.clues : []
+    };
   }
 
   async function analyzeTabScreenshot(base64Jpeg, store) {
@@ -692,12 +1051,113 @@
     });
   }
 
+  function buildSampledTranscriptText(lines, maxChars = 16000) {
+    if (!Array.isArray(lines) || lines.length === 0) return "";
+    const formatted = lines.map((l) => `[${l.speaker || "Table"}] ${l.text}`);
+    const joined = formatted.join("\n");
+    if (joined.length <= maxChars) return joined;
+
+    const bucketCount = 5;
+    const bucketSize = Math.ceil(formatted.length / bucketCount);
+    const charBudget = Math.floor(maxChars / bucketCount);
+    const sections = [];
+
+    for (let b = 0; b < bucketCount; b++) {
+      const start = b * bucketSize;
+      const end = Math.min(formatted.length, start + bucketSize);
+      if (start >= end) break;
+      let used = 0;
+      const picked = [];
+      for (let i = start; i < end; i++) {
+        const line = formatted[i];
+        if (used + line.length + 1 > charBudget && picked.length > 0) break;
+        picked.push(line);
+        used += line.length + 1;
+      }
+      if (picked.length > 0) {
+        sections.push(picked.join("\n"));
+      }
+    }
+    return sections.join("\n...\n");
+  }
+
+  async function summarizeFullSession(store) {
+    const backend = resolveBrainBackend(store);
+    if (backend === "local" && global.DnDCopilot?.LocalBrain?.summarizeFullSession) {
+      return await global.DnDCopilot.LocalBrain.summarizeFullSession(store);
+    }
+
+    const ctx = buildCompactSessionContext(store);
+    const beats = Array.isArray(store.state.sessionBeats) ? store.state.sessionBeats : [];
+    const beatsText = beats
+      .map((b) => {
+        const t = b.timestamp
+          ? new Date(b.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+          : "";
+        return `- ${t ? `[${t}] ` : ""}(${b.sceneMode || "Scene"}) ${b.headline}${
+          b.summary ? ` — ${b.summary}` : ""
+        }`;
+      })
+      .join("\n");
+    const sampledText = buildSampledTranscriptText(store.state.transcript, 16000);
+
+    const prompt = [
+      "Write a concise, accurate full-session summary of this entire D&D 5e session from start to finish.",
+      "Cover the full chronological arc (do NOT summarize only the ending).",
+      `--- PARTY ---\n${ctx.partyText || "None synced"}`,
+      beatsText ? `--- SCENE TIMELINE BEATS ---\n${beatsText}` : "",
+      `--- CHRONOLOGICAL TRANSCRIPT EXCERPTS (${store.state.transcript.length} total lines) ---\n${
+        sampledText || "None"
+      }`,
+      "Return a crisp 1-sentence headline and 4-6 chronological summaryBullets."
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    let res;
+    if (backend === "groq") {
+      res = await callGroqJson({
+        store,
+        userPrompt: prompt,
+        schemaHint: JSON.stringify({
+          headline: "Short 1-sentence full-session headline",
+          bullets: ["Chronological bullet 1", "Chronological bullet 2", "Chronological bullet 3", "Chronological bullet 4"]
+        })
+      });
+    } else {
+      const schema = {
+        type: "object",
+        properties: {
+          headline: { type: "string" },
+          bullets: { type: "array", items: { type: "string" } }
+        },
+        required: ["headline", "bullets"]
+      };
+      res = await callInteractionsApi({
+        store,
+        model: store.settings.fastModel || "gemini-3.5-flash-lite",
+        systemInstruction: PLAYER_FAIR_SYSTEM_PROMPT,
+        input: prompt,
+        jsonSchema: schema
+      });
+    }
+
+    return store.setSessionSummary({
+      headline: res.headline || store.state.situation?.headline || "Full Session Summary",
+      bullets: Array.isArray(res.bullets) ? res.bullets.slice(0, 8) : []
+    });
+  }
+
   global.DnDCopilot = global.DnDCopilot || {};
   global.DnDCopilot.GeminiClient = {
     transcribeWithGroq,
+    transcribeWithDeepgramPrerecorded,
+    transcribeLongAudioBlob,
     analyzeTableSituation,
     solvePuzzle,
     adviseTacticsAndSpells,
-    analyzeTabScreenshot
+    summarizePastSession,
+    analyzeTabScreenshot,
+    summarizeFullSession
   };
 })(window);

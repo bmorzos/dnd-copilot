@@ -24,9 +24,15 @@ function createBrowserSandbox() {
     setInterval: () => 1,
     clearInterval: () => {},
     URL,
+    URLSearchParams,
     Blob,
     File,
     FormData,
+    ArrayBuffer,
+    Uint8Array,
+    Int16Array,
+    Float32Array,
+    DataView,
     encodeURIComponent,
     decodeURIComponent,
     localStorage: {
@@ -48,6 +54,7 @@ function createBrowserSandbox() {
 
   for (const rel of [
     "js/ddb-parser.js",
+    "js/audio-utils.js",
     "js/state.js",
     "js/local-brain.js",
     "js/gemini-client.js",
@@ -685,4 +692,625 @@ test("Groq Whisper retries transient blips, carries rolling context prompt, and 
   // Simulate unexpected microphone unplug mid-session
   endListeners[0]();
   assert.match(alertReceived, /stopped or disconnected/i);
+});
+
+test("AudioUtils handles room constraints, 16 kHz PCM WAV encoding, overlap dedupe, and chunk slicing", async () => {
+  const sb = createBrowserSandbox();
+  const AudioUtils = sb.DnDCopilot.AudioUtils;
+
+  const rawDefault = AudioUtils.buildMicConstraints({});
+  assert.equal(rawDefault.audio.noiseSuppression, false);
+  assert.equal(rawDefault.audio.autoGainControl, false);
+  assert.equal(rawDefault.audio.echoCancellation, false);
+  assert.equal(rawDefault.audio.deviceId, undefined);
+
+  const dspCustom = AudioUtils.buildMicConstraints({
+    rawRoomAudio: false,
+    micDeviceId: "usb-yeti-123"
+  });
+  assert.equal(dspCustom.audio.noiseSuppression, true);
+  assert.equal(dspCustom.audio.autoGainControl, true);
+  assert.equal(dspCustom.audio.deviceId?.exact, "usb-yeti-123");
+
+  // Downsample 48 kHz -> 16 kHz (3:1)
+  const samples48k = new Float32Array(48000);
+  for (let i = 0; i < samples48k.length; i++) {
+    samples48k[i] = Math.sin((2 * Math.PI * 440 * i) / 48000) * 0.5;
+  }
+  const down = AudioUtils.downsampleFloat32(samples48k, 48000, 16000);
+  assert.equal(down.length, 16000);
+
+  const wav = AudioUtils.encodeWavBlob(down, 16000);
+  assert.equal(wav.type, "audio/wav");
+  assert.equal(wav.size, 44 + 16000 * 2);
+  const ab = await wav.arrayBuffer();
+  const header = new DataView(ab);
+  assert.equal(String.fromCharCode(header.getUint8(0), header.getUint8(1), header.getUint8(2), header.getUint8(3)), "RIFF");
+  assert.equal(String.fromCharCode(header.getUint8(8), header.getUint8(9), header.getUint8(10), header.getUint8(11)), "WAVE");
+  assert.equal(header.getUint32(24, true), 16000);
+  assert.equal(header.getUint16(34, true), 16);
+
+  // Overlap deduplication
+  assert.equal(
+    AudioUtils.dedupeOverlapText(
+      "We head down the well toward Zorzula's Rest.",
+      "toward Zorzula's Rest and look for the obsidian doors."
+    ),
+    "and look for the obsidian doors."
+  );
+  assert.equal(
+    AudioUtils.dedupeOverlapText(
+      "Roll initiative now.",
+      "Patty sneaks up the spiral staircase."
+    ),
+    "Patty sneaks up the spiral staircase."
+  );
+
+  // Chunk slicing
+  const fakeBuffer = {
+    numberOfChannels: 2,
+    length: 48000 * 25,
+    sampleRate: 48000,
+    getChannelData: () => new Float32Array(48000 * 25)
+  };
+  const chunks = AudioUtils.sliceAudioBufferToWavChunks(fakeBuffer, 12, 2);
+  assert.equal(chunks.length, 3);
+  assert.equal(chunks[0].startSec, 0);
+  assert.equal(chunks[1].startSec, 10);
+});
+
+test("Groq Whisper uses whisper-large-v3, campaign glossary prompt, and verbose_json hallucination filtering", async () => {
+  const sb = createBrowserSandbox();
+  const store = sb.DnDCopilot.Store;
+  const gemini = sb.DnDCopilot.GeminiClient;
+
+  store.resetSession();
+  store.updateSettings({
+    groqApiKey: "gsk_glossary_test",
+    campaignGlossary: "Phandalin, Zorzula's Rest, Ruxithid, Duergar"
+  });
+  store.upsertCharacter({
+    id: "771122",
+    name: "Gonloar",
+    classSummary: "Cleric 6",
+    level: 6,
+    hp: { current: 44, max: 44, temp: 0 },
+    ac: 18,
+    spellSlots: [],
+    spells: []
+  });
+
+  let capturedForm = null;
+  sb.fetch = async (_url, opts) => {
+    capturedForm = opts.body;
+    return {
+      ok: true,
+      json: async () => ({
+        text: "Thank you. Phandalin is under attack by Ruxithid.",
+        segments: [
+          { text: "Thank you.", no_speech_prob: 0.92, avg_logprob: -1.1, compression_ratio: 1.0 },
+          { text: "eat eat eat eat eat eat eat", no_speech_prob: 0.1, avg_logprob: -0.4, compression_ratio: 3.4 },
+          { text: "Phandalin is under attack by Ruxithid.", no_speech_prob: 0.05, avg_logprob: -0.2, compression_ratio: 1.2 }
+        ]
+      })
+    };
+  };
+
+  const result = await gemini.transcribeWithGroq(
+    new Blob(["pcm"], { type: "audio/wav" }),
+    store,
+    "table-vad.wav"
+  );
+  assert.equal(capturedForm.get("model"), "whisper-large-v3");
+  assert.equal(capturedForm.get("response_format"), "verbose_json");
+  const prompt = String(capturedForm.get("prompt") || "");
+  assert.match(prompt, /Phandalin/);
+  assert.match(prompt, /Zorzula's Rest/);
+  assert.match(prompt, /Gonloar/);
+  assert.equal(result, "Phandalin is under attack by Ruxithid.");
+});
+
+test("Deepgram Nova-3 streaming WebSocket, speaker grouping, and pre-recorded diarization follow Nova-3 API rules", async () => {
+  const sb = createBrowserSandbox();
+  const store = sb.DnDCopilot.Store;
+  const gemini = sb.DnDCopilot.GeminiClient;
+
+  store.resetSession();
+  store.updateSettings({
+    deepgramApiKey: "dg_secret_key_99",
+    groqApiKey: "gsk_fallback_key",
+    campaignGlossary: "Zorzula's Rest, Moradin"
+  });
+
+  let openedUrl = "";
+  let openedProtocols = null;
+  let lastSocket = null;
+  sb.WebSocket = class MockWebSocket {
+    constructor(url, protocols) {
+      openedUrl = url;
+      openedProtocols = protocols;
+      this.readyState = 1;
+      lastSocket = this;
+    }
+    send() {}
+    close() {
+      this.readyState = 3;
+    }
+  };
+  sb.navigator = {
+    mediaDevices: {
+      getUserMedia: async () => ({
+        getAudioTracks: () => [
+          { kind: "audio", readyState: "live", stop: () => {}, addEventListener: () => {} }
+        ],
+        getTracks: () => [{ stop: () => {} }]
+      })
+    }
+  };
+
+  const listener = new sb.DnDCopilot.TableAudioListener(store);
+  listener.switchSpeechEngine("deepgram");
+  await listener.start();
+
+  assert.match(openedUrl, /^wss:\/\/api\.deepgram\.com\/v1\/listen\?/);
+  assert.match(openedUrl, /model=nova-3/);
+  assert.match(openedUrl, /diarize_model=latest/);
+  assert.match(openedUrl, /keyterm=Moradin/);
+  assert.doesNotMatch(openedUrl, /keywords=/);
+  assert.doesNotMatch(openedUrl, /diarize=true/);
+  assert.deepEqual(Array.from(openedProtocols), ["token", "dg_secret_key_99"]);
+
+  // Simulate multi-speaker Deepgram final message
+  lastSocket.onmessage({
+    data: JSON.stringify({
+      is_final: true,
+      channel: {
+        alternatives: [
+          {
+            transcript: "Push the obsidian doors open. I got a 19 plus 3!",
+            words: [
+              { word: "push", punctuated_word: "Push", speaker: 0 },
+              { word: "the", punctuated_word: "the", speaker: 0 },
+              { word: "obsidian", punctuated_word: "obsidian", speaker: 0 },
+              { word: "doors", punctuated_word: "doors", speaker: 0 },
+              { word: "open", punctuated_word: "open.", speaker: 0 },
+              { word: "i", punctuated_word: "I", speaker: 1 },
+              { word: "got", punctuated_word: "got", speaker: 1 },
+              { word: "a", punctuated_word: "a", speaker: 1 },
+              { word: "19", punctuated_word: "19", speaker: 1 },
+              { word: "plus", punctuated_word: "plus", speaker: 1 },
+              { word: "3", punctuated_word: "3!", speaker: 1 }
+            ]
+          }
+        ]
+      }
+    })
+  });
+
+  assert.equal(store.state.transcript.length, 2);
+  assert.equal(store.state.transcript[0].speaker, "Speaker 1");
+  assert.equal(store.state.transcript[0].text, "Push the obsidian doors open.");
+  assert.equal(store.state.transcript[1].speaker, "Speaker 2");
+  assert.equal(store.state.transcript[1].text, "I got a 19 plus 3!");
+
+  listener.stop();
+
+  // Pre-recorded Deepgram utterances
+  let postUrl = "";
+  sb.fetch = async (url) => {
+    postUrl = url;
+    return {
+      ok: true,
+      json: async () => ({
+        results: {
+          utterances: [
+            { speaker: 0, start: 1.2, end: 3.5, transcript: "Welcome to Zorzula's Rest." },
+            { speaker: 2, start: 4.0, end: 5.1, transcript: "I roll perception!" }
+          ]
+        }
+      })
+    };
+  };
+
+  const lines = await gemini.transcribeLongAudioBlob(
+    new Blob(["audio"], { type: "audio/webm" }),
+    store,
+    { baseTimestamp: 1000000 }
+  );
+  assert.match(postUrl, /utterances=true/);
+  assert.match(postUrl, /diarize_model=latest/);
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0].speaker, "Speaker 1");
+  assert.equal(lines[0].timestamp, 1001200);
+  assert.equal(lines[1].speaker, "Speaker 3");
+
+  // Pre-recorded Deepgram CORS failure gracefully falls back to Groq Whisper
+  sb.fetch = async (url) => {
+    if (url.includes("deepgram.com")) {
+      throw new TypeError("Failed to fetch");
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        segments: [
+          { text: "Fallback worked cleanly.", no_speech_prob: 0.02, compression_ratio: 1.1 }
+        ]
+      })
+    };
+  };
+  const fallbackLines = await gemini.transcribeLongAudioBlob(
+    new Blob(["audio"], { type: "audio/webm" }),
+    store
+  );
+  assert.equal(fallbackLines.length, 1);
+  assert.equal(fallbackLines[0].speaker, "Recording");
+  assert.equal(fallbackLines[0].text, "Fallback worked cleanly.");
+});
+
+test("Chrome Speech sanitizes leaked </S> tokens and SessionRecorder clones active tracks at 96 kbps", async () => {
+  const sb = createBrowserSandbox();
+  const store = sb.DnDCopilot.Store;
+
+  let activeRecInstance = null;
+  sb.webkitSpeechRecognition = class {
+    start() {
+      activeRecInstance = this;
+    }
+    stop() {}
+  };
+  sb.navigator = {
+    mediaDevices: {
+      getUserMedia: async () => ({
+        getAudioTracks: () => [
+          { kind: "audio", readyState: "live", stop: () => {}, addEventListener: () => {} }
+        ],
+        getTracks: () => [{ stop: () => {} }]
+      })
+    }
+  };
+
+  const listener = new sb.DnDCopilot.TableAudioListener(store);
+  await listener.start();
+  activeRecInstance.onresult({
+    resultIndex: 0,
+    results: [
+      Object.assign([{ transcript: "She made the dessert </S> oh no <s>" }], { isFinal: true })
+    ]
+  });
+  assert.equal(store.state.transcript[0].text, "She made the dessert oh no");
+  listener.stop();
+
+  // SessionRecorder track cloning & 96 kbps default
+  let parentStopped = false;
+  let cloneStopped = false;
+  const clonedTrack = {
+    kind: "audio",
+    readyState: "live",
+    stop: () => {
+      cloneStopped = true;
+    },
+    addEventListener: () => {}
+  };
+  const parentTrack = {
+    kind: "audio",
+    readyState: "live",
+    clone: () => clonedTrack,
+    stop: () => {
+      parentStopped = true;
+    },
+    addEventListener: () => {}
+  };
+  const parentStream = {
+    getAudioTracks: () => [parentTrack],
+    getTracks: () => [parentTrack]
+  };
+
+  let recorderOpts = null;
+  sb.MediaStream = class MockMediaStream {
+    constructor(tracks) {
+      this._tracks = tracks;
+    }
+    getAudioTracks() {
+      return this._tracks;
+    }
+    getTracks() {
+      return this._tracks;
+    }
+  };
+  sb.MediaRecorder = class MockMediaRecorder {
+    static isTypeSupported() {
+      return true;
+    }
+    constructor(_stream, opts) {
+      recorderOpts = opts;
+      this.state = "inactive";
+    }
+    start() {
+      this.state = "recording";
+    }
+    stop() {
+      this.state = "inactive";
+    }
+  };
+  sb.indexedDB = {
+    open: () => {
+      const req = {};
+      setTimeout(() => {
+        req.result = {
+          objectStoreNames: { contains: () => true },
+          transaction: () => {
+            const tx = {
+              objectStore: () => ({
+                put: () => {},
+                getAll: () => {
+                  const r = {};
+                  setTimeout(() => {
+                    r.result = [];
+                    r.onsuccess?.();
+                  }, 0);
+                  return r;
+                }
+              })
+            };
+            setTimeout(() => tx.oncomplete?.(), 0);
+            return tx;
+          }
+        };
+        req.onsuccess?.();
+      }, 0);
+      return req;
+    }
+  };
+
+  const recorder = new sb.DnDCopilot.SessionRecorder();
+  await recorder.start(parentStream, "B.U.G.S.");
+  assert.equal(recorderOpts.audioBitsPerSecond, 96000);
+  recorder.stop();
+  assert.equal(cloneStopped, true);
+  assert.equal(parentStopped, false);
+});
+
+test("Session timeline beats, full-session summary, stale gap check, and settings backup all persist cleanly", async () => {
+  const sb = createBrowserSandbox();
+  const store = sb.DnDCopilot.Store;
+  const localBrain = sb.DnDCopilot.LocalBrain;
+
+  store.resetSession();
+  store.updateSettings({
+    aiProvider: "local-free",
+    groqWhisperModel: "whisper-large-v3",
+    deepgramApiKey: "dg_backup_test",
+    micDeviceId: "mic-99",
+    rawRoomAudio: false,
+    recordingBitrate: 128000,
+    campaignGlossary: "Phandalin, Zorzula's Rest"
+  });
+
+  store.addTranscriptLine("DM", "You speak with Toblen Stonehill inside the tavern.", false);
+  await localBrain.analyzeTableSituation(store);
+  store.state.combat.inCombat = true;
+  store.addTranscriptLine("DM", "Roll initiative against the psionic goblins!", false);
+  await localBrain.analyzeTableSituation(store);
+
+  assert.equal(store.state.sessionBeats.length, 2);
+
+  await localBrain.summarizeFullSession(store);
+  const exported = store.formatTranscriptText();
+  assert.match(exported, /^## Session Summary:/m);
+  assert.match(exported, /Social → Combat/);
+
+  // Stale transcript gap check (> 2 hours old)
+  store.state.transcript[store.state.transcript.length - 1].timestamp =
+    Date.now() - 3 * 60 * 60 * 1000;
+  const gap = store.hasStaleTranscriptGap();
+  assert.equal(gap.isStale, true);
+  assert.ok(gap.gapMinutes >= 179);
+
+  // Portable backup preserves all new audio/transcription settings
+  const backup = store.exportPortableBackup();
+  const sb2 = createBrowserSandbox();
+  sb2.DnDCopilot.Store.importPortableBackup(backup);
+  const s2 = sb2.DnDCopilot.Store.settings;
+  assert.equal(s2.groqWhisperModel, "whisper-large-v3");
+  assert.equal(s2.deepgramApiKey, "dg_backup_test");
+  assert.equal(s2.micDeviceId, "mic-99");
+  assert.equal(s2.rawRoomAudio, false);
+  assert.equal(s2.recordingBitrate, 128000);
+  assert.equal(s2.campaignGlossary, "Phandalin, Zorzula's Rest");
+});
+
+test("Parser extracts magic items/features/skills, backups backfill sheetUrl + campaignMemory, and Live Ideas ties into past sessions", async () => {
+  const sb = createBrowserSandbox();
+  const { parseCharacterJson } = sb.DnDCopilot.DDBParser;
+  const store = sb.DnDCopilot.Store;
+  const localBrain = sb.DnDCopilot.LocalBrain;
+  const gemini = sb.DnDCopilot.GeminiClient;
+
+  // 1. DDB parser extracts items, features, and skills
+  const hero = parseCharacterJson({
+    id: 44556677,
+    name: "lyra Whisperwind",
+    stats: [
+      { id: 1, value: 8 },
+      { id: 2, value: 14 },
+      { id: 3, value: 14 },
+      { id: 4, value: 12 },
+      { id: 5, value: 18 },
+      { id: 6, value: 16 }
+    ],
+    modifiers: {
+      class: [
+        { type: "proficiency", subType: "insight", isGranted: true },
+        { type: "expertise", subType: "perception", isGranted: true }
+      ]
+    },
+    inventory: [
+      {
+        equipped: true,
+        isAttuned: true,
+        definition: {
+          name: "Wand of the War Mage, +1",
+          magic: true,
+          snippet: "+1 spell attack and ignore half cover."
+        }
+      }
+    ],
+    feats: [{ definition: { name: "War Caster" } }],
+    classes: [
+      {
+        id: 1,
+        level: 5,
+        definition: { name: "Cleric", canCastSpells: true, canPrepareSpells: true, spellCastingAbilityId: 5 },
+        classFeatures: [{ definition: { name: "Channel Divinity", requiredLevel: 2, hideInSheet: false } }]
+      }
+    ],
+    classSpells: [
+      {
+        characterClassId: 1,
+        spells: [
+          {
+            prepared: true,
+            definition: {
+              id: 701,
+              name: "Detect Magic",
+              level: 1,
+              ritual: true,
+              activation: { activationType: 1 },
+              description: "Sense magic within 30 feet."
+            }
+          }
+        ]
+      }
+    ]
+  });
+
+  assert.equal(hero.notableItems.length, 1);
+  assert.equal(hero.notableItems[0].name, "Wand of the War Mage, +1");
+  assert.deepEqual(Array.from(hero.notableFeatures), ["War Caster", "Channel Divinity"]);
+  assert.deepEqual(Array.from(hero.proficientSkills), ["Insight", "Perception (Exp)"]);
+
+  // 2. Portable backup backfills missing sheetUrl on legacy numeric-ID B.U.G.S. sheets & preserves campaignMemory
+  store.resetSession();
+  store.upsertCharacter(
+    {
+      id: "44556677",
+      name: "Lyra",
+      classSummary: "Cleric 5",
+      level: 5,
+      hp: { current: 30, max: 38, temp: 0 },
+      ac: 16,
+      spellSlots: [{ level: 1, max: 4, used: 0, remaining: 4 }],
+      spells: Array.from(hero.spells),
+      notableItems: Array.from(hero.notableItems),
+      notableFeatures: Array.from(hero.notableFeatures),
+      proficientSkills: Array.from(hero.proficientSkills)
+      // Notice sheetUrl intentionally omitted to simulate legacy backup!
+    },
+    { manualAdd: true }
+  );
+  // Force legacy missing sheetUrl in exported JSON before import
+  const backup = JSON.parse(JSON.stringify(store.exportPortableBackup()));
+  backup.partyGroups.groups["B.U.G.S."].characters[0].sheetUrl = "";
+  backup.state.party[0].sheetUrl = "";
+
+  store.addCampaignMemoryEntry({
+    title: "Session 11 — Clockwork Vault",
+    summary: "Brother Vane promised a silver passkey if the party returns the astrolabe gear.",
+    keyNpcs: ["Brother Vane", "Magistrate Corin"],
+    openQuests: ["Return astrolabe gear to Brother Vane"],
+    clues: ["Passkey opens the bronze archive"],
+    rawText: "DM: Brother Vane whispers that the astrolabe gear is hidden inside the clockwork vault."
+  });
+  const backupWithMemory = store.exportPortableBackup();
+  assert.equal(backupWithMemory.campaignMemory.length, 1);
+
+  const sbMac = createBrowserSandbox();
+  sbMac.DnDCopilot.Store.importPortableBackup(backup);
+  assert.equal(
+    sbMac.DnDCopilot.Store.state.party[0].sheetUrl,
+    "https://www.dndbeyond.com/characters/44556677"
+  );
+  sbMac.DnDCopilot.Store.importPortableBackup(backupWithMemory);
+  assert.equal(sbMac.DnDCopilot.Store.campaignMemory.length, 1);
+
+  // 3. Past context keyword matching + Exploration Live Ideas (Local + Mocked Groq)
+  const storeMac = sbMac.DnDCopilot.Store;
+  storeMac.addTranscriptLine(
+    "DM",
+    "You spot Brother Vane waiting near the bell tower asking about the astrolabe.",
+    false
+  );
+  const pastCtx = storeMac.getRelevantPastContext(storeMac.state.transcript);
+  assert.match(pastCtx, /Brother Vane/);
+  assert.match(pastCtx, /Clockwork Vault/);
+
+  storeMac.updateSettings({ aiProvider: "local-free" });
+  storeMac.state.situation.sceneMode = "Social";
+  const localAdv = await sbMac.DnDCopilot.LocalBrain.adviseTacticsAndSpells(storeMac, "");
+  assert.match(localAdv.pastSessionConnection, /Brother Vane|Clockwork Vault/);
+  assert.ok(localAdv.recommendations.length >= 2);
+  assert.match(localAdv.recommendations[0].spellOrAction, /Insight|Persuasion/i);
+
+  // Mocked Groq mode returns pastSessionConnection + ideas
+  storeMac.updateSettings({ aiProvider: "groq", groqApiKey: "gsk_ideas_test" });
+  sbMac.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              tacticalOverview: "Brother Vane is testing whether you recovered his astrolabe.",
+              concentrationWarning: "",
+              pastSessionConnection:
+                "From Session 11: Vane promised the silver passkey for the astrolabe gear.",
+              recommendations: [
+                {
+                  rank: 1,
+                  spellOrAction: "Ask Brother Vane about the silver passkey before handing anything over",
+                  slotInfo: "Social Leverage · Free",
+                  whyBest: "Verify he still intends to honor the Session 11 bargain."
+                }
+              ],
+              customAnswer: ""
+            })
+          }
+        }
+      ]
+    })
+  });
+  await sbMac.DnDCopilot.GeminiClient.adviseTacticsAndSpells(storeMac, "");
+  assert.match(storeMac.state.advisor.pastSessionConnection, /silver passkey/);
+  assert.match(storeMac.state.advisor.recommendations[0].spellOrAction, /silver passkey/);
+
+  // 4. Bridge refreshAllPartySheets extracts ID from sheetUrl and refreshes stats cleanly
+  const toasts = [];
+  const bridge = new sbMac.DnDCopilot.AboveVttBridgeHost(storeMac, {
+    onToast: (m) => toasts.push(m)
+  });
+  sbMac.fetch = async (url) => {
+    assert.match(url, /characters?\/v5\/character\/44556677/);
+    return {
+      ok: true,
+      json: async () => ({
+        id: 44556677,
+        name: "Lyra Whisperwind",
+        baseHitPoints: 38,
+        removedHitPoints: 3,
+        stats: [
+          { id: 1, value: 8 },
+          { id: 2, value: 14 },
+          { id: 3, value: 10 },
+          { id: 4, value: 12 },
+          { id: 5, value: 18 },
+          { id: 6, value: 16 }
+        ],
+        classes: [{ id: 1, level: 5, definition: { name: "Cleric" } }]
+      })
+    };
+  };
+  const refreshRes = await bridge.refreshAllPartySheets(false);
+  assert.equal(refreshRes.updated, 1);
+  assert.equal(storeMac.state.party[0].hp.current, 35);
+  assert.ok(toasts.some((t) => /Updated 1\/1 character sheet/i.test(t)));
 });

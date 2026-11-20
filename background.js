@@ -36,18 +36,56 @@ async function findDndBeyondTabs() {
   }
 }
 
+async function getCobaltBearerTokenInBackground() {
+  try {
+    const resp = await fetch("https://auth-service.dndbeyond.com/v1/cobalt-token", {
+      method: "POST",
+      credentials: "include"
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data?.token || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 async function fetchCharacterDirectly(characterId) {
   const cleanId = String(characterId).replace(/\D/g, "");
   if (!cleanId) {
     throw new Error("Invalid D&D Beyond character ID.");
   }
-  const url = `https://character-service.dndbeyond.com/character/v5/character/${cleanId}?includeCustomItems=true`;
+  const url = `https://character-service.dndbeyond.com/character/v5/character/${cleanId}?includeCustomItems=true&_t=${Date.now()}`;
+  const token = await getCobaltBearerTokenInBackground();
+
+  if (token) {
+    const authedResp = await fetch(url, {
+      method: "GET",
+      cache: "no-store",
+      credentials: "include",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${token}`
+      }
+    });
+    if (authedResp.ok) {
+      return await authedResp.json();
+    }
+    if (authedResp.status !== 401 && authedResp.status !== 403) {
+      throw new Error(`D&D Beyond returned HTTP ${authedResp.status}.`);
+    }
+  }
+
   const response = await fetch(url, {
     method: "GET",
+    cache: "no-store",
+    credentials: "include",
     headers: { Accept: "application/json" }
   });
   if (!response.ok) {
-    throw new Error(`D&D Beyond returned HTTP ${response.status}. Make sure the sheet is Public or keep a logged-in D&D Beyond tab open.`);
+    throw new Error(
+      `D&D Beyond returned HTTP ${response.status}. Make sure you are signed into D&D Beyond or keep a D&D Beyond tab open.`
+    );
   }
   return await response.json();
 }
